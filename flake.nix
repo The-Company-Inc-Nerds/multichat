@@ -91,7 +91,7 @@
             youtube.apiKey = mkOption {
               type = types.str;
               default = "";
-              description = "YouTube Data API v3 key. Stored in Nix store — use apiKeyFile for production.";
+              description = "YouTube Data API v3 key as a plain string. This value ends up in the Nix store — use apiKeyFile for production secrets.";
             };
 
             youtube.apiKeyFile = mkOption {
@@ -99,9 +99,10 @@
               default = null;
               example = "/run/secrets/youtube-api-key";
               description = ''
-                Path to a file containing the YouTube API key in the format:
-                YOUTUBE_API_KEY=AIza...
-                Takes precedence over youtube.apiKey.
+                Path to a file containing the raw YouTube API key (just the key value, no KEY=VALUE prefix).
+                Compatible with agenix, sops-nix, and any secrets manager that writes plain files.
+                Takes precedence over youtube.apiKey when both are set.
+                The file must be readable by the service (world-readable or group-readable with supplementary groups).
               '';
             };
 
@@ -137,24 +138,30 @@
               after = ["network-online.target"];
               wants = ["network-online.target"];
 
+              # Inline apiKey lands in the process environment via this attrset.
               environment = mkIf (cfg.youtube.apiKey != "") {
                 YOUTUBE_API_KEY = cfg.youtube.apiKey;
               };
 
-              serviceConfig =
-                {
-                  ExecStart = "${cfg.package}/bin/multichat ${settingsFile}";
-                  Restart = "on-failure";
-                  RestartSec = "5s";
-                  DynamicUser = true;
-                  NoNewPrivileges = true;
-                  PrivateTmp = true;
-                  ProtectSystem = "strict";
-                  ProtectHome = true;
-                }
-                // optionalAttrs (cfg.youtube.apiKeyFile != null) {
-                  EnvironmentFile = cfg.youtube.apiKeyFile;
-                };
+              # Read the raw secret file at start time so any secrets manager
+              # that writes a plain file is supported (agenix, sops-nix, etc.).
+              # apiKeyFile takes precedence over apiKey when both are set.
+              script = ''
+                ${optionalString (cfg.youtube.apiKeyFile != null) ''
+                  export YOUTUBE_API_KEY="$(cat ${lib.escapeShellArg (toString cfg.youtube.apiKeyFile)})"
+                ''}
+                exec ${cfg.package}/bin/multichat ${settingsFile}
+              '';
+
+              serviceConfig = {
+                Restart = "on-failure";
+                RestartSec = "5s";
+                DynamicUser = true;
+                NoNewPrivileges = true;
+                PrivateTmp = true;
+                ProtectSystem = "strict";
+                ProtectHome = true;
+              };
             };
 
             networking.firewall.allowedTCPPorts = mkIf cfg.openFirewall [cfg.port];

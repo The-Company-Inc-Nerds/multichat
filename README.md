@@ -137,22 +137,30 @@ The service runs as a systemd `DynamicUser` (no persistent system account requir
 | `host` | string | `"127.0.0.1"` | Bind address |
 | `openFirewall` | bool | `false` | Open `port` in the firewall |
 | `twitch.channels` | `[string]` | `[]` | Twitch channel names |
-| `youtube.apiKey` | string | `""` | API key (stored in Nix store — prefer `apiKeyFile`) |
-| `youtube.apiKeyFile` | path | `null` | Path to a file containing `YOUTUBE_API_KEY=…` |
+| `youtube.apiKey` | string | `""` | API key inline (stored in Nix store — prefer `apiKeyFile`) |
+| `youtube.apiKeyFile` | path | `null` | Path to a plain file containing just the raw key; takes precedence over `apiKey` |
 | `youtube.channels` | `[{handle,channelId,videoId}]` | `[]` | YouTube channels |
 | `package` | package | built from flake | Override the multichat package |
 
 ### Secrets management
 
-`youtube.apiKeyFile` should point to a file with the content:
+`youtube.apiKeyFile` points to a file containing **just the raw API key** — no `KEY=VALUE` prefix:
 
 ```
-YOUTUBE_API_KEY=AIzaSy...
+AIzaSy...
 ```
 
-This file is never written to the Nix store. It works with any secrets manager that writes files at boot ([agenix](https://github.com/ryantm/agenix), [sops-nix](https://github.com/Mic92/sops-nix), etc.).
+The file is read at service start time, so it works with any tool that writes plain secret files:
 
-`youtube.apiKey` is a convenience option for local or trusted environments where the key being in the Nix store is acceptable.
+| Tool | Typical path | Config note |
+|------|-------------|-------------|
+| [agenix](https://github.com/ryantm/agenix) | `/run/agenix/youtube-api-key` | Set `mode = "0444"` or add the service to the secret's group |
+| [sops-nix](https://github.com/Mic92/sops-nix) | `/run/secrets/youtube-api-key` | Set `mode = "0444"` |
+| Plain file | anywhere readable | Ensure the service can read it |
+
+Because the service runs as a `DynamicUser`, the secret file must be world-readable (`0444`) or have its group set to one granted via `supplementaryGroups`.
+
+`youtube.apiKey` accepts the key as a plain string directly in your NixOS config. It is convenient for local or non-sensitive environments but the value will be stored in the Nix store. When both options are set, `apiKeyFile` takes precedence.
 
 ---
 

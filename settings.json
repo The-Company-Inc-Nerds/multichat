@@ -4,19 +4,12 @@
     "host": "0.0.0.0"
   },
   "twitch": {
-    "channels": ["channelname1", "channelname2"]
+    "channels": ["TheCompanyInc"]
   },
   "youtube": {
-    "apiKey": "YOUR_YOUTUBE_DATA_API_V3_KEY",
     "channels": [
       {
-        "handle": "@channelhandle"
-      },
-      {
-        "channelId": "UCxxxxxxxxxxxxxxxxxxxxxxxx"
-      },
-      {
-        "videoId": "xxxxxxxxxxx"
+        "channelId": "UCP3z2Yd_oe3b2Jnj3gaLsgA"
       }
     ]
   }
