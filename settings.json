@@ -1,0 +1,23 @@
+{
+  "server": {
+    "port": 8080,
+    "host": "0.0.0.0"
+  },
+  "twitch": {
+    "channels": ["channelname1", "channelname2"]
+  },
+  "youtube": {
+    "apiKey": "YOUR_YOUTUBE_DATA_API_V3_KEY",
+    "channels": [
+      {
+        "handle": "@channelhandle"
+      },
+      {
+        "channelId": "UCxxxxxxxxxxxxxxxxxxxxxxxx"
+      },
+      {
+        "videoId": "xxxxxxxxxxx"
+      }
+    ]
+  }
+}

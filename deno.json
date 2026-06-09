@@ -1,0 +1,10 @@
+{
+  "tasks": {
+    "start": "deno run --allow-net --allow-read --allow-env=YOUTUBE_API_KEY,PORT,HOST main.ts",
+    "dev": "deno run --watch --allow-net --allow-read --allow-env=YOUTUBE_API_KEY,PORT,HOST main.ts",
+    "compile": "deno compile --allow-net --allow-read --allow-env=YOUTUBE_API_KEY,PORT,HOST --output multichat main.ts"
+  },
+  "compilerOptions": {
+    "strict": true
+  }
+}
