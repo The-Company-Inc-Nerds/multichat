@@ -500,13 +500,17 @@ const HTML = `<!DOCTYPE html>
 </html>`;
 
 /** Stable derived color for an author name (used when the platform gives none). */
-function colorFor(name: string): string {
+export function colorFor(name: string): string {
   let h = 0;
   for (let i = 0; i < name.length; i++) {
     h = (h * 31 + name.charCodeAt(i)) >>> 0;
   }
   return `hsl(${h % 360}, 65%, 60%)`;
 }
+
+// Upper bound on concurrent SSE viewers. A multichat overlay needs a handful (OBS sources,
+// a monitor or two); the cap stops an exposed port from being flooded with open streams.
+const MAX_SSE_CLIENTS = 50;
 
 export function createServer(settings: Settings): Emitter {
   const clients = new Set<ReadableStreamDefaultController<Uint8Array>>();
@@ -516,11 +520,19 @@ export function createServer(settings: Settings): Emitter {
   const statuses = new Map<string, ChannelStatus>();
   const key = (platform: Platform, name: string) => `${platform}:${name}`;
   for (const name of settings.twitch.channels) {
-    statuses.set(key("twitch", name), { platform: "twitch", name, state: "connecting" });
+    statuses.set(key("twitch", name), {
+      platform: "twitch",
+      name,
+      state: "connecting",
+    });
   }
   for (const ch of settings.youtube.channels) {
     const name = ch.handle ?? ch.channelId ?? ch.videoId ?? "unknown";
-    statuses.set(key("youtube", name), { platform: "youtube", name, state: "connecting" });
+    statuses.set(key("youtube", name), {
+      platform: "youtube",
+      name,
+      state: "connecting",
+    });
   }
 
   function broadcast(event: ServerEvent): void {
@@ -558,6 +570,9 @@ export function createServer(settings: Settings): Emitter {
       const { pathname } = new URL(req.url);
 
       if (pathname === "/events") {
+        if (clients.size >= MAX_SSE_CLIENTS) {
+          return new Response("Too many connections", { status: 503 });
+        }
         let ctrl!: ReadableStreamDefaultController<Uint8Array>;
         const stream = new ReadableStream<Uint8Array>({
           start(c) {
@@ -565,8 +580,13 @@ export function createServer(settings: Settings): Emitter {
             clients.add(ctrl);
             ctrl.enqueue(enc.encode(": connected\n\n"));
             // Push the current channel roster so the panel populates immediately.
-            const snapshot: ServerEvent = { type: "status", data: [...statuses.values()] };
-            ctrl.enqueue(enc.encode("data: " + JSON.stringify(snapshot) + "\n\n"));
+            const snapshot: ServerEvent = {
+              type: "status",
+              data: [...statuses.values()],
+            };
+            ctrl.enqueue(
+              enc.encode("data: " + JSON.stringify(snapshot) + "\n\n"),
+            );
           },
           cancel() {
             clients.delete(ctrl);

@@ -1,8 +1,12 @@
 {
   "tasks": {
-    "start": "deno run --allow-net --allow-read --allow-env=YOUTUBE_API_KEY,PORT,HOST main.ts",
-    "dev": "deno run --watch --allow-net --allow-read --allow-env=YOUTUBE_API_KEY,PORT,HOST main.ts",
-    "compile": "deno compile --allow-net --allow-read --allow-env=YOUTUBE_API_KEY,PORT,HOST --output multichat main.ts"
+    "start": "deno run --allow-net=irc-ws.chat.twitch.tv,www.googleapis.com,127.0.0.1,0.0.0.0 --allow-read --allow-env=YOUTUBE_API_KEY,PORT,HOST main.ts",
+    "dev": "deno run --watch --allow-net=irc-ws.chat.twitch.tv,www.googleapis.com,127.0.0.1,0.0.0.0 --allow-read --allow-env=YOUTUBE_API_KEY,PORT,HOST main.ts",
+    "compile": "deno compile --allow-net=irc-ws.chat.twitch.tv,www.googleapis.com,127.0.0.1,0.0.0.0 --allow-read --allow-env=YOUTUBE_API_KEY,PORT,HOST --output multichat main.ts",
+    "test": "deno test",
+    "check": "deno check main.ts src/*.ts tests/*.ts",
+    "lint": "deno lint",
+    "fmt": "deno fmt"
   },
   "compilerOptions": {
     "strict": true

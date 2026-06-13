@@ -1,3 +1,13 @@
 .direnv
 .env
 multichat
+
+# Nix build output
+result
+
+# Commit-message scratchpad + local gcommit artifact
+GIT_COMMIT_MSG
+gcommit
+
+# Test coverage
+coverage/

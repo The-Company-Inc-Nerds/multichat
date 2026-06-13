@@ -1,16 +1,24 @@
-import type { Badge, Emitter, MessageKind, Segment, TwitchConfig } from "./types.ts";
+import type {
+  Badge,
+  Emitter,
+  MessageKind,
+  Segment,
+  TwitchConfig,
+} from "./types.ts";
 
-function parseTags(raw: string): Record<string, string> {
+export function parseTags(raw: string): Record<string, string> {
   const tags: Record<string, string> = {};
   for (const part of raw.split(";")) {
     const eq = part.indexOf("=");
-    tags[eq === -1 ? part : part.slice(0, eq)] = eq === -1 ? "" : part.slice(eq + 1);
+    tags[eq === -1 ? part : part.slice(0, eq)] = eq === -1
+      ? ""
+      : part.slice(eq + 1);
   }
   return tags;
 }
 
 // IRCv3 tag values escape spaces and a few other chars.
-function unescapeTag(v: string): string {
+export function unescapeTag(v: string): string {
   return v
     .replace(/\\s/g, " ")
     .replace(/\\:/g, ";")
@@ -26,7 +34,7 @@ interface IRCLine {
   params: string[];
 }
 
-function parseIRC(line: string): IRCLine | null {
+export function parseIRC(line: string): IRCLine | null {
   let s = line.trimEnd();
   if (!s) return null;
 
@@ -74,7 +82,7 @@ const BADGE_LABELS: Record<string, string> = {
   partner: "Verified",
 };
 
-function parseBadges(tag: string): Badge[] {
+export function parseBadges(tag: string): Badge[] {
   if (!tag) return [];
   const out: Badge[] = [];
   for (const part of tag.split(",")) {
@@ -92,7 +100,7 @@ interface EmoteSpan {
 }
 
 // Parse Twitch's `emotes` tag: "id:start-end,start-end/id2:start-end".
-function parseEmoteTag(tag: string): EmoteSpan[] {
+export function parseEmoteTag(tag: string): EmoteSpan[] {
   if (!tag) return [];
   const spans: EmoteSpan[] = [];
   for (const group of tag.split("/")) {
@@ -103,7 +111,9 @@ function parseEmoteTag(tag: string): EmoteSpan[] {
       const [a, b] = range.split("-");
       const start = Number(a);
       const end = Number(b);
-      if (Number.isFinite(start) && Number.isFinite(end)) spans.push({ start, end, id });
+      if (Number.isFinite(start) && Number.isFinite(end)) {
+        spans.push({ start, end, id });
+      }
     }
   }
   return spans.sort((x, y) => x.start - y.start);
@@ -113,7 +123,10 @@ const emoteUrl = (id: string) =>
   `https://static-cdn.jtvnw.net/emoticons/v2/${id}/default/dark/1.0`;
 
 // Tokenize a message into text + emote segments. Indices are codepoint-based.
-function buildSegments(text: string, emotesTag: string): Segment[] | undefined {
+export function buildSegments(
+  text: string,
+  emotesTag: string,
+): Segment[] | undefined {
   const spans = parseEmoteTag(emotesTag);
   if (!spans.length) return undefined;
 
@@ -122,7 +135,10 @@ function buildSegments(text: string, emotesTag: string): Segment[] | undefined {
   let cursor = 0;
   for (const span of spans) {
     if (span.start > cursor) {
-      segments.push({ type: "text", text: cp.slice(cursor, span.start).join("") });
+      segments.push({
+        type: "text",
+        text: cp.slice(cursor, span.start).join(""),
+      });
     }
     const alt = cp.slice(span.start, span.end + 1).join("");
     segments.push({ type: "emote", url: emoteUrl(span.id), alt });
@@ -155,7 +171,16 @@ const ANNOUNCE_COLORS: Record<string, string> = {
   PURPLE: "#9147ff",
 };
 
-async function connectOnce(channels: string[], emitter: Emitter): Promise<void> {
+// No data for this long means the connection is silently dead — force a reconnect.
+const IDLE_MS = 90_000;
+const IDLE_CHECK_MS = 15_000;
+// Discard a partial line that never terminates, so a misbehaving peer can't grow memory.
+const MAX_BUF = 64 * 1024;
+
+async function connectOnce(
+  channels: string[],
+  emitter: Emitter,
+): Promise<void> {
   const nick = `justinfan${10000 + Math.floor(Math.random() * 89999)}`;
   const ws = new WebSocket("wss://irc-ws.chat.twitch.tv");
 
@@ -173,10 +198,29 @@ async function connectOnce(channels: string[], emitter: Emitter): Promise<void> 
 
   let buf = "";
   await new Promise<void>((_, rej) => {
+    // Watchdog for silent half-open connections: a NAT/proxy can drop the TCP path
+    // without a close frame, leaving the socket "open" but permanently silent. Twitch
+    // sends a PING at least every ~5 min, so no traffic for IDLE_MS means it's dead —
+    // force a close to trigger the reconnect loop. This is the main long-stream failure.
+    let lastData = Date.now();
+    const timer = setInterval(() => {
+      if (Date.now() - lastData > IDLE_MS) fail(new Error("idle timeout"));
+    }, IDLE_CHECK_MS);
+    const fail = (err: Error) => {
+      clearInterval(timer);
+      try {
+        ws.close();
+      } catch { /* already closing */ }
+      rej(err);
+    };
+
     ws.onmessage = ({ data }) => {
+      lastData = Date.now();
       buf += typeof data === "string" ? data : "";
       const lines = buf.split("\r\n");
       buf = lines.pop() ?? "";
+      // Defensive: a peer streaming bytes without CRLF must not grow buf unboundedly.
+      if (buf.length > MAX_BUF) buf = "";
       for (const line of lines) {
         const msg = parseIRC(line);
         if (!msg) continue;
@@ -187,50 +231,51 @@ async function connectOnce(channels: string[], emitter: Emitter): Promise<void> 
         }
 
         if (msg.command === "RECONNECT") {
-          ws.close();
-          rej(new Error("RECONNECT requested"));
+          fail(new Error("RECONNECT requested"));
           return;
         }
 
-        // Twitch emits one ROOMSTATE per channel right after we join — use it as "joined".
-        if (msg.command === "ROOMSTATE") {
-          const channel = (msg.params[0] ?? "").replace(/^#/, "");
-          if (channel) emitter.status("twitch", channel, "live");
-          continue;
-        }
-
-        if (msg.command === "PRIVMSG") {
-          handlePrivmsg(msg, emitter);
-          continue;
-        }
-
-        if (msg.command === "USERNOTICE") {
-          handleUsernotice(msg, emitter);
-          continue;
-        }
-
-        if (msg.command === "CLEARMSG") {
-          const channel = (msg.params[0] ?? "").replace(/^#/, "");
-          const messageId = msg.tags["target-msg-id"];
-          if (messageId) emitter.delete({ platform: "twitch", channel, messageId });
-          continue;
-        }
-
-        if (msg.command === "CLEARCHAT") {
-          const channel = (msg.params[0] ?? "").replace(/^#/, "");
-          const author = msg.params[1]; // present => single-user ban/timeout
-          if (author) emitter.delete({ platform: "twitch", channel, author });
-          else emitter.delete({ platform: "twitch", channel });
-          continue;
-        }
+        // PING/RECONNECT need the socket; everything else is emitter-only and unit-testable.
+        if (handleCommand(msg, emitter)) continue;
       }
     };
-    ws.onclose = () => rej(new Error("closed"));
-    ws.onerror = () => rej(new Error("socket error"));
+    ws.onclose = () => fail(new Error("closed"));
+    ws.onerror = () => fail(new Error("socket error"));
   });
 }
 
-function handlePrivmsg(msg: IRCLine, emitter: Emitter): void {
+// Route an IRC line to the emitter. Returns true if the command was handled here.
+// PING/RECONNECT are deliberately excluded — they need the socket and stay in connectOnce.
+export function handleCommand(msg: IRCLine, emitter: Emitter): boolean {
+  const channel = (msg.params[0] ?? "").replace(/^#/, "");
+  switch (msg.command) {
+    // Twitch emits one ROOMSTATE per channel right after we join — use it as "joined".
+    case "ROOMSTATE":
+      if (channel) emitter.status("twitch", channel, "live");
+      return true;
+    case "PRIVMSG":
+      handlePrivmsg(msg, emitter);
+      return true;
+    case "USERNOTICE":
+      handleUsernotice(msg, emitter);
+      return true;
+    case "CLEARMSG": {
+      const messageId = msg.tags["target-msg-id"];
+      if (messageId) emitter.delete({ platform: "twitch", channel, messageId });
+      return true;
+    }
+    case "CLEARCHAT": {
+      const author = msg.params[1]; // present => single-user ban/timeout
+      if (author) emitter.delete({ platform: "twitch", channel, author });
+      else emitter.delete({ platform: "twitch", channel });
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+export function handlePrivmsg(msg: IRCLine, emitter: Emitter): void {
   const channel = (msg.params[0] ?? "").replace(/^#/, "");
   let content = msg.params[1] ?? "";
   const author = msg.tags["display-name"] || msg.prefix.split("!")[0] || "anon";
@@ -274,7 +319,7 @@ function handlePrivmsg(msg: IRCLine, emitter: Emitter): void {
   });
 }
 
-function handleUsernotice(msg: IRCLine, emitter: Emitter): void {
+export function handleUsernotice(msg: IRCLine, emitter: Emitter): void {
   const channel = (msg.params[0] ?? "").replace(/^#/, "");
   const author = msg.tags["display-name"] || msg.tags["login"] || "anon";
   const msgId = msg.tags["msg-id"] ?? "";
@@ -324,18 +369,27 @@ function handleUsernotice(msg: IRCLine, emitter: Emitter): void {
   });
 }
 
-export function startTwitchClient(config: TwitchConfig, emitter: Emitter): void {
+export function startTwitchClient(
+  config: TwitchConfig,
+  emitter: Emitter,
+): void {
   const delays = [2_000, 4_000, 8_000, 16_000, 30_000];
   let attempt = 0;
 
   (async () => {
     while (true) {
+      const start = Date.now();
       try {
         console.log(`[Twitch] Connecting to: ${config.channels.join(", ")}`);
-        for (const ch of config.channels) emitter.status("twitch", ch, "connecting");
+        for (const ch of config.channels) {
+          emitter.status("twitch", ch, "connecting");
+        }
         await connectOnce(config.channels, emitter);
       } catch (err) {
         for (const ch of config.channels) emitter.status("twitch", ch, "error");
+        // A connection that stayed up a while is a fresh failure, not a flaky endpoint —
+        // reset the backoff so a mid-stream blip reconnects in 2s, not 30s.
+        if (Date.now() - start > 60_000) attempt = 0;
         const delay = delays[Math.min(attempt++, delays.length - 1)];
         console.error(`[Twitch] ${err} — retry in ${delay / 1000}s`);
         await new Promise((r) => setTimeout(r, delay));

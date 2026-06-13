@@ -1,17 +1,41 @@
-import type { Badge, Emitter, MessageKind, YouTubeChannelConfig, YouTubeConfig } from "./types.ts";
+import type {
+  Badge,
+  Emitter,
+  MessageKind,
+  YouTubeChannelConfig,
+  YouTubeConfig,
+} from "./types.ts";
 
 const BASE = "https://www.googleapis.com/youtube/v3";
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-async function ytGet<T>(url: string): Promise<T | null> {
+/** Thrown when the daily/rate quota is exhausted, so callers can back off for a long time
+ *  instead of hammering the API (every request just returns 403 until quota resets). */
+export class QuotaError extends Error {
+  constructor() {
+    super("YouTube API quota exceeded");
+    this.name = "QuotaError";
+  }
+}
+
+// Returns parsed JSON, or null on a transient error (caller should retry with backoff).
+// Throws QuotaError on quota/rate-limit 403s so the caller can back off hard.
+export async function ytGet<T>(url: string): Promise<T | null> {
   try {
     const r = await fetch(url);
     if (!r.ok) {
-      console.error(`[YouTube] HTTP ${r.status}: ${await r.text()}`);
+      const body = await r.text();
+      if (
+        r.status === 403 && /quota|rateLimitExceeded|dailyLimit/i.test(body)
+      ) {
+        throw new QuotaError();
+      }
+      console.error(`[YouTube] HTTP ${r.status}: ${body}`);
       return null;
     }
     return (await r.json()) as T;
   } catch (e) {
+    if (e instanceof QuotaError) throw e;
     console.error(`[YouTube] Fetch error: ${e}`);
     return null;
   }
@@ -25,7 +49,9 @@ async function resolveChannelId(
   if (!ch.handle) return null;
   const handle = ch.handle.startsWith("@") ? ch.handle : `@${ch.handle}`;
   const d = await ytGet<{ items?: { id: string }[] }>(
-    `${BASE}/channels?part=id&forHandle=${encodeURIComponent(handle)}&key=${key}`,
+    `${BASE}/channels?part=id&forHandle=${
+      encodeURIComponent(handle)
+    }&key=${key}`,
   );
   return d?.items?.[0]?.id ?? null;
 }
@@ -35,7 +61,9 @@ async function findLiveVideo(
   channelId: string,
 ): Promise<string | null> {
   const d = await ytGet<{ items?: { id: { videoId: string } }[] }>(
-    `${BASE}/search?part=id&channelId=${channelId}&eventType=live&type=video&maxResults=1&key=${key}`,
+    `${BASE}/search?part=id&channelId=${
+      encodeURIComponent(channelId)
+    }&eventType=live&type=video&maxResults=1&key=${key}`,
   );
   return d?.items?.[0]?.id?.videoId ?? null;
 }
@@ -46,17 +74,25 @@ async function getLiveChatId(
 ): Promise<string | null> {
   const d = await ytGet<{
     items?: { liveStreamingDetails?: { activeLiveChatId?: string } }[];
-  }>(`${BASE}/videos?part=liveStreamingDetails&id=${videoId}&key=${key}`);
+  }>(
+    `${BASE}/videos?part=liveStreamingDetails&id=${
+      encodeURIComponent(videoId)
+    }&key=${key}`,
+  );
   return d?.items?.[0]?.liveStreamingDetails?.activeLiveChatId ?? null;
 }
 
-interface ChatItem {
+export interface ChatItem {
   id: string;
   snippet: {
     type: string;
     displayMessage?: string;
     publishedAt: string;
-    superChatDetails?: { amountDisplayString: string; userComment?: string; tier?: number };
+    superChatDetails?: {
+      amountDisplayString: string;
+      userComment?: string;
+      tier?: number;
+    };
     superStickerDetails?: {
       amountDisplayString: string;
       tier?: number;
@@ -95,10 +131,10 @@ const TIER_COLORS = [
   "#E91E63", // 6 magenta
   "#E62117", // 7 red
 ];
-const tierColor = (tier?: number) =>
+export const tierColor = (tier?: number) =>
   TIER_COLORS[Math.min(Math.max((tier ?? 1) - 1, 0), TIER_COLORS.length - 1)];
 
-function buildBadges(a: ChatItem["authorDetails"]): Badge[] {
+export function buildBadges(a: ChatItem["authorDetails"]): Badge[] {
   const out: Badge[] = [];
   if (a.isChatOwner) out.push({ id: "owner", label: "Owner" });
   if (a.isChatModerator) out.push({ id: "moderator", label: "Mod" });
@@ -107,7 +143,11 @@ function buildBadges(a: ChatItem["authorDetails"]): Badge[] {
   return out;
 }
 
-function emitItem(item: ChatItem, channel: string, emitter: Emitter): void {
+export function emitItem(
+  item: ChatItem,
+  channel: string,
+  emitter: Emitter,
+): void {
   const sn = item.snippet;
   const author = item.authorDetails.displayName;
   const badges = buildBadges(item.authorDetails);
@@ -144,7 +184,9 @@ function emitItem(item: ChatItem, channel: string, emitter: Emitter): void {
       kind = "membership";
       accentColor = "#2ba640";
       const level = sn.newSponsorDetails?.memberLevelName;
-      eventText = level ? `${author} became a member (${level})` : `${author} became a member`;
+      eventText = level
+        ? `${author} became a member (${level})`
+        : `${author} became a member`;
       content = "";
       break;
     }
@@ -181,47 +223,65 @@ function emitItem(item: ChatItem, channel: string, emitter: Emitter): void {
   });
 }
 
+// Retry cadences. The live-stream lookup (search.list) costs 100 quota units, so an
+// offline channel is rechecked sparingly; quota exhaustion backs off hardest of all.
+const OFFLINE_RECHECK_MS = 5 * 60_000;
+const ERROR_RETRY_MS = 60_000;
+const QUOTA_BACKOFF_MS = 15 * 60_000;
+const POLL_BACKOFF_MAX_MS = 120_000;
+
+// Polls one channel's live chat until it ends or errors. Returns the resolved channelId
+// (or null) so the caller can cache it and skip re-resolving on the next attempt.
 async function pollChannel(
   key: string,
   ch: YouTubeChannelConfig,
   label: string,
   emitter: Emitter,
-): Promise<void> {
+  cachedCid: string | null,
+): Promise<string | null> {
   emitter.status("youtube", label, "connecting");
   let videoId = ch.videoId || null;
+  let cid = cachedCid;
 
   if (!videoId) {
-    const cid = await resolveChannelId(key, ch);
+    if (!cid) cid = await resolveChannelId(key, ch);
     if (!cid) throw new Error(`Cannot resolve channel: ${JSON.stringify(ch)}`);
     videoId = await findLiveVideo(key, cid);
     if (!videoId) {
       console.log(`[YouTube] No live stream found for ${label}`);
       emitter.status("youtube", label, "offline");
-      return;
+      return cid;
     }
   }
 
   const chatId = await getLiveChatId(key, videoId);
   if (!chatId) {
-    console.log(`[YouTube] No active live chat for ${label} (video: ${videoId})`);
+    console.log(
+      `[YouTube] No active live chat for ${label} (video: ${videoId})`,
+    );
     emitter.status("youtube", label, "offline");
-    return;
+    return cid;
   }
 
   console.log(`[YouTube] Polling live chat: ${label} (video: ${videoId})`);
   emitter.status("youtube", label, "live");
 
   let token: string | undefined;
+  let backoff = 15_000;
   while (true) {
-    let url =
-      `${BASE}/liveChat/messages?liveChatId=${chatId}&part=snippet,authorDetails&key=${key}`;
-    if (token) url += `&pageToken=${token}`;
+    let url = `${BASE}/liveChat/messages?liveChatId=${
+      encodeURIComponent(chatId)
+    }&part=snippet,authorDetails&key=${key}`;
+    if (token) url += `&pageToken=${encodeURIComponent(token)}`;
 
-    const page = await ytGet<ChatPage>(url);
+    const page = await ytGet<ChatPage>(url); // throws QuotaError → handled by caller
     if (!page) {
-      await sleep(15_000);
+      // Transient error — back off exponentially instead of a fixed 15s hammer.
+      await sleep(backoff);
+      backoff = Math.min(backoff * 2, POLL_BACKOFF_MAX_MS);
       continue;
     }
+    backoff = 15_000;
 
     for (const item of page.items ?? []) {
       emitItem(item, label, emitter);
@@ -239,15 +299,24 @@ export function startYouTubePoller(
   for (const ch of config.channels) {
     const label = ch.handle ?? ch.channelId ?? ch.videoId ?? "unknown";
     (async () => {
+      let cid: string | null = ch.channelId || null; // resolve once, then reuse
       while (true) {
         try {
-          await pollChannel(config.apiKey, ch, label, emitter);
+          // Normal return means the channel is offline / chat ended.
+          cid = await pollChannel(config.apiKey, ch, label, emitter, cid);
+          await sleep(OFFLINE_RECHECK_MS);
         } catch (e) {
-          console.error(`[YouTube] ${label}: ${e}`);
           emitter.status("youtube", label, "error");
+          if (e instanceof QuotaError) {
+            console.error(
+              `[YouTube] ${label}: quota exceeded — backing off 15m`,
+            );
+            await sleep(QUOTA_BACKOFF_MS);
+          } else {
+            console.error(`[YouTube] ${label}: ${e}`);
+            await sleep(ERROR_RETRY_MS);
+          }
         }
-        // Retry in 60s — stream may have ended or not started yet
-        await sleep(60_000);
       }
     })();
   }

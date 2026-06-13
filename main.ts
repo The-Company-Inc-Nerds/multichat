@@ -9,7 +9,9 @@ async function loadSettings(path: string): Promise<Settings> {
     text = await Deno.readTextFile(path);
   } catch {
     console.error(`Cannot read settings file: ${path}`);
-    console.error("Copy settings.json.example to settings.json and configure it.");
+    console.error(
+      "Copy settings.json.example to settings.json and configure it.",
+    );
     Deno.exit(1);
   }
 
@@ -17,7 +19,7 @@ async function loadSettings(path: string): Promise<Settings> {
   return {
     server: {
       port: Number(Deno.env.get("PORT") ?? raw.server?.port ?? 8080),
-      host: Deno.env.get("HOST") ?? raw.server?.host ?? "0.0.0.0",
+      host: Deno.env.get("HOST") ?? raw.server?.host ?? "127.0.0.1",
     },
     twitch: {
       channels: raw.twitch?.channels ?? [],
