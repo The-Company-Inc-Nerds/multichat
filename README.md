@@ -2,7 +2,15 @@
 
 Combines Twitch IRC chat and YouTube Live Chat into a single browser-based viewer. No dependencies — pure Deno built-ins only.
 
-Messages from all configured channels are streamed to the browser in real time via Server-Sent Events. Each message shows a platform badge, channel name, and colored username.
+Messages from all configured channels are streamed to the browser in real time via Server-Sent Events. A sidebar lists every watched channel with a live/offline/connecting/error indicator, and each message carries its platform's richness:
+
+- **Platform identity** — colored left border + `T`/`YT` badge, channel name, colored username
+- **Role badges** — Twitch broadcaster/mod/VIP/sub, YouTube owner/moderator/member/verified
+- **Image emotes** — Twitch emotes render as images (see note below)
+- **`/me` actions** and **highlighted event rows** — Twitch cheers, subs/resubs, raids, announcements; YouTube Super Chats, Super Stickers, and memberships
+- **Live deletions** — moderator timeouts/bans and removed messages disappear from the feed
+
+> **YouTube emotes** show as `:shortcodes:`/unicode text, not images. The YouTube Data API v3 returns chat messages as plain text only — it does not expose custom-emoji image URLs. Image emotes are therefore Twitch-only.
 
 **Twitch** connects anonymously (no account or token required). **YouTube** requires a free Data API v3 key.
 

@@ -31,12 +31,12 @@ async function loadSettings(path: string): Promise<Settings> {
 
 const configPath = Deno.args[0] ?? "settings.json";
 const settings = await loadSettings(configPath);
-const broadcast = createServer(settings);
+const emitter = createServer(settings);
 
 const { twitch, youtube } = settings;
 
 if (twitch.channels.length > 0) {
-  startTwitchClient(twitch, broadcast);
+  startTwitchClient(twitch, emitter);
 } else {
   console.log("No Twitch channels configured.");
 }
@@ -48,7 +48,7 @@ if (youtube.channels.length > 0) {
         "Set youtube.apiKey in settings.json or YOUTUBE_API_KEY env var.",
     );
   } else {
-    startYouTubePoller(youtube, broadcast);
+    startYouTubePoller(youtube, emitter);
   }
 } else {
   console.log("No YouTube channels configured.");

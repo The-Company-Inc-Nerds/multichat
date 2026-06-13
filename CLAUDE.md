@@ -35,13 +35,17 @@ YouTube channels require an API key. Twitch works anonymously (read-only via `ju
 
 ```
 main.ts          entry point — loads settings, wires broadcaster to server + clients
-src/types.ts     shared TypeScript interfaces (Settings, ChatMessage, Broadcaster)
+src/types.ts     shared TypeScript interfaces (Settings, ChatMessage, ServerEvent, Emitter)
 src/twitch.ts    Twitch IRC over WebSocket (wss://irc-ws.chat.twitch.tv), with reconnect
 src/youtube.ts   YouTube Data API v3 polling — resolves channel → live video → live chat
 src/server.ts    Deno.serve HTTP server: GET / returns embedded HTML, GET /events is SSE
 ```
 
-The `Broadcaster` is a plain callback `(msg: ChatMessage) => void` created by `createServer` and passed to the platform clients. Messages are pushed to all connected SSE streams via a `Set<ReadableStreamDefaultController>`.
+The `Emitter` is an object `{ message, delete, status }` created by `createServer` and passed to the platform clients. Each call broadcasts a tagged `ServerEvent` (`message` / `delete` / `status`) to all connected SSE streams via a `Set<ReadableStreamDefaultController>`; the browser switches on `event.type`. `createServer` also keeps a per-channel status registry (seeded from settings) so it can push a roster snapshot to each newly connected client.
+
+The browser renders platform-specific richness: Twitch/YouTube role badges, author colors, image emotes (Twitch only — see note), `/me` actions, highlighted event rows (cheers, subs, raids, Super Chats, Super Stickers, memberships), and live message deletions. A left sidebar lists every watched channel with a live/offline/connecting/error dot.
+
+> YouTube custom emoji cannot be rendered as images: the Data API v3 returns `displayMessage` as plain text only (no emoji image URLs or runs), so YouTube emotes show as `:shortcodes:`/unicode. Image emotes are Twitch-only.
 
 No external imports — only Deno built-ins (`Deno.serve`, `Deno.readTextFile`, `WebSocket`, `fetch`, `ReadableStream`).
 
