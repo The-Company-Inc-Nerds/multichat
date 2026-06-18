@@ -126,10 +126,12 @@ module.nix   the NixOS service module (portable — importable without the flake
 }
 ```
 
-The systemd service runs as a `DynamicUser` (no persistent system user needed).
-For production, `apiKeyFile` points to a file containing just the raw key, read
-at service start (compatible with agenix/sops-nix); `youtube.apiKey` is the
-convenience path (stored in the Nix store). Full options + secrets table:
+The systemd service runs as a `DynamicUser` (no persistent system user needed)
+with an aggressively hardened unit. For production, `apiKeyFile` points to a
+file containing just the raw key, staged via systemd `LoadCredential` at service
+start so it needs no world/group-read permissions (compatible with
+agenix/sops-nix); `youtube.apiKey` is the convenience path (stored in the Nix
+store, emits a warning). Full options + secrets + hardening table:
 `docs/nixos.md`.
 
 ## Nix dev shell

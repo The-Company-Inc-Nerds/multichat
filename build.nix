@@ -1,7 +1,8 @@
 # Package derivation for multichat. Standalone-buildable:
+#   nix-build build.nix            (uses the <nixpkgs> default below)
 #   nix-build build.nix --arg pkgs 'import <nixpkgs> {}'
 # Also imported by flake.nix (packages.default) and module.nix (the package default).
-{ pkgs }:
+{ pkgs ? import <nixpkgs> { } }:
 pkgs.stdenv.mkDerivation {
   pname = "multichat";
   version = "0.1.0";
