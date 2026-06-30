@@ -46,10 +46,10 @@ passed as the first CLI argument. Copy `settings.json.example` to
 
 ## `youtube`
 
-| Field      | Type     | Description                                                                      |
-| ---------- | -------- | -------------------------------------------------------------------------------- |
-| `apiKey`   | string   | YouTube Data API v3 key (see below). Required if any YouTube channels are listed |
-| `channels` | object[] | One entry per channel; set at least one of the fields below                      |
+| Field      | Type     | Description                                                                                    |
+| ---------- | -------- | ---------------------------------------------------------------------------------------------- |
+| `apiKey`   | string   | YouTube Data API v3 key (see below). Optional — may instead be supplied at runtime (see below) |
+| `channels` | object[] | One entry per channel; set at least one of the fields below                                    |
 
 Each `youtube.channels` entry:
 
@@ -63,15 +63,50 @@ Twitch works anonymously. YouTube requires an API key and resolves each channel
 to its current live stream, so a channel only produces messages while it is
 actually live.
 
+## Setting the YouTube API key at runtime
+
+The API key does not have to be baked into the config. If `youtube.channels` is
+set but no key is available at startup, the server runs (Twitch chat works
+immediately) and waits — then you hand it a key on the running server:
+
+```bash
+# pass the key on stdin (keeps it out of the process list and shell history)
+echo -n "$YT_KEY" | multichat set-youtube-key
+
+# or as an argument
+multichat set-youtube-key AIzaSy...
+
+# non-default port / host
+echo -n "$YT_KEY" | multichat set-youtube-key --port 8080
+```
+
+The command POSTs the key to the running server's control endpoint
+(`POST /api/youtube-key`, see [HTTP & SSE API](api.md)). That endpoint is
+**loopback-only** — it refuses any connection that is not from
+`127.0.0.1`/`::1`, so it is safe even when the viewer binds `0.0.0.0`. Setting
+the key (re)starts YouTube polling immediately; sending a new key rotates it
+without a restart.
+
+**Persistence.** When the server has a writable state directory it stores the
+key there (mode `0600`) and reloads it on the next start, so you only set it
+once. Under the NixOS module this is systemd's `StateDirectory`
+(`/var/lib/multichat`, exported as `$STATE_DIRECTORY`); with a plain
+`deno task start` and no `STATE_DIRECTORY` the key is held in memory only and
+must be re-sent after a restart. See [NixOS Module](nixos.md).
+
+The startup key is chosen in this order: the persisted runtime key, then
+`$YOUTUBE_API_KEY`, then `youtube.apiKey` from `settings.json`.
+
 ## Environment variable overrides
 
 These override their `settings.json` counterparts at startup:
 
-| Variable          | Overrides        |
-| ----------------- | ---------------- |
-| `PORT`            | `server.port`    |
-| `HOST`            | `server.host`    |
-| `YOUTUBE_API_KEY` | `youtube.apiKey` |
+| Variable          | Overrides                                                  |
+| ----------------- | ---------------------------------------------------------- |
+| `PORT`            | `server.port`                                              |
+| `HOST`            | `server.host`                                              |
+| `YOUTUBE_API_KEY` | the startup YouTube key (below a persisted runtime key)    |
+| `STATE_DIRECTORY` | directory the runtime key is persisted in (set by systemd) |
 
 ## Getting a YouTube API key
 

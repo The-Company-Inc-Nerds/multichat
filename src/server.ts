@@ -8,6 +8,11 @@ import type {
   ServerEvent,
   Settings,
 } from "./types.ts";
+import {
+  isLoopbackAddr,
+  parseYouTubeKeyBody,
+  type ServerHooks,
+} from "./control.ts";
 
 const HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -512,7 +517,10 @@ export function colorFor(name: string): string {
 // a monitor or two); the cap stops an exposed port from being flooded with open streams.
 const MAX_SSE_CLIENTS = 50;
 
-export function createServer(settings: Settings): Emitter {
+export function createServer(
+  settings: Settings,
+  hooks: ServerHooks = {},
+): Emitter {
   const clients = new Set<ReadableStreamDefaultController<Uint8Array>>();
   const enc = new TextEncoder();
 
@@ -566,8 +574,41 @@ export function createServer(settings: Settings): Emitter {
         console.log(`Listening on http://${hostname}:${port}`);
       },
     },
-    (req: Request): Response => {
+    async (req: Request, info: Deno.ServeHandlerInfo): Promise<Response> => {
       const { pathname } = new URL(req.url);
+
+      // Runtime control: set the YouTube API key on the live server. Loopback-only
+      // because the viewer is unauthenticated and may bind 0.0.0.0 — without this
+      // guard the whole LAN could set the key. See control.ts.
+      if (pathname === "/api/youtube-key") {
+        if (req.method !== "POST") {
+          return new Response("Method Not Allowed\n", { status: 405 });
+        }
+        if (!isLoopbackAddr(info.remoteAddr)) {
+          return new Response(
+            "Forbidden: the control endpoint is loopback-only\n",
+            { status: 403 },
+          );
+        }
+        if (!hooks.setYouTubeKey) {
+          return new Response("Runtime key control is not available\n", {
+            status: 501,
+          });
+        }
+        const key = parseYouTubeKeyBody(
+          await req.text(),
+          req.headers.get("content-type"),
+        );
+        if (!key) {
+          return new Response("Bad Request: empty or unparseable key\n", {
+            status: 400,
+          });
+        }
+        const result = await hooks.setYouTubeKey(key);
+        return new Response(result.message + "\n", {
+          status: result.ok ? 200 : 500,
+        });
+      }
 
       if (pathname === "/events") {
         if (clients.size >= MAX_SSE_CLIENTS) {

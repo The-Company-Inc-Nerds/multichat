@@ -117,12 +117,9 @@ in
         message = "services.multichat.youtube.channels: every entry must set at least one of handle, channelId, or videoId.";
       }
       {
-        assertion = cfg.youtube.channels == [ ]
-          || cfg.youtube.apiKey != ""
-          || cfg.youtube.apiKeyFile != null;
-        message = "services.multichat: youtube.channels is non-empty but no YouTube API key is set. Set youtube.apiKey or youtube.apiKeyFile (YouTube polling requires a Data API v3 key).";
-      }
-      {
+        # NB: a YouTube key is NOT required at build time — it can be supplied to
+        # the running server with `multichat set-youtube-key` and is persisted in
+        # the StateDirectory. The missing-key case is a warning below, not an error.
         assertion = builtins.elem cfg.host [ "127.0.0.1" "0.0.0.0" ];
         message = ''services.multichat.host must be "127.0.0.1" or "0.0.0.0": the packaged deno wrapper restricts --allow-net to those addresses, so binding any other host is denied by Deno's permission layer.'';
       }
@@ -133,7 +130,16 @@ in
         ("services.multichat.youtube.apiKey is written world-readable into the Nix store and shown by "
           + "`systemctl show multichat`. Use youtube.apiKeyFile (agenix/sops-nix/systemd credentials) for real secrets.")
       ++ lib.optional (cfg.twitch.channels == [ ] && cfg.youtube.channels == [ ])
-        "services.multichat is enabled but both twitch.channels and youtube.channels are empty; the viewer will show no chat.";
+        "services.multichat is enabled but both twitch.channels and youtube.channels are empty; the viewer will show no chat."
+      ++ lib.optional
+        (cfg.youtube.channels != [ ] && cfg.youtube.apiKey == "" && cfg.youtube.apiKeyFile == null)
+        ("services.multichat: youtube.channels is set but no build-time API key (youtube.apiKey / "
+          + "youtube.apiKeyFile). Twitch works immediately; set the YouTube key on the running server "
+          + "with `multichat set-youtube-key <KEY>` — it persists to the StateDirectory (/var/lib/multichat).");
+
+    # Make the `multichat` CLI available so an operator can run
+    # `multichat set-youtube-key <KEY>` against the running service.
+    environment.systemPackages = [ cfg.package ];
 
     systemd.services.multichat = {
       description = "Multichat combined chat viewer";
@@ -162,6 +168,13 @@ in
         Restart = "on-failure";
         RestartSec = "5s";
         DynamicUser = true;
+
+        # Persist a YouTube key set at runtime (`multichat set-youtube-key`) across
+        # restarts/reboots. systemd creates /var/lib/multichat (0700, owned by the
+        # DynamicUser) and exports $STATE_DIRECTORY; the app writes the key there
+        # (mode 0600). With ProtectSystem=strict this is the only writable path.
+        StateDirectory = "multichat";
+        StateDirectoryMode = "0700";
 
         # --- Sandboxing: stateless, network-only Deno service ---
         # MemoryDenyWriteExecute is deliberately NOT set — V8's JIT requires

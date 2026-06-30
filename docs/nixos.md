@@ -60,6 +60,24 @@ The module is also importable without the flake —
 `imports = [ (import ./module.nix) ];` — and the package builds standalone from
 `build.nix`.
 
+## Supplying the YouTube key at runtime
+
+The YouTube key is **optional at build time**. You can omit both
+`youtube.apiKey` and `youtube.apiKeyFile` and instead hand the key to the
+running service — handy when you would rather not put the key in Nix/agenix at
+all:
+
+```bash
+echo -n "$YT_KEY" | multichat set-youtube-key
+```
+
+The module puts the `multichat` CLI on `PATH` (`environment.systemPackages`) and
+gives the unit a `StateDirectory` (`/var/lib/multichat`), so a key set this way
+is written there (mode `0600`, owned by the service) and reloaded on the next
+start — set it once. Twitch chat works immediately regardless; only YouTube
+waits for the key. The control endpoint is loopback-only (see
+[HTTP & SSE API](api.md)). Full reference: [Configuration](configuration.md).
+
 ## Module options
 
 | Option               | Type                           | Default                | Description                                                                |
@@ -104,13 +122,12 @@ the inline key is not written into the unit at all.
 The module **fails the build** (assertion) when:
 
 - a `youtube.channels` entry sets none of `handle` / `channelId` / `videoId`;
-- `youtube.channels` is non-empty but neither `youtube.apiKey` nor
-  `youtube.apiKeyFile` is set (YouTube polling requires a Data API v3 key);
 - `host` is anything other than `"127.0.0.1"` or `"0.0.0.0"`.
 
 It emits a build-time **warning** when the insecure inline `youtube.apiKey` is
-used, or when both `twitch.channels` and `youtube.channels` are empty (the
-viewer would show no chat).
+used; when both `twitch.channels` and `youtube.channels` are empty (the viewer
+would show no chat); or when `youtube.channels` is set but no build-time key is
+given (a reminder that the key must be supplied at runtime — not an error).
 
 ## Security hardening
 

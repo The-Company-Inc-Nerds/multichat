@@ -30,11 +30,19 @@ pre-commit gate).
 Or directly:
 
 ```bash
-deno run --allow-net --allow-read --allow-env=YOUTUBE_API_KEY,PORT,HOST main.ts [config-path]
+deno run --allow-net --allow-read --allow-write=/var/lib/multichat,/var/lib/private/multichat --allow-env=YOUTUBE_API_KEY,PORT,HOST,STATE_DIRECTORY main.ts [config-path]
 ```
 
-`config-path` defaults to `./settings.json`. Env vars `PORT`, `HOST`, and
-`YOUTUBE_API_KEY` override their settings.json counterparts.
+`config-path` defaults to `./settings.json`. Env vars `PORT` and `HOST` override
+their settings.json counterparts; the YouTube key is resolved as persisted
+runtime key → `YOUTUBE_API_KEY` → `youtube.apiKey`. `--allow-write` /
+`STATE_DIRECTORY` exist only so a runtime-set key can be persisted to
+`$STATE_DIRECTORY/youtube-api-key` (systemd `StateDirectory`); with no state dir
+the key is in-memory only.
+
+The same binary is also a small CLI client: `multichat set-youtube-key [KEY]`
+POSTs a key to a running server's loopback `POST /api/youtube-key` endpoint (key
+from arg or stdin). See `docs/configuration.md`.
 
 ## Configuration
 
@@ -46,17 +54,24 @@ Copy `settings.json.example` to `settings.json` and edit:
 - `youtube.channels` — list of `{handle, channelId, videoId}` objects; supply at
   least one field per entry
 
-YouTube channels require an API key. Twitch works anonymously (read-only via
-`justinfan*`). Full reference: `docs/configuration.md`.
+YouTube channels require an API key, but it need not be in `settings.json` — it
+can be set on the running server with `multichat set-youtube-key` (see above).
+Twitch works anonymously (read-only via `justinfan*`). Full reference:
+`docs/configuration.md`.
 
 ## Architecture
 
 ```
-main.ts          entry point — loads settings, wires the emitter to server + clients
+main.ts          entry point — loads settings, wires the emitter to server + clients;
+                 also the `set-youtube-key` CLI subcommand + the runtime-key manager
 src/types.ts     shared TypeScript interfaces (Settings, ChatMessage, ServerEvent, Emitter)
 src/twitch.ts    Twitch IRC over WebSocket (wss://irc-ws.chat.twitch.tv), with reconnect
-src/youtube.ts   YouTube Data API v3 polling — resolves channel → live video → live chat
-src/server.ts    Deno.serve HTTP server: GET / returns embedded HTML, GET /events is SSE
+src/youtube.ts   YouTube Data API v3 polling — resolves channel → live video → live chat;
+                 startYouTubePoller takes an AbortSignal so it can be torn down/restarted
+src/server.ts    Deno.serve HTTP server: GET / (embedded HTML), GET /events (SSE),
+                 POST /api/youtube-key (loopback-only runtime key control)
+src/control.ts   pure control-plane helpers (loopback check, key-body parse, startup-key
+                 resolution, state path) + the ServerHooks/KeyUpdateResult types
 tests/           one *_test.ts per source module; dependency-free assert shim in _assert.ts
 ```
 

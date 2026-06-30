@@ -31,6 +31,17 @@ deno task start          # start the server
 
 Open `http://localhost:8080`. Use `deno task dev` to auto-restart on changes.
 
+The YouTube API key need not live in `settings.json` — you can set it on the
+running server instead (it persists under systemd), which keeps it out of your
+config and Nix store:
+
+```bash
+echo -n "$YT_KEY" | multichat set-youtube-key
+```
+
+See
+[Configuration](docs/configuration.md#setting-the-youtube-api-key-at-runtime).
+
 ## Documentation
 
 | Doc                                              | Contents                                                                     |

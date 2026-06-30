@@ -7,7 +7,18 @@ import type {
 } from "./types.ts";
 
 const BASE = "https://www.googleapis.com/youtube/v3";
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+// Abortable sleep: resolves early (does not reject) when the signal fires, so a
+// poll loop parked in a backoff wakes immediately when its key is replaced.
+const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
+  new Promise<void>((resolve) => {
+    if (signal?.aborted) return resolve();
+    const t = setTimeout(resolve, ms);
+    signal?.addEventListener("abort", () => {
+      clearTimeout(t);
+      resolve();
+    }, { once: true });
+  });
 
 /** Thrown when the daily/rate quota is exhausted, so callers can back off for a long time
  *  instead of hammering the API (every request just returns 403 until quota resets). */
@@ -238,6 +249,7 @@ async function pollChannel(
   label: string,
   emitter: Emitter,
   cachedCid: string | null,
+  signal?: AbortSignal,
 ): Promise<string | null> {
   emitter.status("youtube", label, "connecting");
   let videoId = ch.videoId || null;
@@ -268,16 +280,17 @@ async function pollChannel(
 
   let token: string | undefined;
   let backoff = 15_000;
-  while (true) {
+  while (!signal?.aborted) {
     let url = `${BASE}/liveChat/messages?liveChatId=${
       encodeURIComponent(chatId)
     }&part=snippet,authorDetails&key=${key}`;
     if (token) url += `&pageToken=${encodeURIComponent(token)}`;
 
     const page = await ytGet<ChatPage>(url); // throws QuotaError → handled by caller
+    if (signal?.aborted) break;
     if (!page) {
       // Transient error — back off exponentially instead of a fixed 15s hammer.
-      await sleep(backoff);
+      await sleep(backoff, signal);
       backoff = Math.min(backoff * 2, POLL_BACKOFF_MAX_MS);
       continue;
     }
@@ -288,33 +301,47 @@ async function pollChannel(
     }
 
     token = page.nextPageToken;
-    await sleep(page.pollingIntervalMillis ?? 5_000);
+    await sleep(page.pollingIntervalMillis ?? 5_000, signal);
   }
+  return cid;
 }
 
+// `signal` lets a running poller be torn down so a new one can start with a
+// fresh API key (see the runtime-key control plane in main.ts / control.ts).
+// When omitted, the poller runs forever, exactly as before.
 export function startYouTubePoller(
   config: YouTubeConfig,
   emitter: Emitter,
+  signal?: AbortSignal,
 ): void {
   for (const ch of config.channels) {
     const label = ch.handle ?? ch.channelId ?? ch.videoId ?? "unknown";
     (async () => {
       let cid: string | null = ch.channelId || null; // resolve once, then reuse
-      while (true) {
+      while (!signal?.aborted) {
         try {
           // Normal return means the channel is offline / chat ended.
-          cid = await pollChannel(config.apiKey, ch, label, emitter, cid);
-          await sleep(OFFLINE_RECHECK_MS);
+          cid = await pollChannel(
+            config.apiKey,
+            ch,
+            label,
+            emitter,
+            cid,
+            signal,
+          );
+          if (signal?.aborted) break;
+          await sleep(OFFLINE_RECHECK_MS, signal);
         } catch (e) {
+          if (signal?.aborted) break;
           emitter.status("youtube", label, "error");
           if (e instanceof QuotaError) {
             console.error(
               `[YouTube] ${label}: quota exceeded — backing off 15m`,
             );
-            await sleep(QUOTA_BACKOFF_MS);
+            await sleep(QUOTA_BACKOFF_MS, signal);
           } else {
             console.error(`[YouTube] ${label}: ${e}`);
-            await sleep(ERROR_RETRY_MS);
+            await sleep(ERROR_RETRY_MS, signal);
           }
         }
       }

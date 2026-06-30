@@ -1,8 +1,8 @@
 {
   "tasks": {
-    "start": "deno run --allow-net=irc-ws.chat.twitch.tv,www.googleapis.com,127.0.0.1,0.0.0.0 --allow-read --allow-env=YOUTUBE_API_KEY,PORT,HOST main.ts",
-    "dev": "deno run --watch --allow-net=irc-ws.chat.twitch.tv,www.googleapis.com,127.0.0.1,0.0.0.0 --allow-read --allow-env=YOUTUBE_API_KEY,PORT,HOST main.ts",
-    "compile": "deno compile --allow-net=irc-ws.chat.twitch.tv,www.googleapis.com,127.0.0.1,0.0.0.0 --allow-read --allow-env=YOUTUBE_API_KEY,PORT,HOST --output multichat main.ts",
+    "start": "deno run --allow-net=irc-ws.chat.twitch.tv,www.googleapis.com,127.0.0.1,0.0.0.0 --allow-read --allow-write=/var/lib/multichat,/var/lib/private/multichat --allow-env=YOUTUBE_API_KEY,PORT,HOST,STATE_DIRECTORY main.ts",
+    "dev": "deno run --watch --allow-net=irc-ws.chat.twitch.tv,www.googleapis.com,127.0.0.1,0.0.0.0 --allow-read --allow-write=/var/lib/multichat,/var/lib/private/multichat --allow-env=YOUTUBE_API_KEY,PORT,HOST,STATE_DIRECTORY main.ts",
+    "compile": "deno compile --allow-net=irc-ws.chat.twitch.tv,www.googleapis.com,127.0.0.1,0.0.0.0 --allow-read --allow-write=/var/lib/multichat,/var/lib/private/multichat --allow-env=YOUTUBE_API_KEY,PORT,HOST,STATE_DIRECTORY --output multichat main.ts",
     "test": "deno test",
     "check": "deno check main.ts src/*.ts tests/*.ts",
     "lint": "deno lint",

@@ -1,8 +1,8 @@
 # HTTP & SSE API
 
-multichat serves a single page and a Server-Sent Events stream. There is no REST
-surface and no authentication — it is a read-only viewer meant to run on a
-trusted network.
+multichat serves a single page and a Server-Sent Events stream. The viewer
+surface is read-only and unauthenticated — meant to run on a trusted network —
+plus one loopback-only control endpoint for setting the YouTube API key.
 
 ## Endpoints
 
@@ -10,11 +10,33 @@ trusted network.
 | ------ | ----------------------- | ------------------- | ---------------------------------------------------- |
 | `GET`  | `/` (and `/index.html`) | `text/html`         | The viewer page (HTML/CSS/JS embedded in the binary) |
 | `GET`  | `/events`               | `text/event-stream` | The live SSE feed of chat events                     |
+| `POST` | `/api/youtube-key`      | `text/plain`        | Set the YouTube API key (loopback-only — see below)  |
 | any    | anything else           | `404`               | Not found                                            |
 
 `/events` returns `503` once 50 concurrent streams are open (a flood guard,
 since the viewer is unauthenticated). The browser's `EventSource` retries
 automatically.
+
+## `POST /api/youtube-key`
+
+Sets the YouTube Data API v3 key on the running server, which (re)starts YouTube
+polling for the configured channels. Normally invoked through the CLI
+(`multichat set-youtube-key`, see [Configuration](configuration.md)) rather than
+called directly.
+
+- **Loopback-only.** Requests whose peer is not `127.0.0.1` / `::1` (or a
+  unix-domain socket) get `403`. The viewer is unauthenticated and may bind
+  `0.0.0.0`, so this guard keeps the rest of the network from setting the key.
+- **Body.** Either the raw key as `text/plain`, or JSON `{ "key": "AIza…" }`
+  (`Content-Type: application/json`). The value is trimmed.
+
+| Status | Meaning                                                        |
+| ------ | -------------------------------------------------------------- |
+| `200`  | Key accepted; body describes how many channels are now polling |
+| `400`  | Body was empty or could not be parsed into a key               |
+| `403`  | Request did not originate from loopback                        |
+| `405`  | Method was not `POST`                                          |
+| `501`  | The server was started without runtime-key control enabled     |
 
 ## The SSE stream
 
