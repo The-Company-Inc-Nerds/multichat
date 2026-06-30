@@ -16,6 +16,8 @@ Deno built-ins only.
   Stickers, memberships
 - **Live deletions** — moderator timeouts/bans and removed messages disappear
   from the feed
+- **OBS overlay** — `/overlay` renders the feed transparent and messages-only
+  (new at the bottom, old sliding off the top) for a browser source
 
 Twitch connects anonymously (no account or token). YouTube requires a free Data
 API v3 key.

@@ -273,6 +273,33 @@ const HTML = `<!DOCTYPE html>
       }
       body.nav #side { transform: translateX(0); }
     }
+
+    /* ---- OBS overlay mode (visit /overlay or add ?overlay) ----
+       Transparent page, messages only, anchored to the bottom; older messages
+       slide up and clip off the top (a soft top fade smooths the exit). Drop it
+       into an OBS browser source — no chroma key needed, the page is see-through. */
+    body.overlay {
+      background: transparent;
+      font-size: 15px;
+    }
+    body.overlay header,
+    body.overlay #side,
+    body.overlay #jump { display: none; }
+    body.overlay #main { background: transparent; }
+    body.overlay #chat {
+      background: transparent;
+      overflow: hidden;            /* no scrollbar; oldest rows clip off the top */
+      padding: 6px 12px 10px;
+      -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 56px);
+      mask-image: linear-gradient(to bottom, transparent 0, #000 56px);
+    }
+    body.overlay .msg { background: none; }
+    body.overlay .chan { display: none; }   /* the T/YT badge already shows source */
+    /* legibility over arbitrary video — text-shadow inherits to the row's text */
+    body.overlay #chat .msg,
+    body.overlay #chat .event {
+      text-shadow: 0 1px 2px rgba(0,0,0,0.95), 0 0 5px rgba(0,0,0,0.8);
+    }
   </style>
 </head>
 <body>
@@ -298,6 +325,12 @@ const HTML = `<!DOCTYPE html>
     var pinned = true;
     var count  = 0;
     var MAX    = 500;
+
+    // OBS overlay mode: /overlay or ?overlay → transparent, messages-only, bottom-anchored.
+    if (location.pathname === '/overlay' ||
+        new URLSearchParams(location.search).has('overlay')) {
+      document.body.classList.add('overlay');
+    }
 
     chat.addEventListener('scroll', function() {
       var atBottom = chat.scrollTop + chat.clientHeight >= chat.scrollHeight - 60;
@@ -581,33 +614,25 @@ export function createServer(
       // because the viewer is unauthenticated and may bind 0.0.0.0 — without this
       // guard the whole LAN could set the key. See control.ts.
       if (pathname === "/api/youtube-key") {
-        if (req.method !== "POST") {
-          return new Response("Method Not Allowed\n", { status: 405 });
-        }
+        // Tag every control response so the CLI can tell multichat apart from
+        // some *other* server it reached on a mistaken port (which would 401/404
+        // without this header) and give a "wrong --port?" hint instead.
+        const ctl = (body: string, status: number) =>
+          new Response(body, { status, headers: { "x-multichat": "control" } });
+        if (req.method !== "POST") return ctl("Method Not Allowed\n", 405);
         if (!isLoopbackAddr(info.remoteAddr)) {
-          return new Response(
-            "Forbidden: the control endpoint is loopback-only\n",
-            { status: 403 },
-          );
+          return ctl("Forbidden: the control endpoint is loopback-only\n", 403);
         }
         if (!hooks.setYouTubeKey) {
-          return new Response("Runtime key control is not available\n", {
-            status: 501,
-          });
+          return ctl("Runtime key control is not available\n", 501);
         }
         const key = parseYouTubeKeyBody(
           await req.text(),
           req.headers.get("content-type"),
         );
-        if (!key) {
-          return new Response("Bad Request: empty or unparseable key\n", {
-            status: 400,
-          });
-        }
+        if (!key) return ctl("Bad Request: empty or unparseable key\n", 400);
         const result = await hooks.setYouTubeKey(key);
-        return new Response(result.message + "\n", {
-          status: result.ok ? 200 : 500,
-        });
+        return ctl(result.message + "\n", result.ok ? 200 : 500);
       }
 
       if (pathname === "/events") {
@@ -643,7 +668,10 @@ export function createServer(
         });
       }
 
-      if (pathname === "/" || pathname === "/index.html") {
+      if (
+        pathname === "/" || pathname === "/index.html" ||
+        pathname === "/overlay"
+      ) {
         return new Response(HTML, {
           headers: { "Content-Type": "text/html; charset=utf-8" },
         });

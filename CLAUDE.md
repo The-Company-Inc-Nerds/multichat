@@ -68,7 +68,8 @@ src/types.ts     shared TypeScript interfaces (Settings, ChatMessage, ServerEven
 src/twitch.ts    Twitch IRC over WebSocket (wss://irc-ws.chat.twitch.tv), with reconnect
 src/youtube.ts   YouTube Data API v3 polling — resolves channel → live video → live chat;
                  startYouTubePoller takes an AbortSignal so it can be torn down/restarted
-src/server.ts    Deno.serve HTTP server: GET / (embedded HTML), GET /events (SSE),
+src/server.ts    Deno.serve HTTP server: GET / + GET /overlay (embedded HTML; overlay
+                 mode = transparent OBS browser source), GET /events (SSE),
                  POST /api/youtube-key (loopback-only runtime key control)
 src/control.ts   pure control-plane helpers (loopback check, key-body parse, startup-key
                  resolution, state path) + the ServerHooks/KeyUpdateResult types

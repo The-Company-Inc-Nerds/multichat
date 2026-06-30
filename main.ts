@@ -230,6 +230,17 @@ async function runSetYouTubeKey(args: string[]): Promise<void> {
     console.log(text || "YouTube API key updated.");
     Deno.exit(0);
   }
+  // No X-Multichat header => we reached some *other* server on this port (a
+  // common mix-up: another app, or multichat on a different port). Say so plainly
+  // instead of surfacing that server's opaque error (e.g. a 401 from a neighbour).
+  if (res.headers.get("x-multichat") === null) {
+    console.error(
+      `The server at ${target}:${port} does not look like multichat ` +
+        `(HTTP ${res.status}, no X-Multichat header). Is multichat listening on ` +
+        `that port? Pass the right one with --port <port>.`,
+    );
+    Deno.exit(1);
+  }
   console.error(`Failed (HTTP ${res.status}): ${text}`);
   Deno.exit(1);
 }

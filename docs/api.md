@@ -9,9 +9,23 @@ plus one loopback-only control endpoint for setting the YouTube API key.
 | Method | Path                    | Response            | Description                                          |
 | ------ | ----------------------- | ------------------- | ---------------------------------------------------- |
 | `GET`  | `/` (and `/index.html`) | `text/html`         | The viewer page (HTML/CSS/JS embedded in the binary) |
+| `GET`  | `/overlay`              | `text/html`         | Same page in OBS overlay mode (see below)            |
 | `GET`  | `/events`               | `text/event-stream` | The live SSE feed of chat events                     |
 | `POST` | `/api/youtube-key`      | `text/plain`        | Set the YouTube API key (loopback-only — see below)  |
 | any    | anything else           | `404`               | Not found                                            |
+
+The viewer page also takes an `?overlay` query param (`/?overlay` is equivalent
+to `/overlay`).
+
+## Overlay mode (`/overlay`)
+
+A stripped-down rendering of the same feed for use as an **OBS browser source**:
+transparent background (no chroma key needed), no header or channel sidebar,
+just the messages anchored to the bottom — new ones appear at the bottom and
+older ones slide up and clip off the top (with a soft top fade). The platform
+badge still tags each message's source. Point an OBS Browser source at
+`http://<host>:<port>/overlay` and size it to your scene; everything else (SSE
+feed, message shapes) is identical to the normal viewer.
 
 `/events` returns `503` once 50 concurrent streams are open (a flood guard,
 since the viewer is unauthenticated). The browser's `EventSource` retries
