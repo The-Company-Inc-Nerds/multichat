@@ -293,11 +293,16 @@ const HTML = `<!DOCTYPE html>
       -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 56px);
       mask-image: linear-gradient(to bottom, transparent 0, #000 56px);
     }
-    body.overlay .msg { background: none; }
     body.overlay .chan { display: none; }   /* the T/YT badge already shows source */
-    /* legibility over arbitrary video — text-shadow inherits to the row's text */
+    /* Each row gets its own translucent dark pill so the near-white text stays
+       legible over any video — or a plain browser tab — while the page itself
+       stays see-through for OBS. text-shadow adds extra bite at the glyph edges. */
     body.overlay #chat .msg,
     body.overlay #chat .event {
+      background: rgba(0,0,0,0.55);
+      border-radius: 6px;
+      margin: 0 0 4px;
+      padding: 3px 10px;
       text-shadow: 0 1px 2px rgba(0,0,0,0.95), 0 0 5px rgba(0,0,0,0.8);
     }
   </style>
@@ -327,10 +332,9 @@ const HTML = `<!DOCTYPE html>
     var MAX    = 500;
 
     // OBS overlay mode: /overlay or ?overlay → transparent, messages-only, bottom-anchored.
-    if (location.pathname === '/overlay' ||
-        new URLSearchParams(location.search).has('overlay')) {
-      document.body.classList.add('overlay');
-    }
+    var overlayMode = location.pathname === '/overlay' ||
+        new URLSearchParams(location.search).has('overlay');
+    if (overlayMode) document.body.classList.add('overlay');
 
     chat.addEventListener('scroll', function() {
       var atBottom = chat.scrollTop + chat.clientHeight >= chat.scrollHeight - 60;
@@ -399,7 +403,9 @@ const HTML = `<!DOCTYPE html>
       row.setAttribute('data-channel', m.channel);
       if (m.accentColor) {
         row.style.borderLeftColor = m.accentColor;
-        row.style.background = hexFade(m.accentColor);
+        // In overlay mode the CSS gives every row a dark pill; the faint accent
+        // tint would sit on top of it and hurt legibility, so keep just the border.
+        if (!overlayMode) row.style.background = hexFade(m.accentColor);
       }
 
       var head = make('div', 'ehead');
