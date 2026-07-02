@@ -12,6 +12,8 @@ broadcaster, which pushes events to connected browsers over Server-Sent Events.
 | `src/twitch.ts`  | Twitch IRC over WebSocket (`wss://irc-ws.chat.twitch.tv`), with reconnect               |
 | `src/youtube.ts` | YouTube Data API v3 polling — resolves channel → live video → live chat                 |
 | `src/server.ts`  | `Deno.serve` HTTP server + the embedded viewer HTML/CSS/JS                              |
+| `src/control.ts` | Pure control-plane helpers (loopback check, key-body parse, startup-key resolution)     |
+| `src/fake.ts`    | Fake-event demo sequence + wire (de)serialization/validation behind `POST /api/fake`    |
 
 ## Data flow
 
@@ -66,6 +68,12 @@ call). See [Reliability & limits](#reliability--limits) for the quota handling.
   immediately on load.
 - **Author colors.** Derived once, server-side (`colorFor`), so a name maps to a
   stable color across both platforms.
+- **Fake events reuse the real path.** The loopback-only `POST /api/fake`
+  endpoint (driven by `multichat fake`) dispatches parsed events through the
+  same `Emitter` instance the platform clients use, so a previewed message is
+  identical downstream to a real one. `src/fake.ts` holds the curated demo
+  sequence and re-validates the wire body before it reaches the emitter — the
+  same "logic in `src/`, wiring elsewhere" split as `src/control.ts`.
 
 ## Reliability & limits
 

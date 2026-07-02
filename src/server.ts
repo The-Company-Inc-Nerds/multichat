@@ -13,6 +13,7 @@ import {
   parseYouTubeKeyBody,
   type ServerHooks,
 } from "./control.ts";
+import { describeFakeAction, parseFakeAction } from "./fake.ts";
 
 const HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -605,6 +606,26 @@ export function createServer(
     }
   }, 25_000);
 
+  // The live sink. Defined before Deno.serve so the /api/fake route can inject
+  // through the very same path a real platform message takes (colorFor fill,
+  // status registry, broadcast) — a faked event is indistinguishable downstream.
+  const emitter: Emitter = {
+    message(msg: ChatMessage): void {
+      if (!msg.authorColor) msg.authorColor = colorFor(msg.author);
+      broadcast({ type: "message", data: msg });
+    },
+    delete(ev: DeleteEvent): void {
+      broadcast({ type: "delete", ...ev });
+    },
+    status(platform: Platform, name: string, state: ChannelState): void {
+      const k = key(platform, name);
+      const existing = statuses.get(k);
+      if (existing && existing.state === state) return;
+      statuses.set(k, { platform, name, state });
+      broadcast({ type: "status", data: [...statuses.values()] });
+    },
+  };
+
   Deno.serve(
     {
       port: settings.server.port,
@@ -639,6 +660,31 @@ export function createServer(
         if (!key) return ctl("Bad Request: empty or unparseable key\n", 400);
         const result = await hooks.setYouTubeKey(key);
         return ctl(result.message + "\n", result.ok ? 200 : 500);
+      }
+
+      // Runtime testing aid: inject a fake chat event straight into the SSE feed
+      // so you can preview how each message kind renders without a live stream.
+      // Loopback-only for the same reason as the key endpoint — the viewer is
+      // unauthenticated and may bind 0.0.0.0. Driven by `multichat fake`. See fake.ts.
+      if (pathname === "/api/fake") {
+        const ctl = (body: string, status: number) =>
+          new Response(body, { status, headers: { "x-multichat": "control" } });
+        if (req.method !== "POST") return ctl("Method Not Allowed\n", 405);
+        if (!isLoopbackAddr(info.remoteAddr)) {
+          return ctl(
+            "Forbidden: the fake-event endpoint is loopback-only\n",
+            403,
+          );
+        }
+        const parsed = parseFakeAction(await req.text());
+        if (!parsed.ok) {
+          return ctl("Bad Request: " + parsed.message + "\n", 400);
+        }
+        const a = parsed.action;
+        if (a.action === "message") emitter.message(a.data);
+        else if (a.action === "delete") emitter.delete(a.data);
+        else emitter.status(a.data.platform, a.data.name, a.data.state);
+        return ctl("Injected: " + describeFakeAction(a) + "\n", 200);
       }
 
       if (pathname === "/events") {
@@ -687,20 +733,5 @@ export function createServer(
     },
   );
 
-  return {
-    message(msg: ChatMessage): void {
-      if (!msg.authorColor) msg.authorColor = colorFor(msg.author);
-      broadcast({ type: "message", data: msg });
-    },
-    delete(ev: DeleteEvent): void {
-      broadcast({ type: "delete", ...ev });
-    },
-    status(platform: Platform, name: string, state: ChannelState): void {
-      const k = key(platform, name);
-      const existing = statuses.get(k);
-      if (existing && existing.state === state) return;
-      statuses.set(k, { platform, name, state });
-      broadcast({ type: "status", data: [...statuses.values()] });
-    },
-  };
+  return emitter;
 }

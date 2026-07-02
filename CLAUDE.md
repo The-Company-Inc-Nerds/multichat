@@ -22,6 +22,7 @@ deno task check          # type-check main.ts, src/, tests/
 deno task lint           # lint
 deno task fmt            # format
 deno task compile        # build a standalone binary ./multichat
+deno task fake           # play a demo of every message kind into a running server
 ```
 
 In the dev shell, `runchecks` runs fmt-check + lint + check + test (the
@@ -40,9 +41,15 @@ runtime key → `YOUTUBE_API_KEY` → `youtube.apiKey`. `--allow-write` /
 `$STATE_DIRECTORY/youtube-api-key` (systemd `StateDirectory`); with no state dir
 the key is in-memory only.
 
-The same binary is also a small CLI client: `multichat set-youtube-key [KEY]`
-POSTs a key to a running server's loopback `POST /api/youtube-key` endpoint (key
-from arg or stdin). See `docs/configuration.md`.
+The same binary is also a small CLI client:
+
+- `multichat set-youtube-key [KEY]` POSTs a key to a running server's loopback
+  `POST /api/youtube-key` endpoint (key from arg or stdin). See
+  `docs/configuration.md`.
+- `multichat fake` plays a fixed showcase of every message kind (chat, action,
+  cheer, sub, raid, Super Chat, sticker, membership, system, a live deletion)
+  into a running server's loopback `POST /api/fake` endpoint, for previewing how
+  they render without a live stream. See `docs/development/testing.md`.
 
 ## Configuration
 
@@ -63,16 +70,19 @@ Twitch works anonymously (read-only via `justinfan*`). Full reference:
 
 ```
 main.ts          entry point — loads settings, wires the emitter to server + clients;
-                 also the `set-youtube-key` CLI subcommand + the runtime-key manager
+                 also the `set-youtube-key` / `fake` CLI subcommands + the runtime-key manager
 src/types.ts     shared TypeScript interfaces (Settings, ChatMessage, ServerEvent, Emitter)
 src/twitch.ts    Twitch IRC over WebSocket (wss://irc-ws.chat.twitch.tv), with reconnect
 src/youtube.ts   YouTube Data API v3 polling — resolves channel → live video → live chat;
                  startYouTubePoller takes an AbortSignal so it can be torn down/restarted
 src/server.ts    Deno.serve HTTP server: GET / + GET /overlay (embedded HTML; overlay
                  mode = transparent OBS browser source), GET /events (SSE),
-                 POST /api/youtube-key (loopback-only runtime key control)
+                 POST /api/youtube-key (loopback-only runtime key control),
+                 POST /api/fake (loopback-only fake-event injection for previewing)
 src/control.ts   pure control-plane helpers (loopback check, key-body parse, startup-key
                  resolution, state path) + the ServerHooks/KeyUpdateResult types
+src/fake.ts      pure fake-event helpers: the curated demo sequence + wire
+                 (de)serialization/validation behind POST /api/fake
 tests/           one *_test.ts per source module; dependency-free assert shim in _assert.ts
 ```
 

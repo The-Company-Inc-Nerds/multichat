@@ -158,7 +158,7 @@ const CHEER_TIERS: Array<{ min: number; color: string }> = [
   { min: 1, color: "#9c9c9c" },
 ];
 
-function cheerColor(bits: number): string {
+export function cheerColor(bits: number): string {
   for (const t of CHEER_TIERS) if (bits >= t.min) return t.color;
   return "#9c9c9c";
 }

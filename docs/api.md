@@ -2,17 +2,19 @@
 
 multichat serves a single page and a Server-Sent Events stream. The viewer
 surface is read-only and unauthenticated — meant to run on a trusted network —
-plus one loopback-only control endpoint for setting the YouTube API key.
+plus two loopback-only control endpoints: setting the YouTube API key, and
+injecting fake events for previewing how they render.
 
 ## Endpoints
 
-| Method | Path                    | Response            | Description                                          |
-| ------ | ----------------------- | ------------------- | ---------------------------------------------------- |
-| `GET`  | `/` (and `/index.html`) | `text/html`         | The viewer page (HTML/CSS/JS embedded in the binary) |
-| `GET`  | `/overlay`              | `text/html`         | Same page in OBS overlay mode (see below)            |
-| `GET`  | `/events`               | `text/event-stream` | The live SSE feed of chat events                     |
-| `POST` | `/api/youtube-key`      | `text/plain`        | Set the YouTube API key (loopback-only — see below)  |
-| any    | anything else           | `404`               | Not found                                            |
+| Method | Path                    | Response            | Description                                                         |
+| ------ | ----------------------- | ------------------- | ------------------------------------------------------------------- |
+| `GET`  | `/` (and `/index.html`) | `text/html`         | The viewer page (HTML/CSS/JS embedded in the binary)                |
+| `GET`  | `/overlay`              | `text/html`         | Same page in OBS overlay mode (see below)                           |
+| `GET`  | `/events`               | `text/event-stream` | The live SSE feed of chat events                                    |
+| `POST` | `/api/youtube-key`      | `text/plain`        | Set the YouTube API key (loopback-only — see below)                 |
+| `POST` | `/api/fake`             | `text/plain`        | Inject a fake chat event for previewing (loopback-only — see below) |
+| any    | anything else           | `404`               | Not found                                                           |
 
 The viewer page also takes an `?overlay` query param (`/?overlay` is equivalent
 to `/overlay`).
@@ -51,6 +53,31 @@ called directly.
 | `403`  | Request did not originate from loopback                        |
 | `405`  | Method was not `POST`                                          |
 | `501`  | The server was started without runtime-key control enabled     |
+
+## `POST /api/fake`
+
+Injects a single fabricated event straight into the SSE feed, so you can preview
+how each message kind renders without a live stream. The event goes through the
+exact same `Emitter` path as a real message (author-color fill, status registry,
+broadcast) — it is indistinguishable downstream. Normally driven by the CLI
+(`multichat fake`, see
+[Testing](development/testing.md#previewing-message-rendering-with-fake)) rather
+than called directly.
+
+- **Loopback-only.** Same guard as `/api/youtube-key` — a non-loopback peer gets
+  `403`. The viewer is unauthenticated and may bind `0.0.0.0`, so this keeps the
+  rest of the network from pushing events to every viewer.
+- **Body.** A JSON object `{ "action": …, "data": … }`, one of:
+  - `{"action":"message","data":{/* ChatMessage — platform, channel, author required */}}`
+  - `{"action":"delete","data":{"platform":…,"channel":…,"messageId"?:…,"author"?:…}}`
+  - `{"action":"status","data":{"platform":…,"name":…,"state":…}}`
+
+| Status | Meaning                                                    |
+| ------ | ---------------------------------------------------------- |
+| `200`  | Injected; body is a one-line summary of what was broadcast |
+| `400`  | Body was not valid JSON, or a field was missing/invalid    |
+| `403`  | Request did not originate from loopback                    |
+| `405`  | Method was not `POST`                                      |
 
 ## The SSE stream
 
