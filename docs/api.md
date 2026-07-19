@@ -7,27 +7,46 @@ injecting fake events for previewing how they render.
 
 ## Endpoints
 
-| Method | Path                    | Response            | Description                                                         |
-| ------ | ----------------------- | ------------------- | ------------------------------------------------------------------- |
-| `GET`  | `/` (and `/index.html`) | `text/html`         | The viewer page (HTML/CSS/JS embedded in the binary)                |
-| `GET`  | `/overlay`              | `text/html`         | Same page in OBS overlay mode (see below)                           |
-| `GET`  | `/events`               | `text/event-stream` | The live SSE feed of chat events                                    |
-| `POST` | `/api/youtube-key`      | `text/plain`        | Set the YouTube API key (loopback-only — see below)                 |
-| `POST` | `/api/fake`             | `text/plain`        | Inject a fake chat event for previewing (loopback-only — see below) |
-| any    | anything else           | `404`               | Not found                                                           |
+| Method | Path                    | Response            | Description                                                          |
+| ------ | ----------------------- | ------------------- | -------------------------------------------------------------------- |
+| `GET`  | `/` (and `/index.html`) | `text/html`         | The viewer page (HTML/CSS/JS embedded in the binary)                 |
+| `GET`  | `/overlay`              | `text/html`         | Same page in OBS overlay mode (see below)                            |
+| `GET`  | `/alerts`               | `text/html`         | Same page in OBS alerts mode — animated shoutout pop-ups (see below) |
+| `GET`  | `/events`               | `text/event-stream` | The live SSE feed of chat events                                     |
+| `POST` | `/api/youtube-key`      | `text/plain`        | Set the YouTube API key (loopback-only — see below)                  |
+| `POST` | `/api/fake`             | `text/plain`        | Inject a fake chat event for previewing (loopback-only — see below)  |
+| any    | anything else           | `404`               | Not found                                                            |
 
-The viewer page also takes an `?overlay` query param (`/?overlay` is equivalent
-to `/overlay`).
+The viewer page also takes `?overlay` and `?alerts` query params (`/?overlay` is
+equivalent to `/overlay`, `/?alerts` to `/alerts`).
 
 ## Overlay mode (`/overlay`)
 
 A stripped-down rendering of the same feed for use as an **OBS browser source**:
 transparent background (no chroma key needed), no header or channel sidebar,
 just the messages anchored to the bottom — new ones appear at the bottom and
-older ones slide up and clip off the top (with a soft top fade). The platform
-badge still tags each message's source. Point an OBS Browser source at
+older ones slide up and clip off the top (with a soft top fade). Each row also
+pops in, and highlighted event rows glow their accent color. The platform badge
+still tags each message's source. Point an OBS Browser source at
 `http://<host>:<port>/overlay` and size it to your scene; everything else (SSE
 feed, message shapes) is identical to the normal viewer.
+
+## Alerts mode (`/alerts`)
+
+A dedicated **shoutout** browser source: also transparent, but instead of the
+chat stream it plays one big animated card at a time, centered, for the
+highlight events — follows, cheers/bits, subs, gift subs, resubs, raids (Twitch,
+via EventSub) and Super Chats, Super Stickers, memberships (YouTube). Cards are
+queued and auto-dismiss (~6s each) so a burst never overlaps; plain chat and
+system notices are ignored. It reads the same `/events` SSE feed, so
+[`multichat fake`](development/testing.md) previews it too. Point a second OBS
+Browser source at `http://<host>:<port>/alerts`. Configuring the events requires
+[Twitch EventSub](configuration.md#twitch-eventsub-alerts).
+
+The overlay renders the configured **alert theme** (from `settings.json`'s
+`alerts` block, see [Alert themes](configuration.md#alert-themes)); a
+`?theme=NAME` query param overrides the active theme for that source
+(`/alerts?theme=The%20Company,%20Inc`).
 
 `/events` returns `503` once 50 concurrent streams are open (a flood guard,
 since the viewer is unauthenticated). The browser's `EventSource` retries
@@ -136,20 +155,20 @@ changes).
 Defined in [`src/types.ts`](../src/types.ts). All fields beyond the first block
 are optional.
 
-| Field         | Type                    | Description                                                                                             |
-| ------------- | ----------------------- | ------------------------------------------------------------------------------------------------------- |
-| `id`          | string                  | Stable message id (used for deletions)                                                                  |
-| `platform`    | `"twitch" \| "youtube"` | Source platform                                                                                         |
-| `channel`     | string                  | Channel name / label                                                                                    |
-| `author`      | string                  | Display name                                                                                            |
-| `content`     | string                  | Plain-text body (fallback when `segments` is absent)                                                    |
-| `timestamp`   | number                  | Epoch milliseconds                                                                                      |
-| `authorColor` | string?                 | CSS color; derived from the name if the platform gives none                                             |
-| `segments`    | Segment[]?              | Tokenized body: `{type:"text",text}` or `{type:"emote",url,alt}`                                        |
-| `badges`      | Badge[]?                | Role chips: `{id,label}`                                                                                |
-| `kind`        | MessageKind?            | `chat` (default), `action`, `cheer`, `sub`, `raid`, `superchat`, `supersticker`, `membership`, `system` |
-| `amount`      | string?                 | e.g. `"500 bits"`, `"$5.00"`                                                                            |
-| `accentColor` | string?                 | Highlight color for event rows / tiers                                                                  |
-| `eventText`   | string?                 | Notice line for event rows, e.g. "X subscribed for 3 months"                                            |
+| Field         | Type                    | Description                                                                                                       |
+| ------------- | ----------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `id`          | string                  | Stable message id (used for deletions)                                                                            |
+| `platform`    | `"twitch" \| "youtube"` | Source platform                                                                                                   |
+| `channel`     | string                  | Channel name / label                                                                                              |
+| `author`      | string                  | Display name                                                                                                      |
+| `content`     | string                  | Plain-text body (fallback when `segments` is absent)                                                              |
+| `timestamp`   | number                  | Epoch milliseconds                                                                                                |
+| `authorColor` | string?                 | CSS color; derived from the name if the platform gives none                                                       |
+| `segments`    | Segment[]?              | Tokenized body: `{type:"text",text}` or `{type:"emote",url,alt}`                                                  |
+| `badges`      | Badge[]?                | Role chips: `{id,label}`                                                                                          |
+| `kind`        | MessageKind?            | `chat` (default), `action`, `cheer`, `sub`, `raid`, `follow`, `superchat`, `supersticker`, `membership`, `system` |
+| `amount`      | string?                 | e.g. `"500 bits"`, `"$5.00"`                                                                                      |
+| `accentColor` | string?                 | Highlight color for event rows / tiers                                                                            |
+| `eventText`   | string?                 | Notice line for event rows, e.g. "X subscribed for 3 months"                                                      |
 
 See [Chat Features](features.md) for how these fields are rendered.

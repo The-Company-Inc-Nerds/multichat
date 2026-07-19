@@ -44,6 +44,7 @@ const MESSAGE_KINDS: readonly string[] = [
   "cheer",
   "sub",
   "raid",
+  "follow",
   "superchat",
   "supersticker",
   "membership",
@@ -120,6 +121,14 @@ export function demoActions(now = 0): FakeAction[] {
       author: "OopsUser",
       kind: "chat",
       content: "this message will be deleted in a moment…",
+    }),
+    message({
+      platform: "twitch",
+      channel: TW,
+      author: "NewFollower",
+      kind: "follow",
+      accentColor: "#a970ff",
+      eventText: "NewFollower followed",
     }),
     message({
       platform: "twitch",

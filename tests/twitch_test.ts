@@ -160,6 +160,62 @@ Deno.test("handleCommand: USERNOTICE raid carries viewer count", () => {
   assertEquals(m.amount, "50 viewers");
 });
 
+Deno.test("handleCommand: covered channel keeps a cheer as plain chat text", () => {
+  const e = fakeEmitter();
+  const msg = parseIRC(
+    "@id=a;display-name=Foo;bits=1000 :foo!foo@x PRIVMSG #chan :cheer1000 go",
+  )!;
+  handleCommand(msg, e, () => true);
+  const m = e.captured.messages[0];
+  assertEquals(m.kind, "chat"); // EventSub emits the highlighted cheer instead
+  assertEquals(m.amount, undefined);
+  assertEquals(m.accentColor, undefined);
+  assertEquals(m.content, "cheer1000 go"); // the comment is preserved
+});
+
+Deno.test("handleCommand: covered channel drops USERNOTICE sub and raid", () => {
+  const e = fakeEmitter();
+  handleCommand(
+    parseIRC("@msg-id=resub;display-name=Foo USERNOTICE #chan :hi")!,
+    e,
+    () => true,
+  );
+  handleCommand(
+    parseIRC("@msg-id=raid;msg-param-viewerCount=50 USERNOTICE #chan")!,
+    e,
+    () => true,
+  );
+  assertEquals(e.captured.messages.length, 0); // both come from EventSub instead
+});
+
+Deno.test("handleCommand: covered channel still emits announcements (not EventSub-covered)", () => {
+  const e = fakeEmitter();
+  handleCommand(
+    parseIRC(
+      "@msg-id=announcement;msg-param-color=BLUE;system-msg=Heads\\sup USERNOTICE #chan :read this",
+    )!,
+    e,
+    () => true,
+  );
+  assertEquals(e.captured.messages.length, 1);
+  assertEquals(e.captured.messages[0].eventText, "Heads up");
+});
+
+Deno.test("handleCommand: predicate is per-channel (other channels unaffected)", () => {
+  const e = fakeEmitter();
+  const covered = (ch: string) => ch === "covered";
+  handleCommand(
+    parseIRC(
+      "@id=a;display-name=Foo;bits=500 :foo!foo@x PRIVMSG #other :cheer500",
+    )!,
+    e,
+    covered,
+  );
+  const m = e.captured.messages[0];
+  assertEquals(m.kind, "cheer"); // #other is not covered → normal IRC behavior
+  assertEquals(m.amount, "500 bits");
+});
+
 Deno.test("handleCommand: CLEARMSG deletes a single message by id", () => {
   const e = fakeEmitter();
   const msg = parseIRC("@target-msg-id=xyz CLEARMSG #chan :nuked")!;

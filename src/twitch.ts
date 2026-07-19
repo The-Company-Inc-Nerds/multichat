@@ -177,9 +177,16 @@ const IDLE_CHECK_MS = 15_000;
 // Discard a partial line that never terminates, so a misbehaving peer can't grow memory.
 const MAX_BUF = 64 * 1024;
 
+/** True for channels whose follow/cheer/sub/raid events come from EventSub instead
+ *  of IRC. Such channels keep only their IRC chat text; the highlighted events are
+ *  emitted by the EventSub client. Undefined/absent = nothing covered (the
+ *  anonymous default), so existing behavior is unchanged. */
+export type CoveredPredicate = (channel: string) => boolean;
+
 async function connectOnce(
   channels: string[],
   emitter: Emitter,
+  isCovered?: CoveredPredicate,
 ): Promise<void> {
   const nick = `justinfan${10000 + Math.floor(Math.random() * 89999)}`;
   const ws = new WebSocket("wss://irc-ws.chat.twitch.tv");
@@ -236,7 +243,7 @@ async function connectOnce(
         }
 
         // PING/RECONNECT need the socket; everything else is emitter-only and unit-testable.
-        if (handleCommand(msg, emitter)) continue;
+        if (handleCommand(msg, emitter, isCovered)) continue;
       }
     };
     ws.onclose = () => fail(new Error("closed"));
@@ -246,7 +253,11 @@ async function connectOnce(
 
 // Route an IRC line to the emitter. Returns true if the command was handled here.
 // PING/RECONNECT are deliberately excluded — they need the socket and stay in connectOnce.
-export function handleCommand(msg: IRCLine, emitter: Emitter): boolean {
+export function handleCommand(
+  msg: IRCLine,
+  emitter: Emitter,
+  isCovered?: CoveredPredicate,
+): boolean {
   const channel = (msg.params[0] ?? "").replace(/^#/, "");
   switch (msg.command) {
     // Twitch emits one ROOMSTATE per channel right after we join — use it as "joined".
@@ -254,10 +265,10 @@ export function handleCommand(msg: IRCLine, emitter: Emitter): boolean {
       if (channel) emitter.status("twitch", channel, "live");
       return true;
     case "PRIVMSG":
-      handlePrivmsg(msg, emitter);
+      handlePrivmsg(msg, emitter, isCovered);
       return true;
     case "USERNOTICE":
-      handleUsernotice(msg, emitter);
+      handleUsernotice(msg, emitter, isCovered);
       return true;
     case "CLEARMSG": {
       const messageId = msg.tags["target-msg-id"];
@@ -275,7 +286,11 @@ export function handleCommand(msg: IRCLine, emitter: Emitter): boolean {
   }
 }
 
-export function handlePrivmsg(msg: IRCLine, emitter: Emitter): void {
+export function handlePrivmsg(
+  msg: IRCLine,
+  emitter: Emitter,
+  isCovered?: CoveredPredicate,
+): void {
   const channel = (msg.params[0] ?? "").replace(/^#/, "");
   let content = msg.params[1] ?? "";
   const author = msg.tags["display-name"] || msg.prefix.split("!")[0] || "anon";
@@ -295,7 +310,10 @@ export function handlePrivmsg(msg: IRCLine, emitter: Emitter): void {
   let amount: string | undefined;
   let accentColor: string | undefined;
   let eventText: string | undefined;
-  if (Number.isFinite(bits) && bits > 0) {
+  // A cheer is a normal PRIVMSG with a `bits` tag and a message body. When EventSub
+  // covers this channel it emits the highlighted cheer alert, so here we keep only
+  // the chat text (as a plain `chat` message) to avoid a duplicate highlighted row.
+  if (Number.isFinite(bits) && bits > 0 && !isCovered?.(channel)) {
     kind = "cheer";
     amount = `${bits} bits`;
     accentColor = cheerColor(bits);
@@ -319,7 +337,11 @@ export function handlePrivmsg(msg: IRCLine, emitter: Emitter): void {
   });
 }
 
-export function handleUsernotice(msg: IRCLine, emitter: Emitter): void {
+export function handleUsernotice(
+  msg: IRCLine,
+  emitter: Emitter,
+  isCovered?: CoveredPredicate,
+): void {
   const channel = (msg.params[0] ?? "").replace(/^#/, "");
   const author = msg.tags["display-name"] || msg.tags["login"] || "anon";
   const msgId = msg.tags["msg-id"] ?? "";
@@ -347,6 +369,11 @@ export function handleUsernotice(msg: IRCLine, emitter: Emitter): void {
     accentColor = ANNOUNCE_COLORS[c] ?? "#9147ff";
   }
 
+  // For EventSub-covered channels, subs and raids come from EventSub — drop the
+  // IRC copy to avoid duplicates. Announcements/other system notices aren't
+  // covered by EventSub, so they still flow from IRC.
+  if ((kind === "sub" || kind === "raid") && isCovered?.(channel)) return;
+
   const segments = userComment
     ? buildSegments(userComment, msg.tags["emotes"] ?? "")
     : undefined;
@@ -372,6 +399,7 @@ export function handleUsernotice(msg: IRCLine, emitter: Emitter): void {
 export function startTwitchClient(
   config: TwitchConfig,
   emitter: Emitter,
+  isCovered?: CoveredPredicate,
 ): void {
   const delays = [2_000, 4_000, 8_000, 16_000, 30_000];
   let attempt = 0;
@@ -384,7 +412,7 @@ export function startTwitchClient(
         for (const ch of config.channels) {
           emitter.status("twitch", ch, "connecting");
         }
-        await connectOnce(config.channels, emitter);
+        await connectOnce(config.channels, emitter, isCovered);
       } catch (err) {
         for (const ch of config.channels) emitter.status("twitch", ch, "error");
         // A connection that stayed up a while is a fresh failure, not a flaky endpoint —

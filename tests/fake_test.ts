@@ -39,6 +39,7 @@ Deno.test("demoActions: covers every kind and both platforms", () => {
       "cheer",
       "sub",
       "raid",
+      "follow",
       "superchat",
       "supersticker",
       "membership",

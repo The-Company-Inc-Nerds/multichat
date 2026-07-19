@@ -306,7 +306,96 @@ const HTML = `<!DOCTYPE html>
       padding: 3px 10px;
       text-shadow: 0 1px 2px rgba(0,0,0,0.95), 0 0 5px rgba(0,0,0,0.8);
     }
+    /* Enhancement: each new overlay row pops in (event rows also glow their accent,
+       set inline in JS). Purely cosmetic; the default viewer is left untouched. */
+    @keyframes popIn {
+      from { opacity: 0; transform: translateY(8px) scale(0.98); }
+      to   { opacity: 1; transform: none; }
+    }
+    body.overlay #chat .msg,
+    body.overlay #chat .event { animation: popIn 0.28s ease-out; }
+
+    /* ---- OBS alerts mode (visit /alerts or add ?alerts) ----
+       A dedicated shoutout box: one big animated card at a time, centered,
+       auto-dismissing (a queue plays them in order). Transparent for OBS. */
+    body.alerts { background: transparent; }
+    body.alerts header,
+    body.alerts #side,
+    body.alerts #chat,
+    body.alerts #jump { display: none; }
+    body.alerts #main { background: transparent; }
+
+    #alert-stage {
+      display: none;
+      position: fixed;
+      inset: 0;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      pointer-events: none;
+    }
+    body.alerts #alert-stage { display: flex; }
+
+    /* The card is a normal .event row (built by addEventRow) scaled way up. */
+    .alert-card {
+      min-width: 320px;
+      max-width: 82vw;
+      margin: 0;
+      border-left-width: 7px;
+      border-radius: 14px;
+      background: rgba(0,0,0,0.74);
+      padding: 20px 30px;
+      font-size: 30px;
+      text-shadow: 0 2px 6px rgba(0,0,0,0.95), 0 0 10px rgba(0,0,0,0.8);
+      opacity: 0;
+      transform: scale(0.82);
+      transition: transform 0.4s cubic-bezier(.2,1.3,.35,1), opacity 0.4s ease;
+    }
+    .alert-card.show { opacity: 1; transform: scale(1); }
+    .alert-card.exit { opacity: 0; transform: scale(1) translateY(-18px); }
+    .alert-card .ehead { gap: 0 10px; }
+    .alert-card .amount { font-size: 0.62em; }
+    .alert-card .ebody { font-size: 0.66em; margin-top: 10px; }
+    .alert-card .badge { font-size: 0.4em; }
+
+    /* ---- Theme: "company-memo" ("The Company, Inc") ----
+       An opaque office-memo note on paper. Overrides the dark card look; the
+       three-class selectors beat the base .alert-card.show/.exit so the slight
+       paper rotation is preserved through enter/exit. */
+    .alert-card.memo {
+      background: #f4efdc;
+      color: #1b1b1b;
+      border-left: none;
+      border-top: 14px solid #c8bf9c;
+      border-radius: 3px;
+      padding: 26px 34px 22px;
+      font-family: "Courier New", Courier, monospace;
+      text-shadow: none;
+      box-shadow: 0 14px 34px rgba(0,0,0,0.55);
+      transform: scale(0.82) rotate(-1.6deg);
+    }
+    .alert-card.memo.show { opacity: 1; transform: scale(1) rotate(-1.6deg); }
+    .alert-card.memo.exit { opacity: 0; transform: scale(1) rotate(-1.6deg) translateY(-20px); }
+    .memo-head { font-weight: 700; letter-spacing: 0.14em; font-size: 0.6em; color: #6a5b2e; }
+    .memo-sub {
+      font-size: 0.32em; letter-spacing: 0.34em; color: #9a8f68;
+      margin: 2px 0 16px; padding-bottom: 9px; border-bottom: 1px solid #d8cfae;
+    }
+    .memo-line { font-size: 1em; font-weight: 700; line-height: 1.3; }
+    .memo-w { position: relative; display: inline-block; }
+    /* The redaction bar: a black rectangle that wipes across a word before exit. */
+    .memo-w.redacted::after {
+      content: ""; position: absolute; left: -3px; top: -1px; bottom: -1px;
+      width: 0; background: #111; animation: redact 0.5s ease-out forwards;
+    }
+    @keyframes redact { from { width: 0; } to { width: calc(100% + 6px); } }
+    .memo-stamp {
+      margin-top: 16px; display: inline-block; color: #b5322b;
+      border: 2px solid #b5322b; border-radius: 4px; padding: 2px 9px;
+      font-size: 0.3em; letter-spacing: 0.2em; transform: rotate(-6deg); opacity: 0.85;
+    }
   </style>
+  <!--ALERTS-->
 </head>
 <body>
   <header>
@@ -321,6 +410,7 @@ const HTML = `<!DOCTYPE html>
     <aside id="side"></aside>
     <div id="chat"></div>
   </div>
+  <div id="alert-stage"></div>
   <button id="jump" onclick="jumpBottom()">&#9660; Latest</button>
   <script>
     var chat = document.getElementById('chat');
@@ -328,14 +418,38 @@ const HTML = `<!DOCTYPE html>
     var dot  = document.getElementById('dot');
     var stxt = document.getElementById('stxt');
     var jump = document.getElementById('jump');
+    var stage = document.getElementById('alert-stage');
     var pinned = true;
     var count  = 0;
     var MAX    = 500;
 
+    var params = new URLSearchParams(location.search);
     // OBS overlay mode: /overlay or ?overlay → transparent, messages-only, bottom-anchored.
-    var overlayMode = location.pathname === '/overlay' ||
-        new URLSearchParams(location.search).has('overlay');
+    var overlayMode = location.pathname === '/overlay' || params.has('overlay');
     if (overlayMode) document.body.classList.add('overlay');
+    // OBS alerts mode: /alerts or ?alerts → transparent, one animated shoutout at a time.
+    var alertsMode = location.pathname === '/alerts' || params.has('alerts');
+    if (alertsMode) document.body.classList.add('alerts');
+
+    // Alert theme: the active theme is injected as window.MULTICHAT_ALERTS (from
+    // settings.json); ?theme=NAME overrides it for testing / per-source setups.
+    var alertsCfg = window.MULTICHAT_ALERTS || {};
+    var themeOverride = params.get('theme');
+    var activeThemeName = themeOverride !== null ? themeOverride : (alertsCfg.activeTheme || '');
+    var activeTheme = null;
+    if (activeThemeName && alertsCfg.themes) {
+      for (var ti = 0; ti < alertsCfg.themes.length; ti++) {
+        if (alertsCfg.themes[ti].name === activeThemeName) { activeTheme = alertsCfg.themes[ti]; break; }
+      }
+    }
+    // The theme that should render an event of this kind, or null for the default
+    // card. A theme with no explicit events list covers all shoutout kinds.
+    function themeForKind(kind) {
+      if (!activeTheme) return null;
+      var evs = activeTheme.events;
+      if (evs && evs.length && evs.indexOf(kind) === -1) return null;
+      return activeTheme;
+    }
 
     chat.addEventListener('scroll', function() {
       var atBottom = chat.scrollTop + chat.clientHeight >= chat.scrollHeight - 60;
@@ -395,7 +509,10 @@ const HTML = `<!DOCTYPE html>
       }
     }
 
-    var EVENT_KINDS = { cheer:1, sub:1, raid:1, superchat:1, supersticker:1, membership:1, system:1 };
+    var EVENT_KINDS = { cheer:1, sub:1, raid:1, follow:1, superchat:1, supersticker:1, membership:1, system:1 };
+    // Shoutout kinds the /alerts overlay pops up (everything highlighted except plain
+    // system notices like sub-only-mode / announcements, which aren't shoutouts).
+    var ALERT_KINDS = { cheer:1, sub:1, raid:1, follow:1, superchat:1, supersticker:1, membership:1 };
 
     function addEventRow(m) {
       var row = make('div', 'event');
@@ -404,9 +521,11 @@ const HTML = `<!DOCTYPE html>
       row.setAttribute('data-channel', m.channel);
       if (m.accentColor) {
         row.style.borderLeftColor = m.accentColor;
-        // In overlay mode the CSS gives every row a dark pill; the faint accent
-        // tint would sit on top of it and hurt legibility, so keep just the border.
-        if (!overlayMode) row.style.background = hexFade(m.accentColor);
+        // In overlay/alerts mode the CSS gives each row a dark pill; the faint accent
+        // tint would sit on top of it and hurt legibility, so keep just the border,
+        // plus an accent-colored glow for a bit of pop.
+        if (!overlayMode && !alertsMode) row.style.background = hexFade(m.accentColor);
+        else row.style.boxShadow = '0 0 14px ' + m.accentColor;
       }
 
       var head = make('div', 'ehead');
@@ -524,8 +643,105 @@ const HTML = `<!DOCTYPE html>
       }
     }
 
+    // ---- /alerts overlay: a queue that plays one shoutout card at a time ----
+    var alertQ = [];
+    var alertBusy = false;
+    var ALERT_HOLD_MS = 6000;   // time a card stays fully visible
+    var ALERT_ANIM_MS = 450;    // enter/exit transition (matches CSS .alert-card)
+    var ALERT_QMAX = 50;        // drop oldest beyond this so a burst can't pile up
+
+    function enqueueAlert(m) {
+      alertQ.push(m);
+      if (alertQ.length > ALERT_QMAX) alertQ.shift();
+      if (!alertBusy) playNextAlert();
+    }
+
+    // Word used in the memo line, per event kind. Kept to a single word so the
+    // "three words" redaction gag ([name] / just / [action]) stays intact.
+    var COMPANY_ACTION = {
+      follow: 'followed', sub: 'subscribed', membership: 'joined',
+      cheer: 'cheered', raid: 'raided', superchat: 'donated', supersticker: 'donated'
+    };
+
+    // "The Company, Inc" — an office memo that redacts one of its three words
+    // right before it leaves. Returns the alert-lifecycle shape buildAlert uses.
+    function buildCompanyMemo(m, theme) {
+      var opts = theme.options || {};
+      var card = make('div', 'alert-card memo');
+      if (opts.paper) card.style.background = opts.paper;
+      if (opts.ink) card.style.color = opts.ink;
+      card.appendChild(make('div', 'memo-head', 'THE COMPANY, INC'));
+      card.appendChild(make('div', 'memo-sub', 'INTERNAL MEMO'));
+
+      var line = make('div', 'memo-line');
+      var wName = make('span', 'memo-w', m.author);
+      var wJust = make('span', 'memo-w', 'just');
+      var wAct  = make('span', 'memo-w', COMPANY_ACTION[m.kind] || 'subscribed');
+      line.appendChild(wName);
+      line.appendChild(document.createTextNode(' '));
+      line.appendChild(wJust);
+      line.appendChild(document.createTextNode(' '));
+      line.appendChild(wAct);
+      line.appendChild(document.createTextNode('!'));
+      card.appendChild(line);
+      card.appendChild(make('div', 'memo-stamp', 'CONFIDENTIAL'));
+
+      var words = [wName, wJust, wAct];
+      function beforeExit(el, done) {
+        if (opts.redact === false) { setTimeout(done, 250); return; }
+        // Redact one of the three words (black bar wipes across), hold, then exit.
+        words[Math.floor(Math.random() * words.length)].classList.add('redacted');
+        setTimeout(done, 1100);
+      }
+      var hold = typeof opts.hold === 'number' ? opts.hold : 4500;
+      return { el: card, holdMs: hold, exitMs: ALERT_ANIM_MS, beforeExit: beforeExit };
+    }
+
+    function buildDefaultAlert(m) {
+      var card = addEventRow(m);        // reuse the event-row builder
+      card.classList.add('alert-card');
+      return { el: card, holdMs: ALERT_HOLD_MS, exitMs: ALERT_ANIM_MS };
+    }
+
+    // Pick the renderer for this event: a theme's style if one covers the kind,
+    // else the default card. New styles slot in here.
+    function buildAlert(m) {
+      var theme = themeForKind(m.kind);
+      if (theme && theme.style === 'company-memo') return buildCompanyMemo(m, theme);
+      return buildDefaultAlert(m);
+    }
+
+    function playNextAlert() {
+      var m = alertQ.shift();
+      if (!m) { alertBusy = false; return; }
+      alertBusy = true;
+      var a = buildAlert(m);
+      var holdMs = a.holdMs != null ? a.holdMs : ALERT_HOLD_MS;
+      var exitMs = a.exitMs != null ? a.exitMs : ALERT_ANIM_MS;
+      stage.textContent = '';
+      stage.appendChild(a.el);
+      // Two frames so the browser paints the initial (hidden) state before we
+      // add .show, otherwise the enter transition doesn't run.
+      requestAnimationFrame(function() {
+        requestAnimationFrame(function() { a.el.classList.add('show'); });
+      });
+      setTimeout(function() {
+        function exit() {
+          a.el.classList.remove('show');
+          a.el.classList.add('exit');
+          setTimeout(playNextAlert, exitMs);
+        }
+        if (a.beforeExit) a.beforeExit(a.el, exit); else exit();
+      }, holdMs);
+    }
+
     function handle(ev) {
-      if (ev.type === 'message') addMsg(ev.data);
+      if (ev.type === 'message') {
+        // In alerts mode only shoutout kinds are shown, one at a time; everything
+        // else (plain chat, system notices) is ignored. Other modes render inline.
+        if (alertsMode) { if (ALERT_KINDS[ev.data.kind]) enqueueAlert(ev.data); }
+        else addMsg(ev.data);
+      }
       else if (ev.type === 'status') renderStatus(ev.data);
       else if (ev.type === 'delete') onDelete(ev);
     }
@@ -563,6 +779,18 @@ export function createServer(
 ): Emitter {
   const clients = new Set<ReadableStreamDefaultController<Uint8Array>>();
   const enc = new TextEncoder();
+
+  // Bake the alerts theme registry into the page as window.MULTICHAT_ALERTS so the
+  // overlay picks up the configured theme with no extra request. Escape "<" so a
+  // theme name can't break out of the <script> tag.
+  const alertsJson = JSON.stringify(settings.alerts ?? {}).replace(
+    /</g,
+    "\\u003c",
+  );
+  const pageHtml = HTML.replace(
+    "<!--ALERTS-->",
+    `<script>window.MULTICHAT_ALERTS=${alertsJson}</script>`,
+  );
 
   // Seed one status entry per configured channel, all "connecting" until a client reports in.
   const statuses = new Map<string, ChannelStatus>();
@@ -722,9 +950,9 @@ export function createServer(
 
       if (
         pathname === "/" || pathname === "/index.html" ||
-        pathname === "/overlay"
+        pathname === "/overlay" || pathname === "/alerts"
       ) {
-        return new Response(HTML, {
+        return new Response(pageHtml, {
           headers: { "Content-Type": "text/html; charset=utf-8" },
         });
       }

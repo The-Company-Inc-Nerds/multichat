@@ -83,3 +83,29 @@ export function keyStatePath(
   const dir = (stateDir ?? "").replace(/\/+$/, "");
   return dir ? `${dir}/youtube-api-key` : null;
 }
+
+/**
+ * Where a channel's (rotating) Twitch refresh token is persisted, keyed by
+ * broadcaster id so a login rename doesn't orphan it. Returns null with no state
+ * dir (the token is then in-memory / from settings only, and won't survive a
+ * restart). Mirrors keyStatePath.
+ */
+export function twitchTokenStatePath(
+  stateDir: string | null | undefined,
+  broadcasterId: string,
+): string | null {
+  const dir = (stateDir ?? "").replace(/\/+$/, "");
+  return dir && broadcasterId ? `${dir}/twitch-refresh-${broadcasterId}` : null;
+}
+
+/** Where a login→broadcaster-id resolution is cached, to skip the Helix lookup on
+ *  restart. Returns null with no state dir. */
+export function twitchBroadcasterStatePath(
+  stateDir: string | null | undefined,
+  login: string,
+): string | null {
+  const dir = (stateDir ?? "").replace(/\/+$/, "");
+  return dir && login
+    ? `${dir}/twitch-broadcaster-${login.toLowerCase()}`
+    : null;
+}

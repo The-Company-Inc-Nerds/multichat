@@ -4,10 +4,19 @@
     "host": "127.0.0.1"
   },
   "twitch": {
-    "channels": []
+    "channels": [],
+    "eventsub": {
+      "clientId": "",
+      "clientSecret": "",
+      "channels": []
+    }
   },
   "youtube": {
     "apiKey": "",
     "channels": []
+  },
+  "alerts": {
+    "activeTheme": "",
+    "themes": []
   }
 }

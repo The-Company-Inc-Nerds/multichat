@@ -3,6 +3,8 @@ import {
   keyStatePath,
   parseYouTubeKeyBody,
   resolveStartupKey,
+  twitchBroadcasterStatePath,
+  twitchTokenStatePath,
 } from "../src/control.ts";
 import { assert, assertEquals } from "./_assert.ts";
 
@@ -80,4 +82,26 @@ Deno.test("keyStatePath: builds a path under the state dir, else null", () => {
   assertEquals(keyStatePath(null), null);
   assertEquals(keyStatePath(undefined), null);
   assertEquals(keyStatePath(""), null);
+});
+
+Deno.test("twitchTokenStatePath: refresh token file keyed by broadcaster id", () => {
+  assertEquals(
+    twitchTokenStatePath("/var/lib/multichat", "12345"),
+    "/var/lib/multichat/twitch-refresh-12345",
+  );
+  assertEquals(
+    twitchTokenStatePath("/var/lib/multichat/", "12345"),
+    "/var/lib/multichat/twitch-refresh-12345",
+  );
+  assertEquals(twitchTokenStatePath(null, "12345"), null);
+  assertEquals(twitchTokenStatePath("/var/lib/multichat", ""), null);
+});
+
+Deno.test("twitchBroadcasterStatePath: id cache keyed by lowercased login", () => {
+  assertEquals(
+    twitchBroadcasterStatePath("/var/lib/multichat", "Streamer"),
+    "/var/lib/multichat/twitch-broadcaster-streamer",
+  );
+  assertEquals(twitchBroadcasterStatePath(null, "streamer"), null);
+  assertEquals(twitchBroadcasterStatePath("/var/lib/multichat", ""), null);
 });

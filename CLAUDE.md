@@ -31,7 +31,7 @@ pre-commit gate).
 Or directly:
 
 ```bash
-deno run --allow-net --allow-read --allow-write=/var/lib/multichat,/var/lib/private/multichat --allow-env=YOUTUBE_API_KEY,PORT,HOST,STATE_DIRECTORY main.ts [config-path]
+deno run --allow-net --allow-read --allow-write=/var/lib/multichat,/var/lib/private/multichat --allow-env=YOUTUBE_API_KEY,TWITCH_CLIENT_ID,TWITCH_CLIENT_SECRET,PORT,HOST,STATE_DIRECTORY main.ts [config-path]
 ```
 
 `config-path` defaults to `./settings.json`. Env vars `PORT` and `HOST` override
@@ -46,10 +46,16 @@ The same binary is also a small CLI client:
 - `multichat set-youtube-key [KEY]` POSTs a key to a running server's loopback
   `POST /api/youtube-key` endpoint (key from arg or stdin). See
   `docs/configuration.md`.
+- `multichat login` (alias `twitch-login`) runs the Twitch OAuth flow via a
+  temporary loopback redirect and prints a `twitch.eventsub.channels` entry
+  (login + broadcasterId + refreshToken) to paste into `settings.json`, enabling
+  EventSub alerts. Needs the app's clientId/clientSecret (from settings or
+  `--client-id`/`--client-secret`). See `docs/configuration.md`.
 - `multichat fake` plays a fixed showcase of every message kind (chat, action,
-  cheer, sub, raid, Super Chat, sticker, membership, system, a live deletion)
-  into a running server's loopback `POST /api/fake` endpoint, for previewing how
-  they render without a live stream. See `docs/development/testing.md`.
+  cheer, sub, raid, follow, Super Chat, sticker, membership, system, a live
+  deletion) into a running server's loopback `POST /api/fake` endpoint, for
+  previewing how they render (incl. `/alerts` and `/overlay`) without a live
+  stream. See `docs/development/testing.md`.
 
 ## Configuration
 
@@ -57,30 +63,54 @@ Copy `settings.json.example` to `settings.json` and edit:
 
 - `server.port` / `server.host` — where the web UI is served
 - `twitch.channels` — list of Twitch channel names (lowercase)
+- `twitch.eventsub` — optional `{clientId, clientSecret, channels}` for follow/
+  cheer/sub/raid **alerts** via Twitch EventSub (chat alone works without it)
 - `youtube.apiKey` — YouTube Data API v3 key (get one at Google Cloud Console)
 - `youtube.channels` — list of `{handle, channelId, videoId}` objects; supply at
   least one field per entry
+- `alerts` — optional `{activeTheme, themes}` registry that skins the `/alerts`
+  overlay (built-in styles `default` / `company-memo`); unset = default look
 
 YouTube channels require an API key, but it need not be in `settings.json` — it
 can be set on the running server with `multichat set-youtube-key` (see above).
-Twitch works anonymously (read-only via `justinfan*`). Full reference:
+Twitch **chat** works anonymously (read-only via `justinfan*`); Twitch
+**alerts** (follows/cheers/subs/raids) require `twitch.eventsub` — a Twitch
+app + a per-channel OAuth token from `multichat login` (YouTube Super Chats/
+stickers/memberships need only the API key). Full reference:
 `docs/configuration.md`.
 
 ## Architecture
 
 ```
 main.ts          entry point — loads settings, wires the emitter to server + clients;
-                 also the `set-youtube-key` / `fake` CLI subcommands + the runtime-key manager
-src/types.ts     shared TypeScript interfaces (Settings, ChatMessage, ServerEvent, Emitter)
-src/twitch.ts    Twitch IRC over WebSocket (wss://irc-ws.chat.twitch.tv), with reconnect
+                 also the `set-youtube-key` / `login` / `fake` CLI subcommands +
+                 the runtime-key manager and the EventSub manager (per-channel token
+                 lifecycle + one WebSocket per broadcaster)
+src/types.ts     shared TypeScript interfaces (Settings, ChatMessage, ServerEvent, Emitter,
+                 TwitchEventSubConfig, EventSub frames)
+src/twitch.ts    Twitch IRC over WebSocket (wss://irc-ws.chat.twitch.tv), with reconnect;
+                 handleCommand takes an optional isCovered predicate so EventSub-covered
+                 channels emit only chat text (their events come from EventSub instead)
+src/eventsub.ts  Twitch EventSub over WebSocket (wss://eventsub.wss.twitch.tv) — the source
+                 of truth for follow/cheer/sub/raid on configured channels; pure
+                 notification→ChatMessage mappers + classifyFrame are exported/tested, the
+                 socket-holding connectOnce/startTwitchEventSub are the wiring (receive-only)
+src/twitchauth.ts pure Twitch OAuth + EventSub request builders / response parsers
+                 (refresh + auth-code grants, /users, create-subscription) + the
+                 SUBSCRIPTIONS table (single source of truth for types/versions/scopes)
 src/youtube.ts   YouTube Data API v3 polling — resolves channel → live video → live chat;
                  startYouTubePoller takes an AbortSignal so it can be torn down/restarted
-src/server.ts    Deno.serve HTTP server: GET / + GET /overlay (embedded HTML; overlay
-                 mode = transparent OBS browser source), GET /events (SSE),
-                 POST /api/youtube-key (loopback-only runtime key control),
+src/server.ts    Deno.serve HTTP server: GET / + GET /overlay + GET /alerts (embedded HTML;
+                 overlay = transparent chat OBS source, alerts = animated shoutout pop-ups
+                 with selectable themes, e.g. the "company-memo" redacted-memo look),
+                 GET /events (SSE), POST /api/youtube-key (loopback-only runtime key control),
                  POST /api/fake (loopback-only fake-event injection for previewing)
+src/alerts.ts    pure alerts-theme helpers: normalizeAlertsConfig (validates the theme
+                 registry from settings.json) + ALERT_EVENT_KINDS; the resolved config is
+                 injected into the page as window.MULTICHAT_ALERTS for the overlay to apply
 src/control.ts   pure control-plane helpers (loopback check, key-body parse, startup-key
-                 resolution, state path) + the ServerHooks/KeyUpdateResult types
+                 resolution, state paths incl. Twitch token/broadcaster-id) + the
+                 ServerHooks/KeyUpdateResult types
 src/fake.ts      pure fake-event helpers: the curated demo sequence + wire
                  (de)serialization/validation behind POST /api/fake
 tests/           one *_test.ts per source module; dependency-free assert shim in _assert.ts

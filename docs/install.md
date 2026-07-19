@@ -36,10 +36,13 @@ Open `http://localhost:8080` (or whatever `server.port` you configured).
 A config path may be passed explicitly; it defaults to `./settings.json`:
 
 ```bash
-deno run --allow-net --allow-read --allow-env=YOUTUBE_API_KEY,PORT,HOST main.ts /path/to/settings.json
+deno run --allow-net --allow-read --allow-env=YOUTUBE_API_KEY,TWITCH_CLIENT_ID,TWITCH_CLIENT_SECRET,PORT,HOST,STATE_DIRECTORY main.ts /path/to/settings.json
 ```
 
-See [Configuration](configuration.md) for the settings format.
+See [Configuration](configuration.md) for the settings format. Twitch chat and
+YouTube work from `settings.json` alone; to enable Twitch **alerts** (follows /
+bits / subs / raids) run the one-time `multichat login` per channel — see
+[Configuration → Twitch EventSub alerts](configuration.md#twitch-eventsub-alerts).
 
 ## Building a Standalone Binary
 

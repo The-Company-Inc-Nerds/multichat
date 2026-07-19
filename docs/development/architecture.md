@@ -5,22 +5,26 @@ broadcaster, which pushes events to connected browsers over Server-Sent Events.
 
 ## Module layout
 
-| File             | Responsibility                                                                          |
-| ---------------- | --------------------------------------------------------------------------------------- |
-| `main.ts`        | Entry point — loads settings, creates the server, starts the platform clients           |
-| `src/types.ts`   | Shared interfaces: `Settings`, `ChatMessage`, `ServerEvent`, `Emitter`, `ChannelStatus` |
-| `src/twitch.ts`  | Twitch IRC over WebSocket (`wss://irc-ws.chat.twitch.tv`), with reconnect               |
-| `src/youtube.ts` | YouTube Data API v3 polling — resolves channel → live video → live chat                 |
-| `src/server.ts`  | `Deno.serve` HTTP server + the embedded viewer HTML/CSS/JS                              |
-| `src/control.ts` | Pure control-plane helpers (loopback check, key-body parse, startup-key resolution)     |
-| `src/fake.ts`    | Fake-event demo sequence + wire (de)serialization/validation behind `POST /api/fake`    |
+| File                | Responsibility                                                                                                                                  |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `main.ts`           | Entry point — loads settings, creates the server, starts the platform clients, owns the runtime-key + EventSub managers and the CLI subcommands |
+| `src/types.ts`      | Shared interfaces: `Settings`, `ChatMessage`, `ServerEvent`, `Emitter`, `ChannelStatus`, `TwitchEventSubConfig`, EventSub frames                |
+| `src/twitch.ts`     | Twitch IRC over WebSocket (`wss://irc-ws.chat.twitch.tv`), with reconnect; suppresses events for EventSub-covered channels                      |
+| `src/eventsub.ts`   | Twitch EventSub over WebSocket (`wss://eventsub.wss.twitch.tv`) — follow/cheer/sub/raid; pure mappers + socket client                           |
+| `src/twitchauth.ts` | Pure Twitch OAuth + EventSub request builders / response parsers + the `SUBSCRIPTIONS` table                                                    |
+| `src/youtube.ts`    | YouTube Data API v3 polling — resolves channel → live video → live chat                                                                         |
+| `src/server.ts`     | `Deno.serve` HTTP server + the embedded viewer HTML/CSS/JS (`/`, `/overlay`, `/alerts`)                                                         |
+| `src/control.ts`    | Pure control-plane helpers (loopback check, key-body parse, startup-key resolution, state paths)                                                |
+| `src/fake.ts`       | Fake-event demo sequence + wire (de)serialization/validation behind `POST /api/fake`                                                            |
+| `src/alerts.ts`     | Pure `/alerts` theme-registry validation (`normalizeAlertsConfig`), injected into the page as `window.MULTICHAT_ALERTS`                         |
 
 ## Data flow
 
 ```
-twitch.ts ─┐
-           ├─► Emitter ─► ServerEvent ─► SSE (/events) ─► browser
-youtube.ts ┘
+twitch.ts   ─┐  (IRC: chat text; events unless EventSub covers the channel)
+eventsub.ts ─┤  (Twitch follow/cheer/sub/raid)
+             ├─► Emitter ─► ServerEvent ─► SSE (/events) ─► browser
+youtube.ts  ─┘  (chat + Super Chat/sticker/membership)
 ```
 
 `createServer(settings)` (in `src/server.ts`) returns an **`Emitter`** — an
@@ -44,6 +48,26 @@ emitter-only commands (`PRIVMSG`, `USERNOTICE`, `CLEARMSG`, `CLEARCHAT`,
 `ROOMSTATE`), while `PING`/`RECONNECT` are handled inline because they need the
 socket. `handlePrivmsg` / `handleUsernotice` build the `ChatMessage` (badges,
 emote segments, cheers, sub/raid notices). Reconnect uses exponential backoff.
+
+When a channel is configured for EventSub, `handleCommand` is passed an
+`isCovered` predicate: for that channel it drops the IRC copies of
+cheer/sub/raid (they come from EventSub instead) but keeps the chat text, so
+nothing is emitted twice. Channels without EventSub creds are untouched.
+
+## Twitch EventSub client
+
+For channels in `twitch.eventsub`, `eventsub.ts` opens one **receive-only**
+WebSocket per broadcaster (a session may only carry one user's token). On the
+`session_welcome` it creates the follow/cheer/sub/gift/resub/raid subscriptions
+via the Helix API (within the 10-second window), then maps each `notification`
+to a `ChatMessage` through the same `Emitter`. It mirrors the IRC client's idle
+watchdog (driven by the session's `keepalive_timeout_seconds`) and backoff, and
+migrates on `session_reconnect`. The pure mappers and `classifyFrame` live
+outside the socket for testing. `main.ts`'s EventSub manager owns each channel's
+token: user access tokens are refreshed reactively (single-flight) using the
+rotating refresh token, which is persisted (rotated-token-first) to the state
+directory. `twitchauth.ts` holds the pure request builders / response parsers.
+EventSub does not touch the sidebar status (IRC owns the Twitch dot).
 
 ## YouTube client
 
@@ -100,9 +124,12 @@ Tuned for unattended multi-hour streams:
 - **Bounded browser memory.** The viewer keeps at most 500 messages, removing
   the oldest, so a long stream doesn't grow the DOM without limit.
 - **Scoped permissions.** The process runs with `--allow-net` limited to
-  `irc-ws.chat.twitch.tv`, `www.googleapis.com`, and the local bind addresses,
-  plus a scoped `--allow-env`. Emote images load in the browser, not the server,
-  so the CDN isn't in the server's net allowlist.
+  `irc-ws.chat.twitch.tv`, `eventsub.wss.twitch.tv`, `api.twitch.tv`,
+  `id.twitch.tv`, `www.googleapis.com`, and the local bind addresses, plus a
+  scoped `--allow-env`. Emote images load in the browser, not the server, so the
+  CDN isn't in the server's net allowlist. (A Twitch `session_reconnect` URL is
+  expected to stay under `eventsub.wss.twitch.tv`; a different host would be
+  blocked by the allowlist, after which the backoff loop reconnects fresh.)
 
 ## Nix file layout
 

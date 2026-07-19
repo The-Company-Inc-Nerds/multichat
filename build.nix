@@ -18,7 +18,7 @@ pkgs.stdenv.mkDerivation {
     # so src/*.ts is exactly the runtime set.
     cp src/*.ts $out/share/multichat/src/
     makeWrapper ${pkgs.deno}/bin/deno $out/bin/multichat \
-      --add-flags "run --allow-net=irc-ws.chat.twitch.tv,www.googleapis.com,127.0.0.1,0.0.0.0 --allow-read --allow-write=/var/lib/multichat,/var/lib/private/multichat --allow-env=YOUTUBE_API_KEY,PORT,HOST,STATE_DIRECTORY $out/share/multichat/main.ts"
+      --add-flags "run --allow-net=irc-ws.chat.twitch.tv,eventsub.wss.twitch.tv,api.twitch.tv,id.twitch.tv,www.googleapis.com,127.0.0.1,0.0.0.0 --allow-read --allow-write=/var/lib/multichat,/var/lib/private/multichat --allow-env=YOUTUBE_API_KEY,TWITCH_CLIENT_ID,TWITCH_CLIENT_SECRET,PORT,HOST,STATE_DIRECTORY $out/share/multichat/main.ts"
     runHook postInstall
   '';
 }

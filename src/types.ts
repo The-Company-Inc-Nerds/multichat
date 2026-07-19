@@ -23,6 +23,7 @@ export type MessageKind =
   | "cheer"
   | "sub"
   | "raid"
+  | "follow"
   | "superchat"
   | "supersticker"
   | "membership"
@@ -75,9 +76,63 @@ export interface Emitter {
   status(platform: Platform, name: string, state: ChannelState): void;
 }
 
+/** One channel to monitor over EventSub. Supply `login` (resolved to an id at
+ *  startup) or `broadcasterId` directly; `refreshToken` is the seed used to mint
+ *  user access tokens (a rotated one persisted to the state dir wins over it). */
+export interface TwitchEventSubChannelConfig {
+  login?: string;
+  broadcasterId?: string;
+  refreshToken?: string;
+}
+
+/** Optional Twitch EventSub config. When present, EventSub becomes the source of
+ *  truth for that channel's follow/cheer/sub/raid events and IRC only carries its
+ *  chat text (see the coverage predicate in twitch.ts). Requires a Twitch app
+ *  (clientId + clientSecret) and a per-channel user token authorized by the
+ *  broadcaster (scopes: moderator:read:followers, channel:read:subscriptions,
+ *  bits:read). Channels without EventSub creds keep full anonymous IRC behavior. */
+export interface TwitchEventSubConfig {
+  clientId: string;
+  clientSecret: string;
+  channels: TwitchEventSubChannelConfig[];
+}
+
 export interface TwitchConfig {
   channels: string[];
+  eventsub?: TwitchEventSubConfig;
 }
+
+// ---- Twitch EventSub WebSocket frames (only the fields we read) ----------
+
+export interface EventSubSession {
+  id: string;
+  keepalive_timeout_seconds?: number;
+  reconnect_url?: string;
+  status?: string;
+}
+
+export interface EventSubFrame {
+  metadata?: {
+    message_type?: string;
+    message_id?: string;
+    subscription_type?: string;
+  };
+  payload?: {
+    session?: EventSubSession;
+    subscription?: { id?: string; type?: string; status?: string };
+    // The event body varies per subscription type; the mappers read it loosely.
+    event?: Record<string, unknown>;
+  };
+}
+
+/** The frame kinds we act on; anything else is ignored. */
+export type EventSubFrameKind =
+  | "welcome"
+  | "keepalive"
+  | "notification"
+  | "reconnect"
+  | "revocation"
+  | "unknown";
 
 export interface YouTubeChannelConfig {
   channelId?: string;
@@ -95,8 +150,27 @@ export interface ServerConfig {
   host: string;
 }
 
+/** A named look for the /alerts overlay. `style` selects a built-in visual engine
+ *  (e.g. "default" — the standard card — or "company-memo"); `events` limits which
+ *  shoutout kinds it restyles (default: all); `options` is a style-specific bag
+ *  (e.g. paper/ink colors) passed through to the engine. */
+export interface AlertTheme {
+  name: string;
+  style: string;
+  events?: MessageKind[];
+  options?: Record<string, string | number | boolean>;
+}
+
+/** Alerts overlay theming. `activeTheme` names the theme in effect (unset = the
+ *  default look). Configured in settings.json / the NixOS module. */
+export interface AlertsConfig {
+  activeTheme?: string;
+  themes?: AlertTheme[];
+}
+
 export interface Settings {
   server: ServerConfig;
   twitch: TwitchConfig;
   youtube: YouTubeConfig;
+  alerts?: AlertsConfig;
 }

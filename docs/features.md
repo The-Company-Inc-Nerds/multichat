@@ -66,13 +66,45 @@ user message:
 
 | Kind           | Platform | Source                                                    |
 | -------------- | -------- | --------------------------------------------------------- |
-| `cheer`        | Twitch   | PRIVMSG with a `bits` tag (accent color by bits tier)     |
-| `sub`          | Twitch   | `USERNOTICE` sub / resub / subgift / mystery gift         |
-| `raid`         | Twitch   | `USERNOTICE` raid (amount = viewer count)                 |
+| `follow`       | Twitch   | EventSub `channel.follow`                                 |
+| `cheer`        | Twitch   | EventSub `channel.cheer`, else IRC PRIVMSG `bits` tag     |
+| `sub`          | Twitch   | EventSub subscribe / gift / resub, else IRC `USERNOTICE`  |
+| `raid`         | Twitch   | EventSub `channel.raid`, else IRC `USERNOTICE` raid       |
 | `system`       | Twitch   | other `USERNOTICE` (e.g. announcements, with their color) |
 | `superchat`    | YouTube  | `superChatEvent` (accent color by Super Chat tier)        |
 | `supersticker` | YouTube  | `superStickerEvent` (shows the sticker alt text)          |
 | `membership`   | YouTube  | `newSponsorEvent` / `memberMilestoneChatEvent`            |
+
+Twitch `follow`/`cheer`/`sub`/`raid` come from
+[Twitch EventSub](configuration.md#twitch-eventsub-alerts) when a channel is
+configured for it (follows need EventSub — they're not in anonymous chat). For a
+channel without EventSub creds, cheers/subs/raids fall back to the IRC tags as
+before, and follows are unavailable. When EventSub covers a channel the IRC copy
+of those events is suppressed so nothing appears twice (a cheer's chat text
+still shows as a normal message).
+
+## Alerts overlay
+
+The [`/alerts`](api.md#alerts-mode-alerts) browser source turns these highlight
+events into big animated shoutout cards — one at a time, centered,
+auto-dismissing — for use as a dedicated OBS source alongside (or instead of)
+the chat `/overlay`. It shows `follow`, `cheer`, `sub`, `raid`, `superchat`,
+`supersticker`, and `membership`; plain chat and `system` notices are skipped.
+Preview it without a live stream with `multichat fake`.
+
+### Themes
+
+The alerts overlay is themeable: `settings.json`'s `alerts` block (and the NixOS
+module) defines a registry of **named themes** and selects an `activeTheme`.
+With no active theme the overlay uses its default card. A theme can limit which
+shoutout kinds it restyles (others fall back to the default), and `?theme=NAME`
+on the overlay URL overrides the selection per OBS source.
+
+The built-in **`company-memo`** style ("The Company, Inc") renders the alert as
+an office memo — `THE COMPANY, INC` over `"[Name] just followed!"` — then, right
+before it vanishes, **redacts one of those three words** with a black bar (a
+"confidential document" gag). It's typically scoped to Twitch `follow` events.
+See [Configuration → Alert themes](configuration.md#alert-themes).
 
 ## Deletions
 
