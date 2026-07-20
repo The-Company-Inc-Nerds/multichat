@@ -51,11 +51,12 @@ The same binary is also a small CLI client:
   (login + broadcasterId + refreshToken) to paste into `settings.json`, enabling
   EventSub alerts. Needs the app's clientId/clientSecret (from settings or
   `--client-id`/`--client-secret`). See `docs/configuration.md`.
-- `multichat fake` plays a fixed showcase of every message kind (chat, action,
-  cheer, sub, raid, follow, Super Chat, sticker, membership, system, a live
-  deletion) into a running server's loopback `POST /api/fake` endpoint, for
-  previewing how they render (incl. `/alerts` and `/overlay`) without a live
-  stream. See `docs/development/testing.md`.
+- `multichat fake` injects fake events into a running server's loopback
+  `POST /api/fake` endpoint for previewing how they render (incl. `/alerts` and
+  `/overlay`) without a live stream. With no argument it plays a fixed showcase
+  of every message kind (chat, action, cheer, sub, raid, follow, Super Chat,
+  sticker, membership, system, a live deletion); `multichat fake <kind>` injects
+  just one (e.g. `fake follow`). See `docs/development/testing.md`.
 
 ## Configuration
 

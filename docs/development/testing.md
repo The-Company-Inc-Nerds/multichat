@@ -57,12 +57,19 @@ row, and a live deletion — into the SSE feed, one event at a time:
 ```bash
 deno task start                 # (terminal 1) against any settings.json
 # then, in terminal 2:
-deno task fake                  # play the demo into the running server
+deno task fake                  # play the whole showcase into the running server
 # or the standalone binary:
 multichat fake
+multichat fake follow           # inject just one event of a kind (e.g. a follow)
 multichat fake --port 8080      # non-default port / host, like set-youtube-key
 multichat fake --gap 0          # fire the events back-to-back (default gap: 450ms)
 ```
+
+`multichat fake <kind>` injects a single representative event instead of the
+full sequence — handy for previewing one alert (e.g. `fake follow` to see an
+[alerts theme](../configuration.md#alert-themes) without waiting through the
+showcase). `kind` is one of: `chat`, `action`, `cheer`, `sub`, `raid`, `follow`,
+`superchat`, `supersticker`, `membership`, `system`.
 
 Open the viewer (`/`), the OBS chat overlay (`/overlay`), or the alerts overlay
 (`/alerts`) first so you can watch the events arrive — `/alerts` plays the

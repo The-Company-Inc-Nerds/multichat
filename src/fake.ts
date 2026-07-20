@@ -38,7 +38,7 @@ export type FakeParseResult =
   | { ok: false; message: string };
 
 const STATES: readonly string[] = ["connecting", "live", "offline", "error"];
-const MESSAGE_KINDS: readonly string[] = [
+export const MESSAGE_KINDS: readonly string[] = [
   "chat",
   "action",
   "cheer",
@@ -207,6 +207,19 @@ export function demoActions(now = 0): FakeAction[] {
       eventText: "Chat is now in subscriber-only mode",
     }),
   ];
+}
+
+/**
+ * A single representative fake event for one message kind, so `multichat fake
+ * <kind>` can inject just that (e.g. a Twitch follow) instead of the whole
+ * showcase. Reuses the curated `demoActions` samples as the single source of
+ * truth: returns the first demo message of that kind, or null for an unknown one.
+ */
+export function fakeActionForKind(kind: string, now = 0): FakeAction | null {
+  for (const a of demoActions(now)) {
+    if (a.action === "message" && (a.data.kind ?? "chat") === kind) return a;
+  }
+  return null;
 }
 
 /** Serialize a FakeAction to the JSON wire body the /api/fake endpoint expects. */

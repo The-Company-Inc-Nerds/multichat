@@ -29,7 +29,13 @@ import {
   twitchBroadcasterStatePath,
   twitchTokenStatePath,
 } from "./src/control.ts";
-import { demoActions, serializeFakeAction } from "./src/fake.ts";
+import {
+  demoActions,
+  type FakeAction,
+  fakeActionForKind,
+  MESSAGE_KINDS,
+  serializeFakeAction,
+} from "./src/fake.ts";
 
 async function loadSettings(path: string): Promise<Settings> {
   let text: string;
@@ -403,7 +409,7 @@ function cliUsage(): string {
     "  multichat [settings.json]                  run the server",
     "  multichat set-youtube-key [opts] [KEY]     set the YouTube API key on a running server",
     "  multichat login [opts]                     authorize a Twitch channel for EventSub alerts",
-    "  multichat fake [opts]                      play a demo of every message kind into a running server",
+    "  multichat fake [kind] [opts]               inject fake events (all kinds, or just one) into a running server",
     "",
     "Options (set-youtube-key and fake share these):",
     "  -p, --port <port>   server port   (default: $PORT or 8080)",
@@ -421,11 +427,14 @@ function cliUsage(): string {
     "http://localhost:3000 as the app's OAuth redirect URL (or pass --redirect-port):",
     "  multichat login",
     "",
-    "fake: injects a scripted showcase of every message kind (chat, action, cheer, sub,",
-    "raid, follow, Super Chat, sticker, membership, system, a live deletion) into the SSE",
-    "feed so you can preview how they render — including on /alerts and /overlay.",
-    "Loopback-only, like set-youtube-key. Open the viewer (or /overlay, /alerts), then:",
-    "  multichat fake",
+    "fake: injects fake events into the SSE feed so you can preview how they render —",
+    "including on /alerts and /overlay. With no kind it plays the full showcase (chat,",
+    "action, cheer, sub, raid, follow, Super Chat, sticker, membership, system, a live",
+    "deletion); `fake <kind>` injects just one. Loopback-only, like set-youtube-key.",
+    "Open the viewer (or /overlay, /alerts), then:",
+    "  multichat fake            # the whole showcase",
+    "  multichat fake follow     # just a Twitch follow (e.g. to preview an alert theme)",
+    "  kind is one of: chat, action, cheer, sub, raid, follow, superchat, supersticker, membership, system",
   ].join("\n");
 }
 
@@ -524,16 +533,18 @@ async function runSetYouTubeKey(args: string[]): Promise<void> {
 }
 
 /**
- * CLI client: play the demo sequence into a running server's loopback /api/fake
- * endpoint, one event at a time, so the operator can watch every message kind
- * render in the viewer (or /overlay). Message control is intentionally omitted —
- * this is a fixed showcase (see docs/development/testing.md).
+ * CLI client: inject fake events into a running server's loopback /api/fake
+ * endpoint so the operator can watch how they render (in the viewer, /overlay, or
+ * /alerts). With no kind it plays the full curated showcase; `fake <kind>` injects
+ * a single event of that kind — e.g. `fake follow` — for a quick preview. See
+ * docs/development/testing.md.
  */
 async function runFake(args: string[]): Promise<void> {
   let host = Deno.env.get("HOST") ?? "127.0.0.1";
   let port = Number(Deno.env.get("PORT") ?? "8080");
   // ms between injected events, so they arrive as a readable trickle, not a burst.
   let gap = 450;
+  let kind: string | undefined; // a single kind to fake; undefined = full showcase
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -548,9 +559,14 @@ async function runFake(args: string[]): Promise<void> {
       gap = Number(args[++i]);
     } else if (a === "demo") {
       // `fake` and `fake demo` are the same; accept the explicit word too.
+    } else if (MESSAGE_KINDS.includes(a)) {
+      kind = a; // e.g. `fake follow` — inject just this one kind
     } else {
       console.error(`Unknown argument: ${a}`);
-      console.error("Usage: multichat fake [--port P] [--host H] [--gap MS]");
+      console.error(
+        "Usage: multichat fake [kind] [--port P] [--host H] [--gap MS]",
+      );
+      console.error(`  kind is one of: ${MESSAGE_KINDS.join(", ")}`);
       Deno.exit(2);
     }
   }
@@ -561,8 +577,19 @@ async function runFake(args: string[]): Promise<void> {
   }
   if (!Number.isFinite(gap) || gap < 0) gap = 450;
 
-  const actions = demoActions(Date.now());
-  console.log(`Playing ${actions.length} demo events into ${host}:${port} …`);
+  let actions: FakeAction[];
+  if (kind) {
+    const one = fakeActionForKind(kind, Date.now());
+    if (!one) {
+      console.error(`No sample available for kind: ${kind}`);
+      Deno.exit(2);
+    }
+    actions = [one];
+    console.log(`Injecting a fake ${kind} into ${host}:${port} …`);
+  } else {
+    actions = demoActions(Date.now());
+    console.log(`Playing ${actions.length} demo events into ${host}:${port} …`);
+  }
   for (const action of actions) {
     const { res, text } = await postControl(
       host,

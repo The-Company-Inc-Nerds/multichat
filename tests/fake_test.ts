@@ -2,6 +2,8 @@ import {
   demoActions,
   describeFakeAction,
   type FakeAction,
+  fakeActionForKind,
+  MESSAGE_KINDS,
   parseFakeAction,
   serializeFakeAction,
 } from "../src/fake.ts";
@@ -60,6 +62,24 @@ Deno.test("demoActions: covers every kind and both platforms", () => {
     ),
   );
   assert(platforms.has("twitch") && platforms.has("youtube"), "both platforms");
+});
+
+Deno.test("fakeActionForKind: returns one representative message per kind", () => {
+  // Every advertised kind has a sample (drawn from the demo).
+  for (const k of MESSAGE_KINDS) {
+    const a = fakeActionForKind(k, 1000);
+    assert(a !== null, `no sample for kind: ${k}`);
+    assert(a!.action === "message", `kind ${k} should be a message action`);
+    assertEquals(a!.data.kind ?? "chat", k);
+  }
+});
+
+Deno.test("fakeActionForKind: follow is a Twitch follow; unknown kinds are null", () => {
+  const follow = fakeActionForKind("follow", 1000);
+  assert(follow !== null && follow.action === "message");
+  assertEquals(follow!.data.platform, "twitch");
+  assertEquals(follow!.data.kind, "follow");
+  assertEquals(fakeActionForKind("nope", 1000), null);
 });
 
 Deno.test("demoActions: the delete targets a message actually shown", () => {

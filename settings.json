@@ -1,6 +1,6 @@
 {
   "server": {
-    "port": 8080,
+    "port": 8088,
     "host": "0.0.0.0"
   },
   "twitch": {
@@ -10,6 +10,16 @@
     "channels": [
       {
         "channelId": "UCP3z2Yd_oe3b2Jnj3gaLsgA"
+      }
+    ]
+  },
+  "alerts": {
+    "activeTheme": "The Company, Inc",
+    "themes": [
+      {
+        "name": "The Company, Inc",
+        "style": "company-memo",
+        "events": ["follow"]
       }
     ]
   }
