@@ -18,18 +18,28 @@ injecting fake events for previewing how they render.
 | any    | anything else           | `404`               | Not found                                                            |
 
 The viewer page also takes `?overlay` and `?alerts` query params (`/?overlay` is
-equivalent to `/overlay`, `/?alerts` to `/alerts`).
+equivalent to `/overlay`, `/?alerts` to `/alerts`), plus `?direction=up|down`
+(message flow — honored on `/` as well as on `/overlay`) and `?theme=NAME`
+(alerts mode only), documented with their modes below.
 
 ## Overlay mode (`/overlay`)
 
 A stripped-down rendering of the same feed for use as an **OBS browser source**:
 transparent background (no chroma key needed), no header or channel sidebar,
-just the messages anchored to the bottom — new ones appear at the bottom and
-older ones slide up and clip off the top (with a soft top fade). Each row also
+just the messages — new ones appear at the bottom and older ones slide up and
+clip off the top (with a soft fade at the edge they exit through). Each row also
 pops in, and highlighted event rows glow their accent color. The platform badge
 still tags each message's source. Point an OBS Browser source at
 `http://<host>:<port>/overlay` and size it to your scene; everything else (SSE
 feed, message shapes) is identical to the normal viewer.
+
+The feed grows downward by default; a `?direction=up|down` query param picks the
+direction for that source (`/overlay?direction=up`). With `up`, new messages
+appear at the **top** and older ones are pushed down and clip off the bottom —
+the fade, the row spacing and the pop-in all mirror to match. `down` is the
+default, and any other value falls back to it. The same param also works on the
+scrollable viewer (`/?direction=up`), where the newest message sits at the top
+and the "Latest" jump button points there instead.
 
 ## Alerts mode (`/alerts`)
 
@@ -43,9 +53,10 @@ system notices are ignored. It reads the same `/events` SSE feed, so
 Browser source at `http://<host>:<port>/alerts`. Configuring the events requires
 [Twitch EventSub](configuration.md#twitch-eventsub-alerts).
 
-The overlay renders the configured **alert theme** (from `settings.json`'s
-`alerts` block, see [Alert themes](configuration.md#alert-themes)); a
-`?theme=NAME` query param overrides the active theme for that source
+The alerts overlay renders the configured **alert theme** (from
+`settings.json`'s `alerts` block, see
+[Alert themes](configuration.md#alert-themes)); a `?theme=NAME` query param
+overrides the active theme for that source
 (`/alerts?theme=The%20Company,%20Inc`).
 
 `/events` returns `503` once 50 concurrent streams are open (a flood guard,

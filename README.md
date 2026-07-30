@@ -20,7 +20,8 @@ Deno built-ins only.
 - **Live deletions** — moderator timeouts/bans and removed messages disappear
   from the feed
 - **OBS overlays** — `/overlay` renders the chat feed transparent and
-  messages-only for a browser source; `/alerts` is the animated shoutout box
+  messages-only for a browser source, stacking new messages downward or upward
+  (`?direction=up|down`); `/alerts` is the animated shoutout box
 
 Twitch **chat** connects anonymously (no account or token). Twitch **alerts**
 (follows/cheers/subs/raids) use Twitch EventSub, which needs a Twitch app + a

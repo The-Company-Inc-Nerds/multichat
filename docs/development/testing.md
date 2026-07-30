@@ -73,10 +73,12 @@ showcase). `kind` is one of: `chat`, `action`, `cheer`, `sub`, `raid`, `follow`,
 
 Open the viewer (`/`), the OBS chat overlay (`/overlay`), or the alerts overlay
 (`/alerts`) first so you can watch the events arrive — `/alerts` plays the
-shoutout kinds (including the follow) as animated pop-ups. The demo also flips
-two throwaway channels (`demo_twitch`, `@demo_yt`) to `live` in the sidebar and,
-partway through (after the Twitch events, before the YouTube ones), deletes one
-of the earlier messages so you can see the moderation path.
+shoutout kinds (including the follow) as animated pop-ups, and
+`/overlay?direction=up` shows the same stream stacking upward instead of
+downward. The demo also flips two throwaway channels (`demo_twitch`, `@demo_yt`)
+to `live` in the sidebar and, partway through (after the Twitch events, before
+the YouTube ones), deletes one of the earlier messages so you can see the
+moderation path.
 
 Under the hood this POSTs each event to the loopback-only `POST /api/fake`
 endpoint (see [HTTP & SSE API](../api.md#post-apifake)), which injects it

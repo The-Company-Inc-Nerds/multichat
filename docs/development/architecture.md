@@ -122,7 +122,10 @@ Tuned for unattended multi-hour streams:
 - **SSE client cap.** `/events` is capped at 50 concurrent connections (returns
   `503` beyond that) so an exposed port can't be flooded with open streams.
 - **Bounded browser memory.** The viewer keeps at most 500 messages, removing
-  the oldest, so a long stream doesn't grow the DOM without limit.
+  the oldest, so a long stream doesn't grow the DOM without limit. Which end
+  holds the oldest row depends on `?direction`, so the trim and the insertion
+  point are decided by the same flag — trimming the wrong end would drop the row
+  just added and silently freeze the feed at the cap.
 - **Scoped permissions.** The process runs with `--allow-net` limited to
   `irc-ws.chat.twitch.tv`, `eventsub.wss.twitch.tv`, `api.twitch.tv`,
   `id.twitch.tv`, `www.googleapis.com`, and the local bind addresses, plus a

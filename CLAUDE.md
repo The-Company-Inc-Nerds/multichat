@@ -103,7 +103,8 @@ src/youtube.ts   YouTube Data API v3 polling — resolves channel → live video
                  startYouTubePoller takes an AbortSignal so it can be torn down/restarted
 src/server.ts    Deno.serve HTTP server: GET / + GET /overlay + GET /alerts (embedded HTML;
                  overlay = transparent chat OBS source, alerts = animated shoutout pop-ups
-                 with selectable themes, e.g. the "company-memo" redacted-memo look),
+                 with selectable themes, e.g. the "company-memo" redacted-memo look;
+                 ?direction=up|down flips the message flow on any chat-rendering page),
                  GET /events (SSE), POST /api/youtube-key (loopback-only runtime key control),
                  POST /api/fake (loopback-only fake-event injection for previewing)
 src/alerts.ts    pure alerts-theme helpers: normalizeAlertsConfig (validates the theme

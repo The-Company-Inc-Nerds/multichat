@@ -276,9 +276,10 @@ const HTML = `<!DOCTYPE html>
     }
 
     /* ---- OBS overlay mode (visit /overlay or add ?overlay) ----
-       Transparent page, messages only, anchored to the bottom; older messages
-       slide up and clip off the top (a soft top fade smooths the exit). Drop it
-       into an OBS browser source — no chroma key needed, the page is see-through. */
+       Transparent page, messages only: new ones land at the bottom and older
+       ones slide up and clip off the top (a soft fade smooths the exit edge).
+       Drop it into an OBS browser source — no chroma key needed, the page is
+       see-through. ?direction=up mirrors the flow; see body.up below. */
     body.overlay {
       background: transparent;
       font-size: 15px;
@@ -314,6 +315,42 @@ const HTML = `<!DOCTYPE html>
     }
     body.overlay #chat .msg,
     body.overlay #chat .event { animation: popIn 0.28s ease-out; }
+
+    /* ---- Newest-first flow (add ?direction=up) ----
+       The mirror image of the default: addMsg inserts each row at the top
+       instead of appending, so everything anchored to an edge flips with it —
+       the breathing room at the newest end, the gap between rows, the overlay's
+       exit fade, and the direction the row pops in from. No layout change is
+       needed: #chat is a plain block, so content already starts at the top and
+       grows down. (If the default flow is ever made a true bottom-anchored flex
+       column, scope it to body.overlay:not(.up) — it would break this.) */
+    body.up #chat { padding: 8px 0 4px; }
+    /* The pill means "jump to newest", so it belongs at the newest end — clear of
+       the header rather than pinned to the now-oldest bottom edge. Viewer only:
+       #jump is hidden in both OBS modes. */
+    body.up #jump { top: 44px; bottom: auto; }
+    body.overlay.up #chat {
+      padding: 10px 12px 6px;
+      /* Belt and braces: inserting rows above the scroll offset is exactly what
+         scroll anchoring compensates for, but here scrollTop never leaves 0 (no
+         scrollbar, and scrollToNewest pins it) and browsers skip anchoring while a
+         scroller sits at the block start — so today this changes nothing. It only
+         bites if that stops being true, and then the pin should still win.
+         Deliberately not applied to the scrollable viewer, where anchoring is
+         what keeps a scrolled-back reader from being shoved along. */
+      overflow-anchor: none;
+      -webkit-mask-image: linear-gradient(to top, transparent 0, #000 56px);
+      mask-image: linear-gradient(to top, transparent 0, #000 56px);
+    }
+    @keyframes popInUp {
+      from { opacity: 0; transform: translateY(-8px) scale(0.98); }
+      to   { opacity: 1; transform: none; }
+    }
+    /* Outranks the two base body.overlay #chat rules above (one more class), so
+       the margin moves to the top edge and only the keyframes name is swapped —
+       duration and easing still come from the base animation shorthand. */
+    body.overlay.up #chat .msg,
+    body.overlay.up #chat .event { margin: 4px 0 0; animation-name: popInUp; }
 
     /* ---- OBS alerts mode (visit /alerts or add ?alerts) ----
        A dedicated shoutout box: one big animated card at a time, centered,
@@ -411,7 +448,7 @@ const HTML = `<!DOCTYPE html>
     <div id="chat"></div>
   </div>
   <div id="alert-stage"></div>
-  <button id="jump" onclick="jumpBottom()">&#9660; Latest</button>
+  <button id="jump" onclick="jumpNewest()">&#9660; Latest</button>
   <script>
     var chat = document.getElementById('chat');
     var side = document.getElementById('side');
@@ -424,12 +461,23 @@ const HTML = `<!DOCTYPE html>
     var MAX    = 500;
 
     var params = new URLSearchParams(location.search);
-    // OBS overlay mode: /overlay or ?overlay → transparent, messages-only, bottom-anchored.
+    // OBS overlay mode: /overlay or ?overlay → transparent, messages-only.
     var overlayMode = location.pathname === '/overlay' || params.has('overlay');
     if (overlayMode) document.body.classList.add('overlay');
     // OBS alerts mode: /alerts or ?alerts → transparent, one animated shoutout at a time.
     var alertsMode = location.pathname === '/alerts' || params.has('alerts');
     if (alertsMode) document.body.classList.add('alerts');
+
+    // Message direction: ?direction=up grows the feed upward — new messages at the
+    // top, older ones pushed down and off the bottom. Anything else (including a
+    // typo) keeps the default ?direction=down flow, so a bad URL degrades to
+    // today's behavior rather than an empty source.
+    var upMode = params.get('direction') === 'up';
+    if (upMode) {
+      document.body.classList.add('up');
+      // The page HTML is static, so the jump button's ▼ is re-pointed here.
+      jump.textContent = '▲ Latest';
+    }
 
     // Alert theme: the active theme is injected as window.MULTICHAT_ALERTS (from
     // settings.json); ?theme=NAME overrides it for testing / per-source setups.
@@ -451,9 +499,20 @@ const HTML = `<!DOCTYPE html>
       return activeTheme;
     }
 
+    // The "newest end" of the feed is the bottom by default and the top in up mode.
+    // Everything that scrolls goes through these two so that sign convention is
+    // stated once instead of being spelled out at each call site.
+    function atNewest() {
+      if (upMode) return chat.scrollTop <= 60;
+      return chat.scrollTop + chat.clientHeight >= chat.scrollHeight - 60;
+    }
+
+    function scrollToNewest() {
+      chat.scrollTop = upMode ? 0 : chat.scrollHeight;
+    }
+
     chat.addEventListener('scroll', function() {
-      var atBottom = chat.scrollTop + chat.clientHeight >= chat.scrollHeight - 60;
-      if (atBottom) {
+      if (atNewest()) {
         pinned = true;
         jump.classList.remove('show');
       } else if (pinned) {
@@ -462,8 +521,8 @@ const HTML = `<!DOCTYPE html>
       }
     });
 
-    function jumpBottom() {
-      chat.scrollTop = chat.scrollHeight;
+    function jumpNewest() {
+      scrollToNewest();
       pinned = true;
       jump.classList.remove('show');
     }
@@ -586,15 +645,19 @@ const HTML = `<!DOCTYPE html>
         }
       }
 
-      chat.appendChild(row);
+      // Up mode puts the new row at the top, which also moves the oldest row to
+      // the other end — both halves read off upMode so the cap can never trim the
+      // row that was just added (that would silently freeze the feed at MAX).
+      if (upMode) chat.insertBefore(row, chat.firstChild);
+      else chat.appendChild(row);
       count++;
 
       if (count > MAX) {
-        var old = chat.firstElementChild;
+        var old = upMode ? chat.lastElementChild : chat.firstElementChild;
         if (old) { old.remove(); count--; }
       }
 
-      if (pinned) chat.scrollTop = chat.scrollHeight;
+      if (pinned) scrollToNewest();
     }
 
     function removeMatching(pred) {

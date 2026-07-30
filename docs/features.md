@@ -88,9 +88,11 @@ still shows as a normal message).
 The [`/alerts`](api.md#alerts-mode-alerts) browser source turns these highlight
 events into big animated shoutout cards — one at a time, centered,
 auto-dismissing — for use as a dedicated OBS source alongside (or instead of)
-the chat `/overlay`. It shows `follow`, `cheer`, `sub`, `raid`, `superchat`,
-`supersticker`, and `membership`; plain chat and `system` notices are skipped.
-Preview it without a live stream with `multichat fake`.
+the chat [`/overlay`](api.md#overlay-mode-overlay), which stacks its messages
+downward or upward as that source's `?direction` asks. It shows `follow`,
+`cheer`, `sub`, `raid`, `superchat`, `supersticker`, and `membership`; plain
+chat and `system` notices are skipped. Preview it without a live stream with
+`multichat fake`.
 
 ### Themes
 
@@ -98,7 +100,7 @@ The alerts overlay is themeable: `settings.json`'s `alerts` block (and the NixOS
 module) defines a registry of **named themes** and selects an `activeTheme`.
 With no active theme the overlay uses its default card. A theme can limit which
 shoutout kinds it restyles (others fall back to the default), and `?theme=NAME`
-on the overlay URL overrides the selection per OBS source.
+on the `/alerts` URL overrides the selection per OBS source.
 
 The built-in **`company-memo`** style ("The Company, Inc") renders the alert as
 an office memo — `THE COMPANY, INC` over `"[Name] just followed!"` — then, right
