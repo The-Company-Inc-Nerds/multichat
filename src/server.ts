@@ -884,8 +884,48 @@ const GIVEAWAY_HTML = `<!DOCTYPE html>
     .card .nm { font-size: 12px; font-weight: 600; max-width: 96px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .card.win { border-color: #ffcf3f; box-shadow: 0 0 0 2px #ffcf3f, 0 0 26px #ffcf3f99; transform: translateY(-2px); }
 
+    .card .num { position: absolute; top: 7px; right: 6px; font-size: 10px; font-weight: 700; color: #8e8e9a; }
+
     #winner { min-height: 30px; font-size: 22px; font-weight: 800; text-align: center; }
     #winner .name { color: #ffcf3f; text-shadow: 0 0 18px #ffcf3f66; }
+    #winner .tier {
+      display: inline-block; margin-left: 8px; padding: 1px 8px; border-radius: 9px;
+      font-size: 11px; font-weight: 700; vertical-align: middle;
+      background: #2b2b31; color: #adadb8; border: 1px solid #3a3a42;
+    }
+    #winner .tier.guaranteed { background: #06331f; color: #00e29a; border-color: #0a4f30; }
+
+    /* Follower-milestone progress (only rendered when followerStep > 0). */
+    #progWrap { width: 100%; max-width: 560px; display: none; }
+    #progWrap.on { display: block; }
+    #progLabel { display: flex; justify-content: space-between; font-size: 11px; color: #8e8e9a; margin-bottom: 4px; }
+    #progLabel b { color: #efeff1; }
+    #progBar { height: 10px; border-radius: 5px; background: #1c1c22; border: 1px solid #2c2c34; overflow: hidden; }
+    #progFill { height: 100%; width: 0%; border-radius: 5px; background: linear-gradient(90deg, #9147ff, #ffcf3f); transition: width 0.5s ease; }
+    #progNote { font-size: 11px; color: #6c6c78; margin-top: 3px; text-align: center; }
+    #progNote .cred { color: #ffcf3f; font-weight: 700; }
+    #progNote.unavail { color: #ff8a84; }
+
+    /* Milestone-crossed flourish. */
+    #milestone {
+      display: none; padding: 8px 18px; border-radius: 8px; text-align: center;
+      font-weight: 800; font-size: 16px; color: #0e0e10;
+      background: linear-gradient(90deg, #ffcf3f, #ffa63f);
+      box-shadow: 0 0 26px #ffcf3f88; animation: mspop 0.45s ease;
+    }
+    #milestone.show { display: block; }
+    @keyframes mspop { from { transform: scale(0.7); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+
+    /* Winners panel (fetched on demand — the mailing list). */
+    #winsWrap { width: 100%; max-width: 640px; display: none; }
+    #winsWrap.on { display: block; }
+    #winsList { list-style: none; display: flex; flex-direction: column; gap: 3px; max-height: 40vh; overflow-y: auto; }
+    #winsList li { display: flex; align-items: baseline; gap: 8px; padding: 4px 9px; background: #161618; border-radius: 5px; font-size: 12px; }
+    #winsList li .wnum { color: #ffcf3f; font-weight: 700; flex-shrink: 0; min-width: 40px; }
+    #winsList li .wtier { color: #8e8e9a; font-size: 11px; }
+    #winsList li .wwhen { margin-left: auto; color: #6c6c78; font-size: 11px; white-space: nowrap; }
+    button.danger { border-color: #5a2a2a; color: #ff8a84; }
+    button.danger:hover { background: #3a2323; }
 
     #panel { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 4px 16px 26px; }
     #hint { font-size: 12px; color: #adadb8; text-align: center; }
@@ -919,6 +959,15 @@ const GIVEAWAY_HTML = `<!DOCTYPE html>
     body.overlay #stage { min-height: 100dvh; justify-content: center; opacity: 1; transition: opacity 0.6s ease; }
     body.overlay #stage.hidden { opacity: 0; }
     body.overlay #winner { font-size: 30px; text-shadow: 0 2px 10px #000; }
+    /* ?overlay&progress: a small always-on corner pill with follower progress. */
+    #progPill {
+      display: none; position: fixed; right: 14px; bottom: 14px; z-index: 5;
+      padding: 7px 14px; border-radius: 16px; font-size: 13px; font-weight: 700;
+      background: #18181bee; border: 1px solid #3a3a42; color: #efeff1;
+      text-shadow: none;
+    }
+    #progPill .cred { color: #ffcf3f; }
+    body.overlay.progress #progPill { display: block; }
   </style>
   <!--GIVEAWAY-->
 </head>
@@ -929,6 +978,7 @@ const GIVEAWAY_HTML = `<!DOCTYPE html>
   </header>
   <div id="disabled">Giveaway mode is disabled. Enable it in settings.json / the NixOS module.</div>
   <div id="stage">
+    <div id="milestone"></div>
     <div id="reel">
       <div id="idle">No entrants yet</div>
       <div id="strip"></div>
@@ -937,28 +987,40 @@ const GIVEAWAY_HTML = `<!DOCTYPE html>
     </div>
     <div id="winner"></div>
   </div>
+  <div id="progPill"></div>
   <div id="panel">
     <div id="hint"></div>
+    <div id="progWrap">
+      <div id="progLabel"><span>Follower milestone</span><b id="progText"></b></div>
+      <div id="progBar"><div id="progFill"></div></div>
+      <div id="progNote"></div>
+    </div>
     <div id="controls">
       <button class="spin" id="spinBtn" onclick="spin()">Draw winner</button>
       <button id="openBtn" onclick="act('open')">Open entries</button>
       <button id="closeBtn" onclick="act('close')">Close entries</button>
       <button id="resetBtn" onclick="resetPool()">Reset</button>
       <button id="demoBtn" onclick="demo()" title="Add sample entrants to preview the reel">Demo</button>
+      <button id="winsBtn" onclick="toggleWinners()">Winners</button>
+      <button id="cresetBtn" class="danger" onclick="campaignReset()"
+        title="Zero follower progress + entry numbers; archives the winners log">Campaign reset</button>
     </div>
     <div id="state"></div>
+    <div id="winsWrap"><h2>WINNERS</h2><ul id="winsList"></ul></div>
     <div id="listWrap"><h2 id="rtitle">ENTRANTS</h2><ul id="list"></ul></div>
   </div>
   <script>
     var cfg = window.MULTICHAT_GIVEAWAY || {};
     var params = new URLSearchParams(location.search);
     // OBS overlay mode: /giveaway?overlay → transparent, controls hidden, auto-hide.
+    // ?overlay&progress adds a small always-on follower-progress pill.
     var overlayMode = params.has('overlay');
     if (overlayMode) document.body.classList.add('overlay');
+    if (overlayMode && params.has('progress')) document.body.classList.add('progress');
     if (cfg.enabled === false) document.body.classList.add('off');
 
     var CARD_W = 108, GAP = 8, STRIDE = CARD_W + GAP;
-    var REEL_MS = 6500, HOLD_MS = 6000;
+    var REEL_MS = 6500, HOLD_MS = 6000, MILESTONE_MS = 6000;
 
     var reelEl = document.getElementById('reel');
     var strip = document.getElementById('strip');
@@ -972,12 +1034,21 @@ const GIVEAWAY_HTML = `<!DOCTYPE html>
     var rtitle = document.getElementById('rtitle');
     var spinBtn = document.getElementById('spinBtn');
     var hintEl = document.getElementById('hint');
+    var msEl = document.getElementById('milestone');
+    var pillEl = document.getElementById('progPill');
+    var winsWrap = document.getElementById('winsWrap');
+    var winsList = document.getElementById('winsList');
     var hideTimer = null;
+    var msTimer = null;
 
-    var pool = { open: true, entrants: [], lastWinner: null };
+    var pool = { open: true, entrants: [], lastWinner: null, campaign: null };
     var reelBusy = false;     // a reel animation is playing
     var awaiting = false;     // a draw was requested; awaiting the broadcast frame
     var pendingState = null;  // post-draw pool, applied once the animation ends
+    // Milestone flourish: seeded from the FIRST frame (incl. the SSE replay) so a
+    // reconnect never re-fires it; deferred while the reel is busy.
+    var prevMilestones = null;
+    var flourishPending = false;
 
     if (hintEl) hintEl.innerHTML = cfg.command
       ? 'Viewers type <b>' + (cfg.prefix || '!') + cfg.command + '</b>' +
@@ -999,11 +1070,18 @@ const GIVEAWAY_HTML = `<!DOCTYPE html>
       av.textContent = nameOf(e).slice(0, 1).toUpperCase(); c.appendChild(av);
       var nm = document.createElement('div'); nm.className = 'nm';
       var n = nameOf(e); nm.textContent = n.length > 14 ? n.slice(0, 13) + '…' : n; c.appendChild(nm);
+      if (e.number) {
+        var num = document.createElement('div'); num.className = 'num';
+        num.textContent = '#' + e.number; c.appendChild(num);
+      }
       return c;
     }
 
     function normPool(p) {
-      return { open: !!p.open, entrants: p.entrants || [], lastWinner: p.lastWinner || null };
+      return {
+        open: !!p.open, entrants: p.entrants || [],
+        lastWinner: p.lastWinner || null, campaign: p.campaign || null,
+      };
     }
 
     // The static "who's in" strip shown between draws (control view only; the
@@ -1025,14 +1103,32 @@ const GIVEAWAY_HTML = `<!DOCTYPE html>
 
     function renderPanel() {
       var n = pool.entrants.length;
+      var c = pool.campaign;
       if (rtitle) rtitle.textContent = 'ENTRANTS (' + n + ')';
-      if (stateEl) stateEl.innerHTML = 'Entries are ' +
-        (pool.open ? '<span class="pill open">OPEN</span>' : '<span class="pill closed">CLOSED</span>') +
-        ' · ' + n + ' in the pool';
-      if (spinBtn) spinBtn.disabled = reelBusy || awaiting || n === 0;
+      if (stateEl) {
+        var line = 'Entries are ' +
+          (pool.open ? '<span class="pill open">OPEN</span>' : '<span class="pill closed">CLOSED</span>');
+        if (c && cfg.firstN > 0) {
+          line += ' · ' + c.guaranteedRemaining + ' guaranteed in queue · ' +
+            c.poolSize + ' in bonus pool';
+        } else {
+          line += ' · ' + n + ' in the pool';
+        }
+        if (c && c.winnersTotal > 0) line += ' · ' + c.winnersTotal + ' won';
+        stateEl.innerHTML = line;
+      }
+      if (spinBtn) {
+        spinBtn.disabled = reelBusy || awaiting || n === 0;
+        // During the guaranteed phase the button reads as "next pack".
+        spinBtn.textContent = (c && cfg.firstN > 0 && c.guaranteedRemaining > 0)
+          ? 'Draw next pack' : 'Draw winner';
+      }
       var ob = document.getElementById('openBtn'), cb = document.getElementById('closeBtn');
       if (ob) ob.disabled = pool.open;
       if (cb) cb.disabled = !pool.open;
+      var wb = document.getElementById('winsBtn');
+      if (wb && c) wb.textContent = 'Winners (' + c.winnersTotal + ')';
+      renderProgress(c);
       if (!listEl) return;
       listEl.textContent = '';
       if (!n) {
@@ -1043,15 +1139,74 @@ const GIVEAWAY_HTML = `<!DOCTYPE html>
         var el = document.createElement('li');
         var sw = document.createElement('span'); sw.className = 'sw';
         sw.style.background = color(e.userId, i); el.appendChild(sw);
-        var nm = document.createElement('span'); nm.textContent = nameOf(e); el.appendChild(nm);
+        var nm = document.createElement('span');
+        nm.textContent = (e.number ? '#' + e.number + ' ' : '') + nameOf(e);
+        el.appendChild(nm);
         var rm = document.createElement('button'); rm.textContent = '✕'; rm.title = 'Remove';
         rm.onclick = function () { act('remove', { userId: e.userId }); }; el.appendChild(rm);
         listEl.appendChild(el);
       });
     }
 
+    // Follower-milestone progress: the control-view bar and the overlay pill.
+    function renderProgress(c) {
+      var wrap = document.getElementById('progWrap');
+      if (!wrap) return;
+      if (!c || cfg.followerStep <= 0) { wrap.classList.remove('on'); return; }
+      wrap.classList.add('on');
+      var note = document.getElementById('progNote');
+      if (!c.followTracking) {
+        document.getElementById('progText').textContent = 'unavailable';
+        document.getElementById('progFill').style.width = '0%';
+        note.className = 'unavail';
+        note.textContent = 'Follower tracking unavailable — the giveaway channel has no EventSub connection.';
+      } else {
+        var into = c.followerCount % cfg.followerStep;
+        document.getElementById('progText').textContent =
+          into + ' / ' + cfg.followerStep + ' (milestone ' + (c.milestonesReached + 1) + ')';
+        document.getElementById('progFill').style.width =
+          Math.min(100, Math.round(into / cfg.followerStep * 100)) + '%';
+        note.className = '';
+        note.innerHTML = c.followerCount + ' new follower(s) · ' +
+          '<span class="cred">' + c.creditsRemaining + ' draw credit(s) armed</span>';
+      }
+      if (pillEl && c.followTracking) {
+        var pInto = c.followerCount % cfg.followerStep;
+        pillEl.innerHTML = 'Followers ' + pInto + '/' + cfg.followerStep +
+          ' · <span class="cred">' + c.creditsRemaining + ' draws armed</span>';
+      }
+    }
+
+    // Milestone-crossed flourish: seeded on the first frame, deferred mid-reel.
+    function checkMilestone(c) {
+      if (!c || cfg.followerStep <= 0) return;
+      if (prevMilestones !== null && c.milestonesReached > prevMilestones) {
+        flourishPending = true;
+      }
+      prevMilestones = c.milestonesReached;
+    }
+    function maybeFlourish() {
+      if (!flourishPending || reelBusy || !msEl) return;
+      flourishPending = false;
+      msEl.textContent = '🎉 MILESTONE! ' + (cfg.milestoneDraws || 1) + ' bonus draw(s) unlocked!';
+      msEl.classList.add('show');
+      if (overlayMode) showStage();
+      clearTimeout(msTimer);
+      msTimer = setTimeout(function () {
+        msEl.classList.remove('show');
+        if (overlayMode && !reelBusy) hideTimer = setTimeout(hideStage, 800);
+      }, MILESTONE_MS);
+    }
+
+    function tierTag(w) {
+      var c = pool.campaign;
+      if (!c || !cfg.firstN) return '';
+      var t = (w.number && w.number <= cfg.firstN) ? 'guaranteed' : 'bonus';
+      return ' <span class="tier ' + (t === 'guaranteed' ? 'guaranteed' : '') + '">' + t + '</span>';
+    }
     function showWinner(w) {
-      winnerEl.innerHTML = '🎉 Winner: <span class="name">' + nameOf(w) + '</span>';
+      winnerEl.innerHTML = '🎉 Winner: <span class="name">' +
+        (w.number ? '#' + w.number + ' ' : '') + nameOf(w) + '</span>' + tierTag(w);
     }
     function showStage() { clearTimeout(hideTimer); stage.classList.remove('hidden'); }
     function hideStage() { if (overlayMode) stage.classList.add('hidden'); }
@@ -1059,7 +1214,9 @@ const GIVEAWAY_HTML = `<!DOCTYPE html>
     function applyPool(p) {
       if (reelBusy) { pendingState = normPool(p); return; }
       pool = normPool(p);
+      checkMilestone(pool.campaign);
       renderIdle(); renderPanel();
+      maybeFlourish();
       if (!overlayMode && pool.lastWinner && !winnerEl.textContent) showWinner(pool.lastWinner);
     }
 
@@ -1094,8 +1251,12 @@ const GIVEAWAY_HTML = `<!DOCTYPE html>
         if (winCard) winCard.classList.add('win');
         showWinner(winner);
         reelBusy = false;
-        if (pendingState) { pool = pendingState; pendingState = null; }
+        if (pendingState) {
+          pool = pendingState; pendingState = null;
+          checkMilestone(pool.campaign);
+        }
         renderPanel();
+        maybeFlourish();
         if (overlayMode) hideTimer = setTimeout(hideStage, HOLD_MS);
       }, REEL_MS + 80);
     }
@@ -1112,9 +1273,45 @@ const GIVEAWAY_HTML = `<!DOCTYPE html>
     function act(action, extra) {
       post(action, extra).then(function (res) { if (res && res.state) applyPool(res.state); });
     }
-    function resetPool() { if (!confirm('Clear all entrants?')) return; winnerEl.textContent = ''; act('reset'); }
+    function resetPool() { if (!confirm('Clear all entrants? (Campaign progress and winners are kept.)')) return; winnerEl.textContent = ''; act('reset'); }
     // Inject sample entrants so you can run the reel without a live stream.
     function demo() { winnerEl.textContent = ''; act('demo'); }
+
+    // The full winners list (mailing list) — fetched on demand, never broadcast.
+    function toggleWinners() {
+      if (winsWrap.classList.contains('on')) { winsWrap.classList.remove('on'); return; }
+      post('winners').then(function (res) {
+        if (!res || !res.winners) return;
+        winsList.textContent = '';
+        if (!res.winners.length) {
+          var li = document.createElement('li');
+          li.textContent = 'No winners recorded yet.'; winsList.appendChild(li);
+        }
+        res.winners.forEach(function (w) {
+          var li = document.createElement('li');
+          var num = document.createElement('span'); num.className = 'wnum';
+          num.textContent = '#' + w.number; li.appendChild(num);
+          var nm = document.createElement('span'); nm.textContent = nameOf(w); li.appendChild(nm);
+          var t = document.createElement('span'); t.className = 'wtier';
+          t.textContent = '[' + w.tier + ']'; li.appendChild(t);
+          var when = document.createElement('span'); when.className = 'wwhen';
+          when.textContent = w.wonAt ? new Date(w.wonAt).toLocaleString() : '';
+          li.appendChild(when);
+          winsList.appendChild(li);
+        });
+        winsWrap.classList.add('on');
+      });
+    }
+
+    // Zero the whole campaign (double confirm — this is the season reset).
+    function campaignReset() {
+      if (!confirm('Campaign reset: zero follower progress, milestone credits and entry numbers, clear the pool, and archive the winners log. Continue?')) return;
+      if (!confirm('Really reset the whole campaign? The winners log is archived to a .bak file, not deleted.')) return;
+      winnerEl.textContent = '';
+      winsWrap.classList.remove('on');
+      prevMilestones = null; flourishPending = false;
+      act('campaign-reset');
+    }
 
     // Trigger a draw; the broadcast frame drives the reel here AND on the overlay.
     function spin() {
@@ -1183,14 +1380,18 @@ export function createServer(
     `<script>window.MULTICHAT_ALERTS=${alertsJson}</script>`,
   );
 
-  // The /giveaway page needs to know the command + channel to prompt with
-  // (never any secret). Same <-escaping as the alerts injection above.
+  // The /giveaway page needs to know the command + channel to prompt with and
+  // the campaign shape (never any secret). Same <-escaping as the alerts
+  // injection above.
   const g = settings.giveaway;
   const giveawayJson = JSON.stringify({
     enabled: g?.enabled ?? false,
     channel: g?.channel ?? "",
     prefix: g?.prefix ?? "!",
     command: g?.command ?? "enter",
+    firstN: g?.firstN ?? 0,
+    followerStep: g?.followerStep ?? 0,
+    milestoneDraws: g?.milestoneDraws ?? 1,
   }).replace(/</g, "\\u003c");
   const giveawayHtml = GIVEAWAY_HTML.replace(
     "<!--GIVEAWAY-->",
@@ -1387,11 +1588,17 @@ export function createServer(
             break;
           case "draw": {
             const r = gh.draw();
-            payload = { state: r.state, winner: r.winner };
+            payload = { state: r.state, winner: r.winner, segment: r.segment };
             break;
           }
           case "status":
             payload = { state: gh.getState() };
+            break;
+          case "winners":
+            payload = { winners: gh.winners() };
+            break;
+          case "campaign-reset":
+            payload = { state: gh.campaignReset() };
             break;
         }
         return ctl(JSON.stringify(payload) + "\n", 200, true);

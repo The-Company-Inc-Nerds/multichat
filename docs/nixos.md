@@ -124,14 +124,19 @@ waits for the key. The control endpoint is loopback-only (see
 | `giveaway.command`                 | string                                                  | `"enter"`              | Command word (default gives `!enter`)                                                          |
 | `giveaway.requireFollow`           | bool                                                    | `true`                 | Gate entries on a live follow check (needs the channel in `twitch.eventsub`)                   |
 | `giveaway.replies`                 | bool                                                    | `true`                 | Reply in chat as the broadcaster (needs re-`login` — see below)                                |
-| `giveaway.messages`                | `attrs of string`                                       | `{}`                   | Optional reply templates (`entered`/`notFollowing`/`alreadyEntered`/`winner`), `{user}` = name |
+| `giveaway.firstN`                  | int                                                     | `0`                    | Campaign: entrants #1..N are all guaranteed winners (0 = off), e.g. `500`                      |
+| `giveaway.followerStep`            | int                                                     | `0`                    | Arm draw credits every N new followers via EventSub (0 = no tracking), e.g. `100`              |
+| `giveaway.milestoneDraws`          | int                                                     | `1`                    | Draw credits armed per milestone, e.g. `10`                                                    |
+| `giveaway.messages`                | `attrs of string`                                       | `{}`                   | Optional reply templates incl. `enteredPool`/`milestone`; placeholders `{user}`/`{number}`/…   |
 
-See [Giveaway mode](configuration.md#giveaway-mode) for the full behavior. Two
-gotchas the module warns about at build time: `giveaway.requireFollow` needs the
-channel authorized in `twitch.eventsub.channels` (the follow check uses its
-broadcaster token — otherwise entries fail closed), and `giveaway.replies`
-requires re-running `multichat login` so the token gains the new
-`user:write:chat` scope (tokens minted before this release don't carry it).
+See [Giveaway mode](configuration.md#giveaway-mode) for the full behavior
+(including the campaign mode the 500/100/10 example configures). Three gotchas
+the module warns about at build time: `giveaway.requireFollow` needs the channel
+authorized in `twitch.eventsub.channels` (the follow check uses its broadcaster
+token — otherwise entries fail closed); `giveaway.followerStep` also needs that
+EventSub connection (follow events feed the milestone counter); and
+`giveaway.replies` requires re-running `multichat login` so the token gains the
+new `user:write:chat` scope (tokens minted before this release don't carry it).
 
 ## Secrets management
 
@@ -227,8 +232,10 @@ skipped); when `alerts.activeTheme` names no theme in `alerts.themes` (the
 overlay falls back to the default look); when the `giveaway.channel` isn't in
 `twitch.channels` (its chat won't be joined); when `giveaway.requireFollow` is
 on but the channel isn't in `twitch.eventsub.channels` (follow checks can't
-run); or when `giveaway.replies` is on (a reminder to re-run `multichat login`
-for the `user:write:chat` scope).
+run); when `giveaway.followerStep` is set but the channel isn't in
+`twitch.eventsub.channels` (follow events can't be received, so milestone
+progress won't advance); or when `giveaway.replies` is on (a reminder to re-run
+`multichat login` for the `user:write:chat` scope).
 
 ## Security hardening
 

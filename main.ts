@@ -1,9 +1,11 @@
 import type {
   Emitter,
+  GiveawayCampaignState,
   GiveawayConfig,
   GiveawayDraw,
   GiveawayMessages,
   GiveawayState,
+  GiveawayWinner,
   Settings,
   TwitchConfig,
   TwitchEventSubChannelConfig,
@@ -16,6 +18,8 @@ import { createServer } from "./src/server.ts";
 import { normalizeAlertsConfig } from "./src/alerts.ts";
 import {
   type EventSubChannelContext,
+  type FollowEvent,
+  type FollowHandler,
   startTwitchEventSub,
 } from "./src/eventsub.ts";
 import {
@@ -32,8 +36,10 @@ import {
   parseUsersResponse,
 } from "./src/twitchauth.ts";
 import {
+  giveawayCampaignStatePath,
   type GiveawayHooks,
   giveawayPoolStatePath,
+  giveawayWinnersLogPath,
   keyStatePath,
   type KeyUpdateResult,
   resolveStartupKey,
@@ -49,21 +55,30 @@ import {
 } from "./src/fake.ts";
 import {
   addEntrant,
+  campaignSummary,
   closePool,
   decideEligibility,
   demoEntrants,
-  drawWinner,
+  demoFollowerIds,
+  drawSegmented,
+  emptyCampaign,
   emptyPool,
   type GiveawayAction,
   giveawayMessage,
   hasEntrant,
   matchGiveawayCommand,
+  normalizeCampaignState,
   normalizeGiveawayConfig,
   normalizePoolState,
   openPool,
+  parseWinnersLog,
+  recordFollower,
   removeEntrant,
   resetPool,
   serializeGiveawayAction,
+  serializeWinnerLine,
+  winnersToCsv,
+  winnerTier,
 } from "./src/giveaway.ts";
 
 async function loadSettings(path: string): Promise<Settings> {
@@ -122,6 +137,16 @@ async function persistState(path: string, value: string): Promise<void> {
     await Deno.writeTextFile(path, value, { mode: 0o600 });
   } catch (e) {
     console.error(`[Control] Could not persist ${path}: ${e}`);
+  }
+}
+
+/** Best-effort append one line to a state file (0600) — the winners JSONL.
+ *  Append-only means a crash can corrupt at most the trailing line. */
+async function appendState(path: string, line: string): Promise<void> {
+  try {
+    await Deno.writeTextFile(path, line + "\n", { append: true, mode: 0o600 });
+  } catch (e) {
+    console.error(`[Control] Could not append to ${path}: ${e}`);
   }
 }
 
@@ -206,6 +231,9 @@ function createTwitchEventSubManager(opts: {
   getEmitter: () => Emitter;
   config: TwitchEventSubConfig;
   stateDir: string | null;
+  /** Optional follow observer, forwarded to every channel's EventSub socket
+   *  (the giveaway milestone counter). */
+  onFollow?: FollowHandler;
 }) {
   const { clientId, clientSecret } = opts.config;
 
@@ -346,6 +374,7 @@ function createTwitchEventSubManager(opts: {
       channelLabel: login || broadcasterId,
       emitter: opts.getEmitter(),
       getToken,
+      onFollow: opts.onFollow,
     };
     startTwitchEventSub(ctx);
   }
@@ -385,43 +414,90 @@ async function readKeyFile(path: string): Promise<string | null> {
  * gates entries on a live Helix follow check (fail-closed when it can't be run),
  * collects eligible viewers, persists the pool, optionally replies in chat as the
  * broadcaster (fail-soft), and drives the /giveaway page via the ServerHooks it
- * exposes. Pure logic lives in src/giveaway.ts; this is the wiring.
+ * exposes. Campaign mode adds a guaranteed first-N queue, a live follower
+ * counter (fed by onFollow from EventSub) arming milestone draw credits, and an
+ * append-only winners log (the mailing list). Pure logic lives in
+ * src/giveaway.ts; this is the wiring.
  */
 function createGiveawayEngine(opts: {
   config: GiveawayConfig;
   clientId: string;
   stateDir: string | null;
+  /** False when followerStep > 0 but follow events can't arrive (no EventSub). */
+  followTracking: boolean;
   getChannelAuth: (login: string) => ChannelAuth | undefined;
   getBroadcast: () =>
     | ((state: GiveawayState, draw?: GiveawayDraw) => void)
     | undefined;
 }): {
   onMessage: (m: TwitchChatMessage) => Promise<void>;
+  onFollow: FollowHandler;
   hooks: GiveawayHooks;
   init: () => Promise<void>;
 } {
   const { config } = opts;
   const poolPath = giveawayPoolStatePath(opts.stateDir);
+  const campaignPath = giveawayCampaignStatePath(opts.stateDir);
+  const winnersPath = giveawayWinnersLogPath(opts.stateDir);
   let state: GiveawayState = emptyPool(true);
+  let campaign: GiveawayCampaignState = emptyCampaign();
+  let winners: GiveawayWinner[] = [];
+
+  /** The broadcast/return view: state with the derived campaign snapshot
+   *  attached (counts + recent winners — never the full list). */
+  function view(): GiveawayState {
+    state.campaign = campaignSummary(
+      state,
+      campaign,
+      config,
+      winners,
+      opts.followTracking,
+    );
+    return state;
+  }
 
   // `draw` rides along only on a draw, so every connected page (incl. the OBS
   // overlay) plays the case-opening reel over the pre-removal entrant list.
   function broadcast(draw?: GiveawayDraw): void {
-    opts.getBroadcast()?.(state, draw);
+    opts.getBroadcast()?.(view(), draw);
   }
   function persist(): void {
-    if (poolPath) void persistState(poolPath, JSON.stringify(state));
+    // The derived summary is not persisted (normalizePoolState drops it on load).
+    if (poolPath) {
+      const { campaign: _drop, ...bare } = state;
+      void persistState(poolPath, JSON.stringify(bare));
+    }
+  }
+  function persistCampaign(): void {
+    if (campaignPath) void persistState(campaignPath, JSON.stringify(campaign));
   }
 
-  /** Restore a persisted pool at startup (best-effort; corrupt file → empty pool). */
+  /** Restore persisted pool + campaign + winners at startup (best-effort;
+   *  corrupt files start empty — a bad winners line is skipped, not fatal). */
   async function init(): Promise<void> {
-    if (!poolPath) return;
-    const raw = await readKeyFile(poolPath);
-    if (!raw) return;
-    try {
-      const restored = normalizePoolState(JSON.parse(raw));
-      if (restored) state = restored;
-    } catch { /* corrupt — start empty */ }
+    if (poolPath) {
+      const raw = await readKeyFile(poolPath);
+      if (raw) {
+        try {
+          const restored = normalizePoolState(JSON.parse(raw));
+          if (restored) state = restored;
+        } catch { /* corrupt — start empty */ }
+      }
+    }
+    if (campaignPath) {
+      const raw = await readKeyFile(campaignPath);
+      if (raw) {
+        try {
+          const restored = normalizeCampaignState(JSON.parse(raw));
+          if (restored) campaign = restored;
+        } catch { /* corrupt — start empty */ }
+      }
+    }
+    if (winnersPath) {
+      try {
+        winners = parseWinnersLog(await Deno.readTextFile(winnersPath));
+      } catch { /* no log yet */ }
+    }
   }
 
   // Helix follow check with one forced-refresh retry on 401. Returns undefined
@@ -476,6 +552,7 @@ function createGiveawayEngine(opts: {
   async function reply(
     key: keyof GiveawayMessages,
     user: string,
+    vars?: Record<string, string | number>,
   ): Promise<void> {
     if (!config.replies) return;
     const auth = opts.getChannelAuth(config.channel);
@@ -485,7 +562,7 @@ function createGiveawayEngine(opts: {
     const req = buildSendChatMessageRequest(
       auth.broadcasterId,
       auth.broadcasterId,
-      giveawayMessage(config, key, user),
+      giveawayMessage(config, key, user, vars),
       opts.clientId,
       token,
     );
@@ -540,58 +617,159 @@ function createGiveawayEngine(opts: {
     state = added.state;
     persist();
     broadcast();
-    await reply("entered", m.displayName);
+    // Entrants within the guaranteed first-N (or any entrant when firstN is
+    // off) get `entered`; later entrants get `enteredPool` — they're in the
+    // milestone draw pool, not the guaranteed queue.
+    const number = state.nextNumber - 1; // the number just assigned
+    if (config.firstN > 0 && number > config.firstN) {
+      await reply("enteredPool", m.displayName, { number });
+    } else {
+      await reply("entered", m.displayName, {
+        number,
+        remaining: config.firstN > 0
+          ? Math.max(0, config.firstN - number)
+          : 0,
+      });
+    }
+  }
+
+  /** Count a new follower toward the milestone campaign (deduped by user id).
+   *  A crossing announces in chat and arms advisory draw credits; every counted
+   *  follow updates the on-screen progress via broadcast. */
+  function onFollow(f: FollowEvent): void {
+    if (!config.enabled || config.followerStep <= 0) return;
+    if (f.channel.toLowerCase() !== config.channel) return;
+    const r = recordFollower(campaign, f.userId, config);
+    if (!r.counted) return;
+    campaign = r.campaign;
+    persistCampaign();
+    broadcast();
+    if (r.milestoneCrossed !== null) {
+      console.log(
+        `[Giveaway] milestone ${r.milestoneCrossed} reached ` +
+          `(${campaign.followerCount} new followers) — ` +
+          `${campaign.creditsRemaining} draw credit(s) armed.`,
+      );
+      void reply("milestone", f.displayName, {
+        count: campaign.followerCount,
+        milestone: r.milestoneCrossed,
+        draws: config.milestoneDraws,
+      });
+    }
   }
 
   const hooks: GiveawayHooks = {
-    getState: () => state,
+    getState: () => view(),
     open: () => {
       state = openPool(state);
       persist();
       broadcast();
-      return state;
+      return view();
     },
     close: () => {
       state = closePool(state);
       persist();
       broadcast();
-      return state;
+      return view();
     },
     reset: () => {
       state = resetPool(state);
       persist();
       broadcast();
-      return state;
+      return view();
     },
     remove: (userId) => {
       state = removeEntrant(state, userId);
       persist();
       broadcast();
-      return state;
+      return view();
     },
     draw: () => {
-      const reel = state.entrants.slice(); // pre-removal list, for the reel animation
-      const r = drawWinner(state, Math.random);
+      // Guaranteed queue first (who's-next-pack), then the milestone pool.
+      const r = drawSegmented(state, config.firstN, Math.random);
       state = r.state;
+      if (r.winner) {
+        const tier = winnerTier(
+          r.winner.number,
+          config.firstN,
+          campaign.creditsRemaining,
+          campaign.milestonesReached,
+        );
+        if (tier.startsWith("milestone-")) {
+          campaign = {
+            ...campaign,
+            creditsRemaining: campaign.creditsRemaining - 1,
+          };
+          persistCampaign();
+        }
+        const w: GiveawayWinner = {
+          userId: r.winner.userId,
+          login: r.winner.login,
+          displayName: r.winner.displayName,
+          number: r.winner.number,
+          enteredAt: r.winner.enteredAt,
+          wonAt: Date.now(),
+          tier,
+        };
+        // Append the mailing-list record BEFORE the pool persist: a crash here
+        // can only leave the winner still in the pool (operator-visible), never
+        // an un-recorded winner.
+        winners.push(w);
+        if (winnersPath) void appendState(winnersPath, serializeWinnerLine(w));
+      }
       persist();
-      broadcast(r.winner ? { winner: r.winner, reel } : undefined);
-      if (r.winner) void reply("winner", r.winner.displayName);
-      return { state, winner: r.winner };
+      broadcast(
+        r.winner
+          ? { winner: r.winner, reel: r.reel, segment: r.segment }
+          : undefined,
+      );
+      if (r.winner) {
+        void reply("winner", r.winner.displayName, { number: r.winner.number });
+      }
+      return { state: view(), winner: r.winner, segment: r.segment };
     },
     demo: () => {
       // Open the pool and add the sample entrants (deduped by their stable ids),
-      // so the reel has something to run without a live stream. No chat replies.
+      // so the reel has something to run without a live stream. When follower
+      // milestones are configured, also simulate ~60% progress toward the next
+      // one (stable fake ids — idempotent). No chat replies.
       state = openPool(state);
       for (const e of demoEntrants(Date.now())) {
         state = addEntrant(state, e).state;
       }
+      if (config.followerStep > 0) {
+        const target = Math.floor(config.followerStep * 0.6);
+        for (const id of demoFollowerIds(target)) {
+          const r = recordFollower(campaign, id, config);
+          campaign = r.campaign;
+        }
+        persistCampaign();
+      }
       persist();
       broadcast();
-      return state;
+      return view();
+    },
+    winners: () => winners.slice(),
+    campaignReset: () => {
+      // Zero the whole campaign. The winners log is a physical mailing list —
+      // archive it (rename) rather than delete, best-effort.
+      if (winnersPath && winners.length > 0) {
+        void Deno.rename(winnersPath, `${winnersPath}.bak-${Date.now()}`)
+          .catch((e) =>
+            console.error(`[Giveaway] could not archive winners log: ${e}`)
+          );
+      }
+      winners = [];
+      campaign = emptyCampaign();
+      state = { ...emptyPool(state.open) };
+      persistCampaign();
+      persist();
+      broadcast();
+      return view();
     },
   };
 
-  return { onMessage, hooks, init };
+  return { onMessage, onFollow, hooks, init };
 }
 
 /** Log giveaway setup problems at startup (the follow gate depends on EventSub;
@@ -630,6 +808,21 @@ function warnGiveawaySetup(config: GiveawayConfig, twitch: TwitchConfig): void {
         `if replies return 401).`,
     );
   }
+  if (config.firstN > 0 || config.followerStep > 0) {
+    console.log(
+      `[Giveaway] campaign: first ${config.firstN} guaranteed` +
+        (config.followerStep > 0
+          ? `, +${config.milestoneDraws} draw(s) per ${config.followerStep} new followers`
+          : ", no follower milestones"),
+    );
+  }
+  if (config.followerStep > 0 && !esChannels.includes(config.channel)) {
+    console.error(
+      `[Giveaway] followerStep is set but "${config.channel}" has no EventSub ` +
+        `connection — follow events can't be received, so milestone progress ` +
+        `won't advance. Authorize it with 'multichat login'.`,
+    );
+  }
 }
 
 async function runServer(configPath: string): Promise<void> {
@@ -652,11 +845,21 @@ async function runServer(configPath: string): Promise<void> {
   let getChannelAuth: (login: string) => ChannelAuth | undefined = () =>
     undefined;
   const giveawayCfg = settings.giveaway;
+  // Follower milestones need follow events, which only arrive for channels with
+  // an EventSub connection — surface "tracking unavailable" honestly in the UI.
+  const esLogins = new Set(
+    (settings.twitch.eventsub?.channels ?? [])
+      .map((c) => (c.login ?? "").toLowerCase())
+      .filter((l) => l),
+  );
+  const followTracking = !!settings.twitch.eventsub?.clientId &&
+    esLogins.has(giveawayCfg?.channel ?? "");
   const giveawayEngine = giveawayCfg?.enabled
     ? createGiveawayEngine({
       config: giveawayCfg,
       clientId: settings.twitch.eventsub?.clientId ?? "",
       stateDir,
+      followTracking,
       getChannelAuth: (login) => getChannelAuth(login),
       getBroadcast: () => broadcastGiveaway,
     })
@@ -707,6 +910,9 @@ async function runServer(configPath: string): Promise<void> {
         getEmitter: () => emitter,
         config: twitch.eventsub,
         stateDir,
+        onFollow: giveawayEngine
+          ? (f) => giveawayEngine.onFollow(f)
+          : undefined,
       });
       getChannelAuth = mgr.getChannelAuth;
       mgr.start();
@@ -746,7 +952,7 @@ function cliUsage(): string {
     "  multichat set-youtube-key [opts] [KEY]     set the YouTube API key on a running server",
     "  multichat login [opts]                     authorize a Twitch channel for EventSub alerts",
     "  multichat fake [kind] [opts]               inject fake events (all kinds, or just one) into a running server",
-    "  multichat giveaway [verb] [opts]           control the giveaway (status|open|close|draw|reset|demo|remove <userId>)",
+    "  multichat giveaway [verb] [opts]           control the giveaway (status|open|close|draw|reset|demo|winners|campaign-reset|remove <userId>)",
     "",
     "Options (set-youtube-key, fake, and giveaway share these):",
     "  -p, --port <port>   server port   (default: $PORT or 8080)",
@@ -775,12 +981,14 @@ function cliUsage(): string {
     "",
     "giveaway: control the running !enter giveaway (Twitch-only) from the terminal —",
     "an alternative to the /giveaway page (a CS2-style case reel). Loopback-only, like fake.",
-    "  multichat giveaway status   # entrant count + open/closed",
+    "  multichat giveaway status   # entrant/queue/pool counts, follower progress, credits",
     "  multichat giveaway open     # start accepting entries",
     "  multichat giveaway close    # stop accepting entries",
     "  multichat giveaway draw     # pick + remove a winner (announced in chat if replies are on)",
-    "  multichat giveaway reset    # clear the pool",
-    "  multichat giveaway demo     # add sample entrants to preview the reel (no live stream needed)",
+    "  multichat giveaway reset    # clear the entrant pool (keeps campaign + winners)",
+    "  multichat giveaway demo     # add sample entrants (+ follower progress) to preview the reel",
+    "  multichat giveaway winners [--csv]   # the recorded winners / mailing list",
+    "  multichat giveaway campaign-reset --yes   # zero campaign + numbers; archives the winners log",
     "  multichat giveaway remove <userId>   # drop one entrant",
   ].join("\n");
 }
@@ -966,8 +1174,20 @@ async function runGiveaway(args: string[]): Promise<void> {
   let port = Number(Deno.env.get("PORT") ?? "8080");
   let action = "";
   let userId = "";
+  let csv = false;
+  let yes = false;
 
-  const VERBS = ["status", "open", "close", "draw", "reset", "demo", "remove"];
+  const VERBS = [
+    "status",
+    "open",
+    "close",
+    "draw",
+    "reset",
+    "demo",
+    "winners",
+    "campaign-reset",
+    "remove",
+  ];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--help") {
@@ -977,6 +1197,10 @@ async function runGiveaway(args: string[]): Promise<void> {
       port = Number(args[++i]);
     } else if (a === "-h" || a === "--host") {
       host = args[++i] ?? host;
+    } else if (a === "--csv") {
+      csv = true;
+    } else if (a === "--yes") {
+      yes = true;
     } else if (VERBS.includes(a)) {
       action = a;
     } else if (action === "remove" && !userId) {
@@ -994,6 +1218,13 @@ async function runGiveaway(args: string[]): Promise<void> {
   }
   if (action === "remove" && !userId) {
     console.error("giveaway remove needs a userId (see `giveaway status`).");
+    Deno.exit(2);
+  }
+  if (action === "campaign-reset" && !yes) {
+    console.error(
+      "campaign-reset zeroes follower progress + entry numbers and archives " +
+        "the winners log. Re-run with --yes to confirm.",
+    );
     Deno.exit(2);
   }
 
@@ -1014,24 +1245,62 @@ async function runGiveaway(args: string[]): Promise<void> {
   try {
     const data = JSON.parse(text) as {
       state?: GiveawayState;
-      winner?: { userId: string; login: string; displayName: string } | null;
+      winner?: GiveawayWinner | null;
+      segment?: string;
+      winners?: GiveawayWinner[];
     };
+    if (action === "winners") {
+      const list = data.winners ?? [];
+      if (csv) {
+        // Raw CSV on stdout so it can be piped straight to a file.
+        console.log(winnersToCsv(list).trimEnd());
+      } else if (list.length === 0) {
+        console.log("No winners recorded yet.");
+      } else {
+        for (const w of list) {
+          const entered = w.enteredAt
+            ? new Date(w.enteredAt).toISOString()
+            : "?";
+          const won = w.wonAt ? new Date(w.wonAt).toISOString() : "?";
+          console.log(
+            `#${w.number}  ${w.displayName} (${w.login || w.userId})  ` +
+              `[${w.tier}]  entered ${entered}  won ${won}`,
+          );
+        }
+        console.log(`${list.length} winner(s).`);
+      }
+      Deno.exit(0);
+    }
     if (data.winner) {
+      const w = data.winner;
       console.log(
-        `Winner: ${
-          data.winner.displayName || data.winner.login ||
-          data.winner.userId
-        }`,
+        `Winner: #${w.number} ${w.displayName || w.login || w.userId}` +
+          (data.segment ? ` (${data.segment})` : ""),
       );
     } else if (action === "draw") {
       console.log("No entrants to draw from.");
     }
     if (data.state) {
+      const s = data.state;
       console.log(
-        `Pool: ${data.state.entrants.length} entrant(s), entries ${
-          data.state.open ? "OPEN" : "CLOSED"
+        `Pool: ${s.entrants.length} entrant(s), entries ${
+          s.open ? "OPEN" : "CLOSED"
         }.`,
       );
+      const c = s.campaign;
+      if (c && (c.guaranteedRemaining > 0 || c.followerCount > 0 ||
+            c.winnersTotal > 0 || c.poolSize !== s.entrants.length)) {
+        console.log(
+          `Campaign: ${c.guaranteedRemaining} guaranteed in queue · ` +
+            `${c.poolSize} in bonus pool · ${c.winnersTotal} winner(s) recorded.`,
+        );
+        if (c.followTracking) {
+          console.log(
+            `Followers: ${c.followerCount} new · milestone ${c.milestonesReached} ` +
+              `· ${c.creditsRemaining} draw credit(s) armed.`,
+          );
+        }
+      }
     }
   } catch {
     console.log(text);

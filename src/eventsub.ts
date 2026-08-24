@@ -162,6 +162,20 @@ export function mapRaid(e: Event, channel: string, id: string): ChatMessage {
   };
 }
 
+/** A follow surfaced out-of-band to an observer (the giveaway follower
+ *  counter). Carries the stable `userId` from the EventSub payload — needed for
+ *  dedup — which the rendered ChatMessage deliberately omits. */
+export interface FollowEvent {
+  channel: string;
+  userId: string;
+  login: string;
+  displayName: string;
+}
+
+/** Optional observer invoked for every channel.follow notification, in parallel
+ *  with the render path. Absent = nothing observes (behavior unchanged). */
+export type FollowHandler = (f: FollowEvent) => void;
+
 /** Route one notification to the emitter. Returns true if the type was handled
  *  (even when the mapper deliberately emits nothing). Mirrors twitch.ts's
  *  handleCommand "return true if handled" contract. */
@@ -171,12 +185,26 @@ export function handleNotification(
   channel: string,
   id: string,
   emitter: Emitter,
+  onFollow?: FollowHandler,
 ): boolean {
   let msg: ChatMessage | null;
   switch (type) {
-    case "channel.follow":
+    case "channel.follow": {
       msg = mapFollow(event, channel, id);
+      // Surface the raw follow (with the payload's user_id, which the rendered
+      // message omits) to any observer, e.g. the giveaway milestone counter.
+      // Skip id-less payloads — they can't be deduped.
+      const userId = str(event.user_id);
+      if (userId) {
+        onFollow?.({
+          channel,
+          userId,
+          login: str(event.user_login),
+          displayName: str(event.user_name) || str(event.user_login) || userId,
+        });
+      }
       break;
+    }
     case "channel.cheer":
       msg = mapCheer(event, channel, id);
       break;
@@ -251,6 +279,8 @@ export interface EventSubChannelContext {
   channelLabel: string;
   emitter: Emitter;
   getToken(force?: boolean): Promise<string | null>;
+  /** Optional follow observer (see FollowHandler) — the giveaway counter. */
+  onFollow?: FollowHandler;
 }
 
 const DEFAULT_KEEPALIVE_MS = 10_000;
@@ -423,6 +453,7 @@ function connectOnce(
               ctx.channelLabel,
               n.id,
               ctx.emitter,
+              ctx.onFollow,
             );
           }
           break;

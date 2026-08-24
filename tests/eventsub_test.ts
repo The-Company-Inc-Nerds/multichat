@@ -1,5 +1,6 @@
 import {
   classifyFrame,
+  type FollowEvent,
   getKeepaliveSeconds,
   getNotification,
   getReconnectUrl,
@@ -142,6 +143,59 @@ Deno.test("handleNotification: emits for known types, false for unknown", () => 
     handleNotification("channel.unknown", {}, "chan", "id3", e),
     false,
   );
+});
+
+Deno.test("handleNotification: onFollow fires for follows with a user id", () => {
+  const e = fakeEmitter();
+  const seen: FollowEvent[] = [];
+  const onFollow = (f: FollowEvent) => seen.push(f);
+
+  handleNotification(
+    "channel.follow",
+    { user_id: "42", user_login: "ann", user_name: "Ann" },
+    "chan",
+    "id",
+    e,
+    onFollow,
+  );
+  assertEquals(seen, [
+    { channel: "chan", userId: "42", login: "ann", displayName: "Ann" },
+  ]);
+  // The rendered follow message still emits alongside the callback.
+  assertEquals(e.captured.messages.length, 1);
+
+  // An id-less payload can't be deduped → callback skipped, message still emits.
+  handleNotification(
+    "channel.follow",
+    { user_name: "Ghost" },
+    "chan",
+    "id2",
+    e,
+    onFollow,
+  );
+  assertEquals(seen.length, 1);
+  assertEquals(e.captured.messages.length, 2);
+
+  // Non-follow notifications never invoke the callback.
+  handleNotification(
+    "channel.cheer",
+    { user_id: "42", user_name: "Ann", bits: 10 },
+    "chan",
+    "id3",
+    e,
+    onFollow,
+  );
+  assertEquals(seen.length, 1);
+
+  // No callback at all — unchanged behavior (no throw).
+  handleNotification(
+    "channel.follow",
+    { user_id: "7", user_name: "C" },
+    "chan",
+    "id4",
+    e,
+  );
+  assertEquals(e.captured.messages.length, 4);
 });
 
 Deno.test("classifyFrame: maps message_type to a frame kind", () => {

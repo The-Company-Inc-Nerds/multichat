@@ -59,10 +59,12 @@ The same binary is also a small CLI client:
   just one (e.g. `fake follow`). See `docs/development/testing.md`.
 - `multichat giveaway <verb>` drives the Twitch `!enter` giveaway on a running
   server via its loopback `POST /api/giveaway` endpoint (`status` / `open` /
-  `close` / `draw` / `reset` / `demo` / `remove <userId>`; `demo` injects sample
-  entrants to preview the reel) — the terminal equivalent of the `/giveaway`
-  page (a CS2-style case reel; `?overlay` is a transparent OBS source). See
-  `docs/configuration.md#giveaway-mode`.
+  `close` / `draw` / `reset` / `demo` / `winners [--csv]` /
+  `campaign-reset --yes` / `remove <userId>`; `demo` injects sample entrants +
+  follower progress to preview the reel, `winners` prints the recorded mailing
+  list) — the terminal equivalent of the `/giveaway` page (a CS2-style case
+  reel; `?overlay` is a transparent OBS source, `?overlay&progress` adds a
+  follower-milestone pill). See `docs/configuration.md#giveaway-mode`.
 
 ## Configuration
 
@@ -77,12 +79,14 @@ Copy `settings.json.example` to `settings.json` and edit:
   least one field per entry
 - `alerts` — optional `{activeTheme, themes}` registry that skins the `/alerts`
   overlay (built-in styles `default` / `company-memo`); unset = default look
-- `giveaway` — optional Twitch-only `!enter` prize draw
-  `{enabled, channel,
-  prefix, command, requireFollow, replies, messages}`;
-  `requireFollow` needs the channel in `twitch.eventsub`, `replies` needs a
-  `user:write:chat` token (re-run `multichat login`). Draw on `/giveaway` (a
-  CS2-style case reel; `?overlay` = transparent OBS source). See
+- `giveaway` — optional Twitch-only `!enter` prize draw `{enabled, channel,
+  prefix, command, requireFollow, replies, firstN, followerStep, milestoneDraws,
+  messages}`; `requireFollow`/`followerStep` need the channel in
+  `twitch.eventsub`, `replies` needs a `user:write:chat` token (re-run
+  `multichat login`). Campaign mode: `firstN` = guaranteed first-N queue (draws
+  pick who's next), `followerStep`/`milestoneDraws` = advisory draw credits per
+  N new followers, winners logged append-only (JSONL mailing list). Draw on
+  `/giveaway` (a CS2-style case reel; `?overlay` = transparent OBS source). See
   `docs/configuration.md`
 
 YouTube channels require an API key, but it need not be in `settings.json` — it
@@ -99,10 +103,13 @@ stickers/memberships need only the API key). Full reference:
 main.ts          entry point — loads settings, wires the emitter to server + clients;
                  also the `set-youtube-key` / `login` / `fake` / `giveaway` CLI subcommands +
                  the runtime-key manager, the EventSub manager (per-channel token lifecycle +
-                 one WebSocket per broadcaster; exposes getChannelAuth), and the giveaway
-                 engine (follow check + chat replies + entrant pool, driving the /giveaway page)
+                 one WebSocket per broadcaster; exposes getChannelAuth, forwards onFollow), and
+                 the giveaway engine (follow check + chat replies + entrant pool + campaign:
+                 guaranteed-queue draws, follower-milestone counter fed by onFollow, append-only
+                 winners JSONL, driving the /giveaway page)
 src/types.ts     shared TypeScript interfaces (Settings, ChatMessage, ServerEvent, Emitter,
-                 TwitchEventSubConfig, EventSub frames, GiveawayConfig/State/Entrant)
+                 TwitchEventSubConfig, EventSub frames, GiveawayConfig/State/Entrant/
+                 CampaignState/CampaignSummary/Winner/Draw)
 src/twitch.ts    Twitch IRC over WebSocket (wss://irc-ws.chat.twitch.tv), with reconnect;
                  handleCommand takes an optional isCovered predicate so EventSub-covered
                  channels emit only chat text (their events come from EventSub instead), and
@@ -111,7 +118,9 @@ src/twitch.ts    Twitch IRC over WebSocket (wss://irc-ws.chat.twitch.tv), with r
 src/eventsub.ts  Twitch EventSub over WebSocket (wss://eventsub.wss.twitch.tv) — the source
                  of truth for follow/cheer/sub/raid on configured channels; pure
                  notification→ChatMessage mappers + classifyFrame are exported/tested, the
-                 socket-holding connectOnce/startTwitchEventSub are the wiring (receive-only)
+                 socket-holding connectOnce/startTwitchEventSub are the wiring (receive-only);
+                 an optional onFollow callback surfaces each follow's user_id/login to the
+                 giveaway milestone counter (kept out of the rendered ChatMessage/SSE)
 src/twitchauth.ts pure Twitch OAuth + EventSub request builders / response parsers
                  (refresh + auth-code grants, /users, create-subscription, /channels/followers
                  follow check + /chat/messages send) + the SUBSCRIPTIONS table (source of truth
@@ -132,11 +141,15 @@ src/alerts.ts    pure alerts-theme helpers: normalizeAlertsConfig (validates the
                  registry from settings.json) + ALERT_EVENT_KINDS; the resolved config is
                  injected into the page as window.MULTICHAT_ALERTS for the overlay to apply
 src/giveaway.ts  pure giveaway helpers: normalizeGiveawayConfig, matchGiveawayCommand, the
-                 entrant-pool reducers (add/remove/draw/open/close/reset) + normalizePoolState,
-                 decideEligibility, and the POST /api/giveaway wire (de)serialization
+                 entrant-pool reducers (add w/ permanent entry numbers, remove, draw +
+                 drawSegmented guaranteed-queue-then-pool, open/close/reset) + normalizePoolState
+                 (migrates number-less files), campaign reducers (recordFollower dedupe +
+                 milestone crossing, winnerTier, campaignSummary), the winners JSONL/CSV
+                 helpers, decideEligibility, and the POST /api/giveaway wire (de)serialization
 src/control.ts   pure control-plane helpers (loopback check, key-body parse, startup-key
-                 resolution, state paths incl. Twitch token/broadcaster-id + giveaway pool) +
-                 the ServerHooks (setYouTubeKey + giveaway) / GiveawayHooks / KeyUpdateResult types
+                 resolution, state paths incl. Twitch token/broadcaster-id + giveaway
+                 pool/campaign/winners-log) + the ServerHooks (setYouTubeKey + giveaway) /
+                 GiveawayHooks / KeyUpdateResult types
 src/fake.ts      pure fake-event helpers: the curated demo sequence + wire
                  (de)serialization/validation behind POST /api/fake
 tests/           one *_test.ts per source module; dependency-free assert shim in _assert.ts

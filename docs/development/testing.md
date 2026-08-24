@@ -94,23 +94,32 @@ same machine as the server and drive it from the terminal instead of waiting for
 real `!enter` chatter:
 
 ```bash
-multichat giveaway demo         # inject sample entrants so the reel has something to spin
-multichat giveaway status       # entrant count + open/closed
+multichat giveaway demo         # inject sample entrants (+ follower progress) for the reel
+multichat giveaway status       # entrant/queue/pool counts, follower progress, credits
 multichat giveaway open         # accept entries
 multichat giveaway draw         # pick + remove a winner (announced in chat if replies are on)
-multichat giveaway reset        # clear the pool
+multichat giveaway winners      # the recorded winners; --csv for a mailing-list export
+multichat giveaway reset        # clear the pool (keeps campaign + winners)
+multichat giveaway campaign-reset --yes  # zero everything; archives the winners log
 ```
 
 The quickest way to see the reveal is the **Demo** button on the `/giveaway`
 page (or `multichat giveaway demo`), then **Draw winner** — the CS2-style case
 reel plays with no live stream needed. Open `/giveaway?overlay` in another tab
-to watch the same reel on the transparent OBS overlay. Real entries only arrive
-from a viewer typing the command in the configured channel's Twitch chat (the
-eligibility follow check needs the channel authorized in `twitch.eventsub`), so
-end-to-end testing of the _entry_ path wants a live channel. The reel, draw,
-removal, open/close and persistence, though, are all exercisable with the CLI
-(or the page's buttons) against any running server. The pure
-pool/command/eligibility logic is covered in `tests/giveaway_test.ts`.
+to watch the same reel on the transparent OBS overlay. To preview **campaign
+mode**, set a small split in a scratch settings.json (e.g. `"firstN": 5,
+"followerStep": 5, "milestoneDraws": 2`): demo's 16 entrants land as 5
+guaranteed + 11 pool, draws work through the queue first (the button reads
+"Draw next pack"), and the follower bar shows simulated progress. Run
+`campaign-reset` afterwards so demo entrants don't occupy real entry numbers.
+
+Real entries only arrive from a viewer typing the command in the configured
+channel's Twitch chat (the eligibility follow check needs the channel authorized
+in `twitch.eventsub`), and real follower progress needs that same EventSub
+connection. The reel, draws, winners log, open/close and persistence, though,
+are all exercisable with the CLI (or the page's buttons) against any running
+server. The pure pool/command/eligibility/campaign logic is covered in
+`tests/giveaway_test.ts`.
 
 ## Commit workflow
 

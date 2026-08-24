@@ -25,6 +25,9 @@
     "prefix": "!",
     "command": "enter",
     "requireFollow": true,
-    "replies": true
+    "replies": true,
+    "firstN": 0,
+    "followerStep": 0,
+    "milestoneDraws": 1
   }
 }

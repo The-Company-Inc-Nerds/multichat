@@ -4,7 +4,11 @@
 // main.ts; everything here is side-effect-free so the test suite can drive it
 // directly, matching the project's "logic in src/, wiring in main.ts" split.
 
-import type { GiveawayEntrant, GiveawayState } from "./types.ts";
+import type {
+  GiveawayEntrant,
+  GiveawayState,
+  GiveawayWinner,
+} from "./types.ts";
 
 /** Result of an attempt to set the runtime YouTube key (returned to the CLI client). */
 export interface KeyUpdateResult {
@@ -21,9 +25,18 @@ export interface GiveawayHooks {
   close(): GiveawayState;
   reset(): GiveawayState;
   remove(userId: string): GiveawayState;
-  draw(): { state: GiveawayState; winner: GiveawayEntrant | null };
+  draw(): {
+    state: GiveawayState;
+    winner: GiveawayEntrant | null;
+    segment: "guaranteed" | "pool";
+  };
   /** Inject a batch of sample entrants for previewing the reel (loopback demo). */
   demo(): GiveawayState;
+  /** The full winners log (the mailing list) — never broadcast, only fetched. */
+  winners(): GiveawayWinner[];
+  /** Zero the whole campaign: counters, entry numbers, archived winners log.
+   *  Distinct from reset(), which only clears the entrant pool. */
+  campaignReset(): GiveawayState;
 }
 
 /** Hooks createServer calls back into. Kept optional so tests can omit them. */
@@ -136,4 +149,22 @@ export function giveawayPoolStatePath(
 ): string | null {
   const dir = (stateDir ?? "").replace(/\/+$/, "");
   return dir ? `${dir}/giveaway-pool` : null;
+}
+
+/** Where the campaign bookkeeping (follower count/dedupe, milestone credits) is
+ *  persisted — separate from the pool so a pool reset can't lose it. */
+export function giveawayCampaignStatePath(
+  stateDir: string | null | undefined,
+): string | null {
+  const dir = (stateDir ?? "").replace(/\/+$/, "");
+  return dir ? `${dir}/giveaway-campaign` : null;
+}
+
+/** Where winners are recorded, append-only JSONL (one winner per line) — the
+ *  durable mailing list. campaign-reset archives it rather than deleting. */
+export function giveawayWinnersLogPath(
+  stateDir: string | null | undefined,
+): string | null {
+  const dir = (stateDir ?? "").replace(/\/+$/, "");
+  return dir ? `${dir}/giveaway-winners` : null;
 }

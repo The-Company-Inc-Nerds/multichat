@@ -58,7 +58,8 @@ let
     giveaway = {
       enabled = cfg.giveaway.enable;
       inherit (cfg.giveaway)
-        channel prefix command requireFollow replies messages;
+        channel prefix command requireFollow replies messages
+        firstN followerStep milestoneDraws;
     };
   });
 in
@@ -330,12 +331,47 @@ in
       type = lib.types.attrsOf lib.types.str;
       default = { };
       example = lib.literalExpression ''
-        { entered = "🎉 @{user} you're in!"; notFollowing = "@{user} follow to enter!"; }
+        { entered = "🎉 @{user} you're pack #{number} of 500!"; winner = "🎉 @{user} won a pack!"; }
       '';
       description = ''
         Optional reply templates (keys: entered, notFollowing, alreadyEntered,
-        winner). "{user}" is replaced with the entrant's display name. Unset keys
-        fall back to built-in defaults.
+        winner, enteredPool, milestone). "{user}" is the entrant's display name;
+        entry replies also fill "{number}" (entry #) and "{remaining}"
+        (guaranteed slots left), and milestone fills "{count}"/"{milestone}"/
+        "{draws}". Unset keys fall back to built-in defaults.
+      '';
+    };
+
+    giveaway.firstN = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 0;
+      example = 500;
+      description = ''
+        Campaign mode: entrants #1..firstN are ALL guaranteed winners — each
+        draw just picks who's next (e.g. "the first 500 entrants each get a
+        card pack"). Later entrants pool up for milestone draws. 0 = off.
+      '';
+    };
+
+    giveaway.followerStep = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 0;
+      example = 100;
+      description = ''
+        Arm milestoneDraws advisory draw credits every this many NEW followers
+        (counted live via the channel's EventSub connection, deduped). Shown as
+        a progress bar on /giveaway and ?overlay&progress. 0 = no tracking.
+      '';
+    };
+
+    giveaway.milestoneDraws = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 1;
+      example = 10;
+      description = ''
+        Draw credits armed per follower milestone crossed (e.g. "every 100 new
+        followers we open 10 more packs"). Advisory — the draw button is never
+        hard-blocked.
       '';
     };
   };
@@ -409,7 +445,14 @@ in
         ("services.multichat.giveaway.replies is on: the bot posts to Twitch chat as the broadcaster, "
           + "which needs the user:write:chat scope. Re-run `multichat login` for \""
           + cfg.giveaway.channel
-          + "\" so its token carries that scope (tokens minted before this release don't).");
+          + "\" so its token carries that scope (tokens minted before this release don't).")
+      ++ lib.optional
+        (cfg.giveaway.enable && cfg.giveaway.followerStep > 0
+          && !(lib.any (ch: ch.login == cfg.giveaway.channel) esCfg.channels))
+        ("services.multichat.giveaway.followerStep is set but \""
+          + cfg.giveaway.channel
+          + "\" has no EventSub connection — follow events can't be received, so milestone "
+          + "progress won't advance. Add it to twitch.eventsub.channels (via `multichat login`).");
 
     # Make the `multichat` CLI available so an operator can run
     # `multichat set-youtube-key <KEY>` against the running service.

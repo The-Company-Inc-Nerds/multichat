@@ -265,19 +265,25 @@ overlay, see below).
   "prefix": "!",
   "command": "enter",
   "requireFollow": true,
-  "replies": true
+  "replies": true,
+  "firstN": 0,
+  "followerStep": 0,
+  "milestoneDraws": 1
 }
 ```
 
-| Field           | Type   | Description                                                                                                                           |
-| --------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `enabled`       | bool   | Turn the giveaway on. Default off.                                                                                                    |
-| `channel`       | string | The single Twitch channel (login, lowercase) it runs on. Must be in `twitch.channels`; for `requireFollow` also in `twitch.eventsub`. |
-| `prefix`        | string | Command prefix. Default `"!"`.                                                                                                        |
-| `command`       | string | Command word after the prefix. Default `"enter"` (so viewers type `!enter`).                                                          |
-| `requireFollow` | bool   | Only admit viewers who follow the channel, checked live via Helix. Default on. See the note below.                                    |
-| `replies`       | bool   | Post confirmation/denial/winner messages back to chat as the broadcaster. Default on. See the note below.                             |
-| `messages`      | object | Optional reply templates (`entered`, `notFollowing`, `alreadyEntered`, `winner`); `{user}` is the display name. Unset = defaults.     |
+| Field            | Type   | Description                                                                                                                           |
+| ---------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`        | bool   | Turn the giveaway on. Default off.                                                                                                    |
+| `channel`        | string | The single Twitch channel (login, lowercase) it runs on. Must be in `twitch.channels`; for `requireFollow` also in `twitch.eventsub`. |
+| `prefix`         | string | Command prefix. Default `"!"`.                                                                                                        |
+| `command`        | string | Command word after the prefix. Default `"enter"` (so viewers type `!enter`).                                                          |
+| `requireFollow`  | bool   | Only admit viewers who follow the channel, checked live via Helix. Default on. See the note below.                                    |
+| `replies`        | bool   | Post confirmation/denial/winner messages back to chat as the broadcaster. Default on. See the note below.                             |
+| `firstN`         | number | Campaign mode: entrants #1..N are **all** guaranteed winners (draws pick who's next). 0 = off. See below.                             |
+| `followerStep`   | number | Arm `milestoneDraws` draw credits every N **new** followers (live via EventSub). 0 = no tracking. See below.                          |
+| `milestoneDraws` | number | Draw credits armed per milestone crossed. Default 1.                                                                                  |
+| `messages`       | object | Optional reply templates — see [Message templates](#giveaway-message-templates) below.                                                |
 
 **Why Twitch-only.** YouTube's API has no way to verify whether a viewer is
 subscribed to a channel (subscriber lists are private and un-queryable), so a
@@ -301,10 +307,10 @@ entries and the winner).
 
 **Running it.** Open `/giveaway` (the control view) on the same machine as the
 server — its buttons use the loopback [`/api/giveaway`](api.md#post-apigiveaway)
-endpoint. Or drive it from the terminal:
-`multichat giveaway status|open|close|draw|reset|demo|remove
-<userId>`. The
-entrant pool is persisted to the state directory, so it survives a restart.
+endpoint. Or drive it from the terminal: `multichat giveaway
+status|open|close|draw|reset|demo|winners|campaign-reset|remove <userId>`. The
+entrant pool, campaign progress, and winners log are persisted to the state
+directory, so they survive a restart.
 
 **On stream (OBS overlay).** Point an OBS browser source at `/giveaway?overlay`
 — a **transparent** version that shows only the reel, stays blank between draws,
@@ -313,8 +319,75 @@ view or the CLI), the overlay plays the reveal for your audience, so you never
 have to share the operator screen.
 
 **Previewing it.** No live stream? Click **Demo** on the `/giveaway` page (or
-run `multichat giveaway demo`) to inject a batch of sample entrants, then draw —
-handy for testing the reel before going live. `Reset` clears them.
+run `multichat giveaway demo`) to inject a batch of sample entrants (and, when
+`followerStep` is set, some simulated follower progress), then draw — handy for
+testing the reel before going live. `Reset` clears the pool; before going live
+for real, run `multichat giveaway campaign-reset --yes` so demo entrants don't
+occupy entry numbers.
+
+### Campaign mode: guaranteed first-N + follower milestones
+
+`firstN` and `followerStep` turn the one-off giveaway into a running
+**campaign**. The worked example — *"the first 500 entrants each get a card
+pack (opened on stream, mailed); after that, every 100 new followers we open 10
+more packs for random people from the pool"*:
+
+```json
+"giveaway": {
+  "enabled": true,
+  "channel": "streamer1",
+  "firstN": 500,
+  "followerStep": 100,
+  "milestoneDraws": 10
+}
+```
+
+- **Entry numbers.** Every entrant gets a permanent `#N` (shown in the UI, the
+  reel cards, chat replies via `{number}`, and the winners log) plus an
+  entered-at timestamp — assigned once, never reused, surviving removals and
+  pool resets.
+- **The guaranteed queue (`firstN`).** Entrants #1..500 are all winners; each
+  **draw** just picks *who's next* (random among the un-drawn ≤ 500) so the reel
+  is your "next pack to open" moment. The draw button reads "Draw next pack"
+  while the queue has anyone left. Entries stay open past 500 — later entrants
+  join the **bonus pool** and get the `enteredPool` reply instead.
+- **Follower milestones (`followerStep`).** The server counts **new** followers
+  live (via the channel's EventSub connection, deduped by user id, persisted).
+  Every 100, it announces the milestone in chat (the `milestone` template),
+  flashes a banner on `/giveaway` (and the overlay), and arms 10 advisory **draw
+  credits**. Credits are displayed and counted down but never hard-block the
+  button — you stay in control. A progress bar (63/100) shows on the control
+  view; add `&progress` to the overlay URL (`/giveaway?overlay&progress`) for an
+  always-on corner pill on stream.
+- **The winners log.** Every draw appends to a durable log (who, entry `#`,
+  entered-at, won-at, and tier: `guaranteed` / `milestone-K` / `manual`) — your
+  mailing list. View it with the **Winners** panel on `/giveaway`, or export it:
+  `multichat giveaway winners --csv > winners.csv`. `campaign-reset` archives
+  the log to a `.bak-<timestamp>` file (never deletes it) and zeroes the
+  counters + entry numbers.
+
+### Giveaway message templates
+
+The `messages` object overrides any of the built-in chat replies. `{user}` is
+always the viewer's display name; the other placeholders are filled per key:
+
+| Key              | Sent when…                                    | Extra placeholders                                                       |
+| ---------------- | --------------------------------------------- | ------------------------------------------------------------------------ |
+| `entered`        | an entrant joins (within `firstN`, or always when `firstN` is 0) | `{number}` entry #, `{remaining}` guaranteed slots left |
+| `enteredPool`    | an entrant joins beyond `firstN`              | `{number}`                                                               |
+| `alreadyEntered` | a repeat `!enter`                             | —                                                                        |
+| `notFollowing`   | `requireFollow` rejects a non-follower        | —                                                                        |
+| `winner`         | a draw lands                                  | `{number}`                                                               |
+| `milestone`      | a follower milestone is crossed               | `{count}` total new follows, `{milestone}` ordinal, `{draws}` credits    |
+
+```json
+"messages": {
+  "entered": "🎉 @{user} you're pack #{number} of 500 — we'll open it on stream!",
+  "enteredPool": "@{user} the first 500 are full, but you're in the pool for every follower milestone (entry #{number})!",
+  "milestone": "🔥 {count} new followers! Opening {draws} more packs!",
+  "winner": "🎉 @{user} (entry #{number}) — your pack is getting opened!"
+}
+```
 
 ## Environment variable overrides
 

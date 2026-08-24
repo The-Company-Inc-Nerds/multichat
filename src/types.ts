@@ -173,12 +173,56 @@ export interface AlertsConfig {
 
 /** One eligible entrant in the giveaway pool. Keyed by the stable Twitch
  *  `userId` (numeric) so a display-name change or a repeat `!enter` can't add
- *  someone twice. */
+ *  someone twice. `number` is the permanent entry number (#1, #2, …), assigned
+ *  once at entry and never reused — it decides the guaranteed tier (≤ firstN). */
 export interface GiveawayEntrant {
   userId: string;
   login: string;
   displayName: string;
   enteredAt: number;
+  number: number;
+}
+
+/** Rolling campaign bookkeeping, persisted separately from the pool (a pool
+ *  reset must not lose follower progress or milestone credits). */
+export interface GiveawayCampaignState {
+  /** New followers counted since the campaign started (deduped by user id). */
+  followerCount: number;
+  /** The user ids already counted, so a re-follow can't double count. */
+  countedFollowerIds: string[];
+  /** floor(followerCount / followerStep) — recomputed, robust to config edits. */
+  milestonesReached: number;
+  /** Advisory draw credits armed by milestones (displayed, never a hard gate). */
+  creditsRemaining: number;
+}
+
+/** One recorded winner (the durable mailing list): who, their entry number,
+ *  when they entered, when they were drawn, and under which tier
+ *  ("guaranteed" | "milestone-K" | "manual"). */
+export interface GiveawayWinner {
+  userId: string;
+  login: string;
+  displayName: string;
+  number: number;
+  enteredAt: number;
+  wonAt: number;
+  tier: string;
+}
+
+/** Derived, broadcast-sized campaign snapshot attached to each GiveawayState
+ *  frame — counts + the last few winners, never the full winners list. */
+export interface GiveawayCampaignSummary {
+  followerCount: number;
+  milestonesReached: number;
+  creditsRemaining: number;
+  /** Un-drawn entrants with number ≤ firstN (the "next pack" queue). */
+  guaranteedRemaining: number;
+  /** Un-drawn entrants beyond firstN (the milestone draw pool). */
+  poolSize: number;
+  winnersTotal: number;
+  recentWinners: GiveawayWinner[];
+  /** False when followerStep > 0 but follow events can't be received. */
+  followTracking: boolean;
 }
 
 /** The live giveaway state pushed to the `/giveaway` page over SSE. */
@@ -186,33 +230,48 @@ export interface GiveawayState {
   /** Whether `!enter` is currently accepted. */
   open: boolean;
   entrants: GiveawayEntrant[];
+  /** The next entry number to assign (persists across removals/resets). */
+  nextNumber: number;
   /** The most recently drawn winner (kept so a reloaded page can show it). */
   lastWinner?: GiveawayEntrant;
+  /** Derived campaign snapshot (attached by the engine, not persisted). */
+  campaign?: GiveawayCampaignSummary;
 }
 
 /** Attached to a `giveaway` SSE frame only when a draw just happened, so every
  *  connected page (incl. the transparent OBS overlay) can play the case-opening
  *  reel: `reel` is the pre-removal entrant list to animate over, landing on
- *  `winner`. Absent on ordinary state updates (open/close/reset/entry). */
+ *  `winner`. `segment` says which tier was drawn from ("guaranteed" = the
+ *  first-N queue, "pool" = everyone after). Absent on ordinary state updates. */
 export interface GiveawayDraw {
   winner: GiveawayEntrant;
   reel: GiveawayEntrant[];
+  segment?: "guaranteed" | "pool";
 }
 
 /** Optional chat-reply templates. `{user}` is replaced with the entrant's display
- *  name; an empty/omitted field falls back to a built-in default. */
+ *  name; other placeholders ({number}, {remaining}, {count}, {milestone},
+ *  {draws}) are filled where documented. An empty/omitted field falls back to a
+ *  built-in default. */
 export interface GiveawayMessages {
   entered?: string;
   notFollowing?: string;
   alreadyEntered?: string;
   winner?: string;
+  /** Reply for entrants beyond firstN (they join the milestone pool). */
+  enteredPool?: string;
+  /** Announcement posted when a follower milestone is crossed. */
+  milestone?: string;
 }
 
 /** Giveaway / prize-draw config (Twitch-only). Watch one channel's chat for
  *  `${prefix}${command}` (e.g. "!enter"), optionally gate on a live Helix follow
  *  check, collect eligible viewers, and draw a winner from the `/giveaway` page.
  *  `replies` posts confirmation/denial/winner messages back to chat as the
- *  broadcaster (needs the `user:write:chat` scope — re-run `multichat login`). */
+ *  broadcaster (needs the `user:write:chat` scope — re-run `multichat login`).
+ *  Campaign mode: `firstN` > 0 makes entrants #1..N a guaranteed-winner queue
+ *  (each draw picks who's next); `followerStep` > 0 counts new follows via
+ *  EventSub and arms `milestoneDraws` advisory draw credits per step. */
 export interface GiveawayConfig {
   enabled: boolean;
   /** The single Twitch channel (login, lowercase) the giveaway runs on. */
@@ -225,6 +284,12 @@ export interface GiveawayConfig {
   requireFollow: boolean;
   /** Post confirmation/denial/winner messages back to Twitch chat. */
   replies: boolean;
+  /** Entrants #1..firstN are all guaranteed winners (0 = off). */
+  firstN: number;
+  /** Arm draw credits every this many new followers (0 = no tracking). */
+  followerStep: number;
+  /** Draw credits armed per milestone crossed. */
+  milestoneDraws: number;
   messages?: GiveawayMessages;
 }
 

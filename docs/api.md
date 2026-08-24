@@ -72,7 +72,9 @@ the `giveaway` frame — the public pages ignore it) and drives the loopback
 Two views of the same page, chosen by a query param:
 
 - **Control view** (`/giveaway`) — dark background, the reel, the operator
-  buttons (Draw winner / Open / Close / Reset / Demo) and the entrant list.
+  buttons (Draw winner / Open / Close / Reset / Demo / Winners / Campaign
+  reset), the entrant list (with entry `#numbers`), a follower-milestone
+  progress bar (when `followerStep` is configured), and the winners panel.
   Because the control endpoint is loopback-only, open this on the **same
   machine** as the server. `multichat giveaway` is the CLI equivalent of the
   buttons.
@@ -80,13 +82,18 @@ Two views of the same page, chosen by a query param:
   just the reel; it stays blank between draws and auto-hides a few seconds after
   the winner lands. Point an OBS browser source at it. It plays the reel
   whenever a draw happens (triggered from the control view or the CLI), so your
-  audience sees the reveal without you sharing the operator screen.
+  audience sees the reveal without you sharing the operator screen. Add
+  `&progress` (`/giveaway?overlay&progress`) for a small always-on corner pill
+  with follower-milestone progress; milestone crossings flash a banner on both
+  views.
 
 The draw is **server-authoritative**: the server picks the winner and removes
 them from the pool, then broadcasts the winner plus the entrant list to animate
 over — so every open page (control view and overlay) plays the _same_ reel and
-lands on the _same_ winner, and a reload can't re-draw. See
-[Giveaway mode](configuration.md#giveaway-mode) for setup.
+lands on the _same_ winner, and a reload can't re-draw. In campaign mode
+(`firstN` set) draws come from the **guaranteed queue** (entrants #1..N) until
+it's exhausted, then from the pool — the reel shows only the segment being drawn
+from. See [Giveaway mode](configuration.md#giveaway-mode) for setup.
 
 To try it without a live stream, click **Demo** (or run
 `multichat giveaway
@@ -152,13 +159,21 @@ in settings.
 - **Loopback-only.** Same guard as the endpoints above — a non-loopback peer
   gets `403`.
 - **Body.** A JSON object `{ "action": … }`, one of `open`, `close`, `draw`,
-  `reset`, `status`, `demo` (inject sample entrants to preview the reel), or
+  `reset` (clear the pool; keeps campaign progress + winners), `status`, `demo`
+  (inject sample entrants — and simulated follower progress — to preview the
+  reel), `winners` (fetch the full winners log), `campaign-reset` (zero
+  counters + entry numbers, archive the winners log), or
   `{"action":"remove","userId":"<id>"}`.
 - **Response.** JSON `{ "state": GiveawayState }` (or `501` if no giveaway is
   configured). `draw` also carries the picked entrant as `winner` (or `null`
-  when the pool is empty). `GiveawayState` is
-  `{ open, entrants: [{userId, login,
-  displayName, enteredAt}], lastWinner? }`.
+  when the pool is empty) plus `segment` (`"guaranteed"` | `"pool"`); `winners`
+  returns `{ "winners": GiveawayWinner[] }` instead. `GiveawayState` is
+  `{ open, entrants: [{userId, login, displayName, enteredAt, number}],
+  nextNumber, lastWinner?, campaign? }` — `campaign` is a derived summary
+  `{ followerCount, milestonesReached, creditsRemaining, guaranteedRemaining,
+  poolSize, winnersTotal, recentWinners (last 10), followTracking }`. A
+  `GiveawayWinner` is `{ userId, login, displayName, number, enteredAt, wonAt,
+  tier }` with tier `"guaranteed"` | `"milestone-K"` | `"manual"`.
 
 Mutating actions broadcast the new pool to every connected page as a `giveaway`
 SSE frame. Entries themselves are **not** an action here — they come from
@@ -229,37 +244,60 @@ changes).
 
 The current giveaway pool (sent to the `/giveaway` page on connect and whenever
 it changes). Only emitted when a giveaway is enabled; other pages ignore it.
+`campaign` is the derived campaign summary (see
+[`POST /api/giveaway`](#post-apigiveaway)) — counts + the last few winners,
+never the full winners log.
 
 ```json
 {
   "type": "giveaway",
   "data": {
     "open": true,
+    "nextNumber": 2,
     "entrants": [
-      { "userId": "1001", "login": "ann", "displayName": "Ann", "enteredAt": 0 }
-    ]
+      {
+        "userId": "1001",
+        "login": "ann",
+        "displayName": "Ann",
+        "enteredAt": 0,
+        "number": 1
+      }
+    ],
+    "campaign": {
+      "followerCount": 63,
+      "milestonesReached": 0,
+      "creditsRemaining": 0,
+      "guaranteedRemaining": 1,
+      "poolSize": 0,
+      "winnersTotal": 0,
+      "recentWinners": [],
+      "followTracking": true
+    }
   }
 }
 ```
 
 On a **draw**, the frame additionally carries a `draw` object — the just-picked
-`winner` plus `reel` (the pre-removal entrant list) — so every page plays the
-case reel and lands on the same winner. `data` is the post-removal pool; the
-snapshot replayed on connect never includes `draw`, so a fresh page doesn't
-replay an old animation.
+`winner`, `reel` (the pre-removal candidate list of the drawn segment), and
+`segment` (`"guaranteed"` | `"pool"`) — so every page plays the case reel and
+lands on the same winner. `data` is the post-removal pool; the snapshot replayed
+on connect never includes `draw`, so a fresh page doesn't replay an old
+animation.
 
 ```json
 {
   "type": "giveaway",
-  "data": { "open": false, "entrants": [/* winner removed */] },
+  "data": { "open": false, "entrants": [/* winner removed */], "nextNumber": 9 },
   "draw": {
     "winner": {
       "userId": "1001",
       "login": "ann",
       "displayName": "Ann",
-      "enteredAt": 0
+      "enteredAt": 0,
+      "number": 1
     },
-    "reel": [/* the entrants as they were, for the animation */]
+    "reel": [/* the drawn segment's entrants as they were */],
+    "segment": "guaranteed"
   }
 }
 ```
