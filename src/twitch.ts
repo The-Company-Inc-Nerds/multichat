@@ -183,10 +183,28 @@ const MAX_BUF = 64 * 1024;
  *  anonymous default), so existing behavior is unchanged. */
 export type CoveredPredicate = (channel: string) => boolean;
 
+/** A single chat message surfaced to an out-of-band consumer (the giveaway
+ *  watcher). Carries the raw Twitch identity (`userId`/`login`) that the rendered
+ *  ChatMessage deliberately omits — needed to dedupe entrants and run the follow
+ *  check. */
+export interface TwitchChatMessage {
+  channel: string;
+  userId: string;
+  login: string;
+  displayName: string;
+  badges: Badge[];
+  text: string;
+}
+
+/** Optional observer invoked for every PRIVMSG, in parallel with the render path.
+ *  Absent = nothing observes (the default), so behavior is unchanged. */
+export type ChatMessageHandler = (m: TwitchChatMessage) => void;
+
 async function connectOnce(
   channels: string[],
   emitter: Emitter,
   isCovered?: CoveredPredicate,
+  onMessage?: ChatMessageHandler,
 ): Promise<void> {
   const nick = `justinfan${10000 + Math.floor(Math.random() * 89999)}`;
   const ws = new WebSocket("wss://irc-ws.chat.twitch.tv");
@@ -243,7 +261,7 @@ async function connectOnce(
         }
 
         // PING/RECONNECT need the socket; everything else is emitter-only and unit-testable.
-        if (handleCommand(msg, emitter, isCovered)) continue;
+        if (handleCommand(msg, emitter, isCovered, onMessage)) continue;
       }
     };
     ws.onclose = () => fail(new Error("closed"));
@@ -257,6 +275,7 @@ export function handleCommand(
   msg: IRCLine,
   emitter: Emitter,
   isCovered?: CoveredPredicate,
+  onMessage?: ChatMessageHandler,
 ): boolean {
   const channel = (msg.params[0] ?? "").replace(/^#/, "");
   switch (msg.command) {
@@ -265,7 +284,7 @@ export function handleCommand(
       if (channel) emitter.status("twitch", channel, "live");
       return true;
     case "PRIVMSG":
-      handlePrivmsg(msg, emitter, isCovered);
+      handlePrivmsg(msg, emitter, isCovered, onMessage);
       return true;
     case "USERNOTICE":
       handleUsernotice(msg, emitter, isCovered);
@@ -290,6 +309,7 @@ export function handlePrivmsg(
   msg: IRCLine,
   emitter: Emitter,
   isCovered?: CoveredPredicate,
+  onMessage?: ChatMessageHandler,
 ): void {
   const channel = (msg.params[0] ?? "").replace(/^#/, "");
   let content = msg.params[1] ?? "";
@@ -334,6 +354,18 @@ export function handlePrivmsg(
     accentColor,
     eventText,
     timestamp: Date.now(),
+  });
+
+  // Surface the raw message (with the viewer's user-id/login) to any observer,
+  // e.g. the giveaway watcher. `content` is the unwrapped body (a /me action's
+  // text without the ACTION envelope), so "!enter" is seen either way.
+  onMessage?.({
+    channel,
+    userId: msg.tags["user-id"] ?? "",
+    login: msg.prefix.split("!")[0] ?? "",
+    displayName: author,
+    badges,
+    text: content,
   });
 }
 
@@ -400,6 +432,7 @@ export function startTwitchClient(
   config: TwitchConfig,
   emitter: Emitter,
   isCovered?: CoveredPredicate,
+  onMessage?: ChatMessageHandler,
 ): void {
   const delays = [2_000, 4_000, 8_000, 16_000, 30_000];
   let attempt = 0;
@@ -412,7 +445,7 @@ export function startTwitchClient(
         for (const ch of config.channels) {
           emitter.status("twitch", ch, "connecting");
         }
-        await connectOnce(config.channels, emitter, isCovered);
+        await connectOnce(config.channels, emitter, isCovered, onMessage);
       } catch (err) {
         for (const ch of config.channels) emitter.status("twitch", ch, "error");
         // A connection that stayed up a while is a fresh failure, not a flaky endpoint —

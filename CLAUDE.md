@@ -57,6 +57,12 @@ The same binary is also a small CLI client:
   of every message kind (chat, action, cheer, sub, raid, follow, Super Chat,
   sticker, membership, system, a live deletion); `multichat fake <kind>` injects
   just one (e.g. `fake follow`). See `docs/development/testing.md`.
+- `multichat giveaway <verb>` drives the Twitch `!enter` giveaway on a running
+  server via its loopback `POST /api/giveaway` endpoint (`status` / `open` /
+  `close` / `draw` / `reset` / `demo` / `remove <userId>`; `demo` injects sample
+  entrants to preview the reel) — the terminal equivalent of the `/giveaway`
+  page (a CS2-style case reel; `?overlay` is a transparent OBS source). See
+  `docs/configuration.md#giveaway-mode`.
 
 ## Configuration
 
@@ -71,6 +77,13 @@ Copy `settings.json.example` to `settings.json` and edit:
   least one field per entry
 - `alerts` — optional `{activeTheme, themes}` registry that skins the `/alerts`
   overlay (built-in styles `default` / `company-memo`); unset = default look
+- `giveaway` — optional Twitch-only `!enter` prize draw
+  `{enabled, channel,
+  prefix, command, requireFollow, replies, messages}`;
+  `requireFollow` needs the channel in `twitch.eventsub`, `replies` needs a
+  `user:write:chat` token (re-run `multichat login`). Draw on `/giveaway` (a
+  CS2-style case reel; `?overlay` = transparent OBS source). See
+  `docs/configuration.md`
 
 YouTube channels require an API key, but it need not be in `settings.json` — it
 can be set on the running server with `multichat set-youtube-key` (see above).
@@ -84,35 +97,46 @@ stickers/memberships need only the API key). Full reference:
 
 ```
 main.ts          entry point — loads settings, wires the emitter to server + clients;
-                 also the `set-youtube-key` / `login` / `fake` CLI subcommands +
-                 the runtime-key manager and the EventSub manager (per-channel token
-                 lifecycle + one WebSocket per broadcaster)
+                 also the `set-youtube-key` / `login` / `fake` / `giveaway` CLI subcommands +
+                 the runtime-key manager, the EventSub manager (per-channel token lifecycle +
+                 one WebSocket per broadcaster; exposes getChannelAuth), and the giveaway
+                 engine (follow check + chat replies + entrant pool, driving the /giveaway page)
 src/types.ts     shared TypeScript interfaces (Settings, ChatMessage, ServerEvent, Emitter,
-                 TwitchEventSubConfig, EventSub frames)
+                 TwitchEventSubConfig, EventSub frames, GiveawayConfig/State/Entrant)
 src/twitch.ts    Twitch IRC over WebSocket (wss://irc-ws.chat.twitch.tv), with reconnect;
                  handleCommand takes an optional isCovered predicate so EventSub-covered
-                 channels emit only chat text (their events come from EventSub instead)
+                 channels emit only chat text (their events come from EventSub instead), and
+                 an optional onMessage callback that surfaces each PRIVMSG's raw user-id/login
+                 to the giveaway watcher (kept out of the rendered ChatMessage/SSE)
 src/eventsub.ts  Twitch EventSub over WebSocket (wss://eventsub.wss.twitch.tv) — the source
                  of truth for follow/cheer/sub/raid on configured channels; pure
                  notification→ChatMessage mappers + classifyFrame are exported/tested, the
                  socket-holding connectOnce/startTwitchEventSub are the wiring (receive-only)
 src/twitchauth.ts pure Twitch OAuth + EventSub request builders / response parsers
-                 (refresh + auth-code grants, /users, create-subscription) + the
-                 SUBSCRIPTIONS table (single source of truth for types/versions/scopes)
+                 (refresh + auth-code grants, /users, create-subscription, /channels/followers
+                 follow check + /chat/messages send) + the SUBSCRIPTIONS table (source of truth
+                 for EventSub types/versions/scopes) + LOGIN_SCOPES (EVENTSUB_SCOPES + the
+                 user:write:chat action scope the login flow requests for giveaway replies)
 src/youtube.ts   YouTube Data API v3 polling — resolves channel → live video → live chat;
                  startYouTubePoller takes an AbortSignal so it can be torn down/restarted
-src/server.ts    Deno.serve HTTP server: GET / + GET /overlay + GET /alerts (embedded HTML;
-                 overlay = transparent chat OBS source, alerts = animated shoutout pop-ups
-                 with selectable themes, e.g. the "company-memo" redacted-memo look;
-                 ?direction=up|down flips the message flow on any chat-rendering page),
-                 GET /events (SSE), POST /api/youtube-key (loopback-only runtime key control),
-                 POST /api/fake (loopback-only fake-event injection for previewing)
+src/server.ts    Deno.serve HTTP server: GET / + GET /overlay + GET /alerts + GET /giveaway
+                 (embedded HTML; overlay = transparent chat OBS source, alerts = animated
+                 shoutout pop-ups with selectable themes, e.g. the "company-memo" redacted-memo
+                 look, giveaway = CS2-style case-reel picker w/ transparent ?overlay OBS mode;
+                 ?direction=up|down flips the
+                 message flow on any chat-rendering page), GET /events (SSE, replays the
+                 giveaway pool on connect), POST /api/youtube-key + POST /api/fake +
+                 POST /api/giveaway (loopback-only control); createServer returns
+                 { emitter, broadcastGiveaway }
 src/alerts.ts    pure alerts-theme helpers: normalizeAlertsConfig (validates the theme
                  registry from settings.json) + ALERT_EVENT_KINDS; the resolved config is
                  injected into the page as window.MULTICHAT_ALERTS for the overlay to apply
+src/giveaway.ts  pure giveaway helpers: normalizeGiveawayConfig, matchGiveawayCommand, the
+                 entrant-pool reducers (add/remove/draw/open/close/reset) + normalizePoolState,
+                 decideEligibility, and the POST /api/giveaway wire (de)serialization
 src/control.ts   pure control-plane helpers (loopback check, key-body parse, startup-key
-                 resolution, state paths incl. Twitch token/broadcaster-id) + the
-                 ServerHooks/KeyUpdateResult types
+                 resolution, state paths incl. Twitch token/broadcaster-id + giveaway pool) +
+                 the ServerHooks (setYouTubeKey + giveaway) / GiveawayHooks / KeyUpdateResult types
 src/fake.ts      pure fake-event helpers: the curated demo sequence + wire
                  (de)serialization/validation behind POST /api/fake
 tests/           one *_test.ts per source module; dependency-free assert shim in _assert.ts

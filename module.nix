@@ -55,6 +55,11 @@ let
         events = t.events;
       }) cfg.alerts.themes;
     };
+    giveaway = {
+      enabled = cfg.giveaway.enable;
+      inherit (cfg.giveaway)
+        channel prefix command requireFollow replies messages;
+    };
   });
 in
 {
@@ -270,6 +275,69 @@ in
       '';
       description = "Named alert themes for the /alerts overlay; select one with alerts.activeTheme.";
     };
+
+    giveaway.enable =
+      lib.mkEnableOption "the Twitch !enter giveaway / prize-wheel";
+
+    giveaway.channel = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      example = "streamer1";
+      description = ''
+        The single Twitch channel (login, lowercase) the giveaway runs on. Must be
+        in twitch.channels (so its chat is joined); for requireFollow it must also
+        be in twitch.eventsub.channels (the follow check uses the broadcaster token).
+      '';
+    };
+
+    giveaway.prefix = lib.mkOption {
+      type = lib.types.str;
+      default = "!";
+      description = "Command prefix, e.g. \"!\".";
+    };
+
+    giveaway.command = lib.mkOption {
+      type = lib.types.str;
+      default = "enter";
+      description = ''
+        Command word after the prefix. With the defaults, viewers type "!enter".
+      '';
+    };
+
+    giveaway.requireFollow = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Only add entrants who follow the channel, checked live via Helix
+        (moderator:read:followers — already an EventSub scope). Requires the channel
+        to be in twitch.eventsub.channels; if it isn't, follow checks can't run and
+        entries fail closed. Set false to let anyone who types the command enter.
+      '';
+    };
+
+    giveaway.replies = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Post confirmation/denial/winner messages back to Twitch chat as the
+        broadcaster. Needs the user:write:chat scope — re-run `multichat login` for
+        the giveaway channel so its token carries it (tokens minted before this
+        release don't). Set false to run silently (the /giveaway page still works).
+      '';
+    };
+
+    giveaway.messages = lib.mkOption {
+      type = lib.types.attrsOf lib.types.str;
+      default = { };
+      example = lib.literalExpression ''
+        { entered = "🎉 @{user} you're in!"; notFollowing = "@{user} follow to enter!"; }
+      '';
+      description = ''
+        Optional reply templates (keys: entered, notFollowing, alreadyEntered,
+        winner). "{user}" is replaced with the entrant's display name. Unset keys
+        fall back to built-in defaults.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -294,6 +362,10 @@ in
       {
         assertion = lib.all (ch: ch.refreshTokenFile == null || ch.broadcasterId != "") esCfg.channels;
         message = "services.multichat.twitch.eventsub.channels: broadcasterId is required when refreshTokenFile is set (it names the persisted token file).";
+      }
+      {
+        assertion = !cfg.giveaway.enable || cfg.giveaway.channel != "";
+        message = "services.multichat.giveaway.enable requires giveaway.channel (the Twitch login the giveaway runs on).";
       }
     ];
 
@@ -321,7 +393,23 @@ in
         (cfg.alerts.activeTheme != ""
           && !(lib.any (t: t.name == cfg.alerts.activeTheme) cfg.alerts.themes))
         ("services.multichat.alerts.activeTheme = \"" + cfg.alerts.activeTheme
-          + "\" does not match any theme in alerts.themes — the /alerts overlay will use the default look.");
+          + "\" does not match any theme in alerts.themes — the /alerts overlay will use the default look.")
+      ++ lib.optional
+        (cfg.giveaway.enable && cfg.giveaway.channel != ""
+          && !(builtins.elem cfg.giveaway.channel cfg.twitch.channels))
+        ("services.multichat.giveaway.channel = \"" + cfg.giveaway.channel
+          + "\" is not in twitch.channels — the server won't join its chat, so the giveaway command will never be seen.")
+      ++ lib.optional
+        (cfg.giveaway.enable && cfg.giveaway.requireFollow
+          && !(lib.any (ch: ch.login == cfg.giveaway.channel) esCfg.channels))
+        ("services.multichat.giveaway.requireFollow needs the follow check, which uses \""
+          + cfg.giveaway.channel
+          + "\"'s EventSub broadcaster token. Add it to twitch.eventsub.channels (via `multichat login`), or set giveaway.requireFollow = false.")
+      ++ lib.optional (cfg.giveaway.enable && cfg.giveaway.replies)
+        ("services.multichat.giveaway.replies is on: the bot posts to Twitch chat as the broadcaster, "
+          + "which needs the user:write:chat scope. Re-run `multichat login` for \""
+          + cfg.giveaway.channel
+          + "\" so its token carries that scope (tokens minted before this release don't).");
 
     # Make the `multichat` CLI available so an operator can run
     # `multichat set-youtube-key <KEY>` against the running service.

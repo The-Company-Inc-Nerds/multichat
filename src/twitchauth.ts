@@ -79,6 +79,20 @@ export const EVENTSUB_SCOPES: readonly string[] = [
   ),
 ];
 
+/** Scope for sending chat messages via Helix (the giveaway replies). It is a
+ *  Helix *action* scope, not an EventSub subscription, so it is kept out of
+ *  SUBSCRIPTIONS/EVENTSUB_SCOPES and only added to the login flow via LOGIN_SCOPES. */
+export const CHAT_WRITE_SCOPE = "user:write:chat";
+
+/** The scopes the `login` flow requests: everything EventSub needs, plus chat
+ *  write so the optional giveaway replies work. Existing tokens minted before
+ *  this scope was added keep working for EventSub/the follow check but can't post
+ *  replies until the operator re-runs `multichat login`. */
+export const LOGIN_SCOPES: readonly string[] = [
+  ...EVENTSUB_SCOPES,
+  CHAT_WRITE_SCOPE,
+];
+
 // ---- OAuth token flows ----------------------------------------------------
 
 /** Authorization-code grant: exchange a `?code` (from the login redirect) for tokens. */
@@ -204,6 +218,67 @@ export function parseUsersResponse(
   if (typeof id !== "string" || !id) return null;
   const login = typeof first?.login === "string" ? first.login : "";
   return { id, login };
+}
+
+// ---- Helix: per-viewer follow check (giveaway eligibility) ----------------
+
+/** Check whether `userId` follows `broadcasterId` (Get Channel Followers,
+ *  filtered by user_id). Needs a user token for the broadcaster — or one of their
+ *  moderators — carrying `moderator:read:followers` (already an EventSub scope). */
+export function buildCheckFollowRequest(
+  broadcasterId: string,
+  userId: string,
+  clientId: string,
+  accessToken: string,
+): HttpRequest {
+  const q = new URLSearchParams({
+    broadcaster_id: broadcasterId,
+    user_id: userId,
+  });
+  return {
+    url: `${HELIX_BASE}/channels/followers?${q.toString()}`,
+    method: "GET",
+    headers: {
+      "client-id": clientId,
+      "authorization": `Bearer ${accessToken}`,
+    },
+  };
+}
+
+/** True when a Get Channel Followers response (filtered by user_id) shows the
+ *  user is a follower: a well-formed body with a non-empty `data` array. A
+ *  not-following result is a 200 with an empty `data` array. */
+export function parseFollowersResponse(json: unknown): boolean {
+  const o = asObj(json);
+  return Array.isArray(o?.data) && o.data.length > 0;
+}
+
+// ---- Helix: send a chat message (giveaway replies) ------------------------
+
+/** Post `message` to `broadcasterId`'s chat as `senderId` (pass the broadcaster's
+ *  own id to send as the broadcaster). Needs a user token carrying
+ *  `user:write:chat` (see CHAT_WRITE_SCOPE / LOGIN_SCOPES). */
+export function buildSendChatMessageRequest(
+  broadcasterId: string,
+  senderId: string,
+  message: string,
+  clientId: string,
+  accessToken: string,
+): HttpRequest {
+  return {
+    url: `${HELIX_BASE}/chat/messages`,
+    method: "POST",
+    headers: {
+      "client-id": clientId,
+      "authorization": `Bearer ${accessToken}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      broadcaster_id: broadcasterId,
+      sender_id: senderId,
+      message,
+    }),
+  };
 }
 
 // ---- Helix: create an EventSub (WebSocket transport) subscription ----------

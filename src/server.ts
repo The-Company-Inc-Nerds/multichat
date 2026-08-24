@@ -4,6 +4,8 @@ import type {
   ChatMessage,
   DeleteEvent,
   Emitter,
+  GiveawayDraw,
+  GiveawayState,
   Platform,
   ServerEvent,
   Settings,
@@ -14,6 +16,7 @@ import {
   type ServerHooks,
 } from "./control.ts";
 import { describeFakeAction, parseFakeAction } from "./fake.ts";
+import { parseGiveawayAction } from "./giveaway.ts";
 
 const HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -823,6 +826,328 @@ const HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
+// The operator-facing giveaway page + transparent OBS overlay. A standalone page
+// (not the chat renderer): it reads the same /events SSE stream but only acts on
+// `giveaway` frames, driving the giveaway via the loopback POST /api/giveaway
+// endpoint. The reveal is a CS2-style horizontal "case" reel that eases onto the
+// winner. `?overlay` = transparent, controls hidden, auto-hides between draws —
+// drop it into OBS as a browser source. Open the control view on the same machine
+// as the server (the control endpoint is loopback-only).
+const GIVEAWAY_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Multichat — Giveaway</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0e0e10; color: #efeff1; font-size: 14px;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      min-height: 100dvh; display: flex; flex-direction: column;
+    }
+    header {
+      padding: 10px 16px; background: #18181b; border-bottom: 1px solid #26262c;
+      display: flex; align-items: center; gap: 12px; flex-shrink: 0;
+    }
+    h1 { font-size: 12px; font-weight: 700; letter-spacing: 0.1em; }
+    #conn { margin-left: auto; display: flex; align-items: center; gap: 6px; font-size: 11px; color: #8e8e9a; }
+    #dot { width: 7px; height: 7px; border-radius: 50%; background: #555; }
+    #dot.live { background: #00b173; } #dot.err { background: #eb0400; }
+
+    #stage { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 26px 14px 10px; }
+    #reel { position: relative; width: 100%; max-width: 940px; height: 172px; overflow: hidden; border-radius: 10px; }
+    body:not(.overlay) #reel { background: #131316; border: 1px solid #26262c; }
+    #strip { position: absolute; left: 0; top: 0; height: 100%; display: flex; align-items: center; will-change: transform; }
+    /* Center ticker the winning card settles under. */
+    #marker { position: absolute; left: 50%; top: 0; bottom: 0; width: 0; transform: translateX(-50%); z-index: 3;
+      border-left: 2px solid #ffcf3f; box-shadow: 0 0 12px #ffcf3f; }
+    #marker::before, #marker::after { content: ""; position: absolute; left: 50%; transform: translateX(-50%);
+      border-left: 9px solid transparent; border-right: 9px solid transparent; }
+    #marker::before { top: -1px; border-top: 11px solid #ffcf3f; }
+    #marker::after  { bottom: -1px; border-bottom: 11px solid #ffcf3f; }
+    /* Edge fades — control view only; the overlay is transparent already. */
+    .fade { position: absolute; top: 0; bottom: 0; width: 96px; z-index: 2; pointer-events: none; }
+    .fade.l { left: 0; } .fade.r { right: 0; }
+    body:not(.overlay) .fade.l { background: linear-gradient(90deg, #131316, #13131600); }
+    body:not(.overlay) .fade.r { background: linear-gradient(270deg, #131316, #13131600); }
+    #idle { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+      color: #5a5a64; font-style: italic; z-index: 1; }
+
+    .card { width: 108px; height: 140px; flex: 0 0 auto; margin-right: 8px; position: relative;
+      background: linear-gradient(180deg, #1c1c22, #141417); border: 1px solid #2c2c34; border-radius: 8px;
+      display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px;
+      box-shadow: 0 2px 6px #0006; }
+    .card .bar { position: absolute; top: 0; left: 0; right: 0; height: 4px; background: var(--c); border-radius: 8px 8px 0 0; }
+    .card .av { width: 52px; height: 52px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+      font-weight: 800; font-size: 22px; color: #0e0e10; }
+    .card .nm { font-size: 12px; font-weight: 600; max-width: 96px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .card.win { border-color: #ffcf3f; box-shadow: 0 0 0 2px #ffcf3f, 0 0 26px #ffcf3f99; transform: translateY(-2px); }
+
+    #winner { min-height: 30px; font-size: 22px; font-weight: 800; text-align: center; }
+    #winner .name { color: #ffcf3f; text-shadow: 0 0 18px #ffcf3f66; }
+
+    #panel { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 4px 16px 26px; }
+    #hint { font-size: 12px; color: #adadb8; text-align: center; }
+    #hint b { color: #efeff1; }
+    #controls { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+    button {
+      background: #2b2b31; color: #efeff1; border: 1px solid #3a3a42;
+      border-radius: 6px; padding: 9px 16px; font-size: 13px; font-weight: 600; cursor: pointer;
+    }
+    button:hover { background: #35353c; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    button.spin { background: #9147ff; border-color: #9147ff; }
+    button.spin:hover:not(:disabled) { background: #a06bff; }
+    #state { font-size: 12px; color: #8e8e9a; text-align: center; }
+    .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-weight: 700; }
+    .pill.open { background: #06331f; color: #00e29a; }
+    .pill.closed { background: #3a2323; color: #ff8a84; }
+    #listWrap { width: 100%; max-width: 560px; }
+    #listWrap h2 { font-size: 11px; letter-spacing: 0.08em; color: #6c6c78; margin-bottom: 8px; text-align: center; }
+    #list { list-style: none; display: flex; flex-wrap: wrap; gap: 4px; justify-content: center; }
+    #list li { display: flex; align-items: center; gap: 7px; padding: 4px 8px; background: #161618; border-radius: 5px; font-size: 12px; }
+    #list li .sw { width: 9px; height: 9px; border-radius: 2px; flex-shrink: 0; }
+    #list li button { padding: 0 5px; font-size: 11px; font-weight: 500; }
+    #empty { color: #5a5a64; font-style: italic; font-size: 12px; }
+    #disabled { display: none; padding: 20px; text-align: center; color: #ff8a84; }
+    body.off #stage, body.off #panel { display: none; } body.off #disabled { display: block; }
+
+    /* ---- transparent OBS overlay (visit /giveaway?overlay) ---- */
+    body.overlay { background: transparent; }
+    body.overlay header, body.overlay #panel, body.overlay #disabled { display: none; }
+    body.overlay #stage { min-height: 100dvh; justify-content: center; opacity: 1; transition: opacity 0.6s ease; }
+    body.overlay #stage.hidden { opacity: 0; }
+    body.overlay #winner { font-size: 30px; text-shadow: 0 2px 10px #000; }
+  </style>
+  <!--GIVEAWAY-->
+</head>
+<body>
+  <header>
+    <h1>GIVEAWAY</h1>
+    <div id="conn"><div id="dot"></div><span id="ctxt">Connecting</span></div>
+  </header>
+  <div id="disabled">Giveaway mode is disabled. Enable it in settings.json / the NixOS module.</div>
+  <div id="stage">
+    <div id="reel">
+      <div id="idle">No entrants yet</div>
+      <div id="strip"></div>
+      <div class="fade l"></div><div class="fade r"></div>
+      <div id="marker"></div>
+    </div>
+    <div id="winner"></div>
+  </div>
+  <div id="panel">
+    <div id="hint"></div>
+    <div id="controls">
+      <button class="spin" id="spinBtn" onclick="spin()">Draw winner</button>
+      <button id="openBtn" onclick="act('open')">Open entries</button>
+      <button id="closeBtn" onclick="act('close')">Close entries</button>
+      <button id="resetBtn" onclick="resetPool()">Reset</button>
+      <button id="demoBtn" onclick="demo()" title="Add sample entrants to preview the reel">Demo</button>
+    </div>
+    <div id="state"></div>
+    <div id="listWrap"><h2 id="rtitle">ENTRANTS</h2><ul id="list"></ul></div>
+  </div>
+  <script>
+    var cfg = window.MULTICHAT_GIVEAWAY || {};
+    var params = new URLSearchParams(location.search);
+    // OBS overlay mode: /giveaway?overlay → transparent, controls hidden, auto-hide.
+    var overlayMode = params.has('overlay');
+    if (overlayMode) document.body.classList.add('overlay');
+    if (cfg.enabled === false) document.body.classList.add('off');
+
+    var CARD_W = 108, GAP = 8, STRIDE = CARD_W + GAP;
+    var REEL_MS = 6500, HOLD_MS = 6000;
+
+    var reelEl = document.getElementById('reel');
+    var strip = document.getElementById('strip');
+    var idleEl = document.getElementById('idle');
+    var stage = document.getElementById('stage');
+    var winnerEl = document.getElementById('winner');
+    var dot = document.getElementById('dot');
+    var ctxt = document.getElementById('ctxt');
+    var stateEl = document.getElementById('state');
+    var listEl = document.getElementById('list');
+    var rtitle = document.getElementById('rtitle');
+    var spinBtn = document.getElementById('spinBtn');
+    var hintEl = document.getElementById('hint');
+    var hideTimer = null;
+
+    var pool = { open: true, entrants: [], lastWinner: null };
+    var reelBusy = false;     // a reel animation is playing
+    var awaiting = false;     // a draw was requested; awaiting the broadcast frame
+    var pendingState = null;  // post-draw pool, applied once the animation ends
+
+    if (hintEl) hintEl.innerHTML = cfg.command
+      ? 'Viewers type <b>' + (cfg.prefix || '!') + cfg.command + '</b>' +
+        (cfg.channel ? ' in <b>#' + cfg.channel + '</b>' : '') + ' to enter.'
+      : '';
+
+    function color(seed, i) {
+      var h = 0, s = String(seed || i);
+      for (var k = 0; k < s.length; k++) h = (h * 31 + s.charCodeAt(k)) >>> 0;
+      return 'hsl(' + (h % 360) + ', 62%, 55%)';
+    }
+    function nameOf(e) { return e.displayName || e.login || e.userId || '?'; }
+
+    function makeCard(e, key) {
+      var c = document.createElement('div'); c.className = 'card';
+      var col = color(e.userId, key); c.style.setProperty('--c', col);
+      var bar = document.createElement('div'); bar.className = 'bar'; c.appendChild(bar);
+      var av = document.createElement('div'); av.className = 'av'; av.style.background = col;
+      av.textContent = nameOf(e).slice(0, 1).toUpperCase(); c.appendChild(av);
+      var nm = document.createElement('div'); nm.className = 'nm';
+      var n = nameOf(e); nm.textContent = n.length > 14 ? n.slice(0, 13) + '…' : n; c.appendChild(nm);
+      return c;
+    }
+
+    function normPool(p) {
+      return { open: !!p.open, entrants: p.entrants || [], lastWinner: p.lastWinner || null };
+    }
+
+    // The static "who's in" strip shown between draws (control view only; the
+    // overlay stays blank/transparent until a draw).
+    function renderIdle() {
+      if (reelBusy) return;
+      strip.style.transition = 'none';
+      strip.innerHTML = '';
+      var es = pool.entrants;
+      if (!es.length) { idleEl.style.display = 'flex'; strip.style.transform = 'translateX(0)'; return; }
+      idleEl.style.display = 'none';
+      if (overlayMode) { strip.style.transform = 'translateX(0)'; return; }
+      var frag = document.createDocumentFragment();
+      for (var i = 0; i < es.length; i++) frag.appendChild(makeCard(es[i], i));
+      strip.appendChild(frag);
+      var stripW = es.length * STRIDE - GAP;
+      strip.style.transform = 'translateX(' + (reelEl.clientWidth / 2 - stripW / 2) + 'px)';
+    }
+
+    function renderPanel() {
+      var n = pool.entrants.length;
+      if (rtitle) rtitle.textContent = 'ENTRANTS (' + n + ')';
+      if (stateEl) stateEl.innerHTML = 'Entries are ' +
+        (pool.open ? '<span class="pill open">OPEN</span>' : '<span class="pill closed">CLOSED</span>') +
+        ' · ' + n + ' in the pool';
+      if (spinBtn) spinBtn.disabled = reelBusy || awaiting || n === 0;
+      var ob = document.getElementById('openBtn'), cb = document.getElementById('closeBtn');
+      if (ob) ob.disabled = pool.open;
+      if (cb) cb.disabled = !pool.open;
+      if (!listEl) return;
+      listEl.textContent = '';
+      if (!n) {
+        var li = document.createElement('li'); li.id = 'empty';
+        li.textContent = 'No one has entered yet.'; listEl.appendChild(li); return;
+      }
+      pool.entrants.forEach(function (e, i) {
+        var el = document.createElement('li');
+        var sw = document.createElement('span'); sw.className = 'sw';
+        sw.style.background = color(e.userId, i); el.appendChild(sw);
+        var nm = document.createElement('span'); nm.textContent = nameOf(e); el.appendChild(nm);
+        var rm = document.createElement('button'); rm.textContent = '✕'; rm.title = 'Remove';
+        rm.onclick = function () { act('remove', { userId: e.userId }); }; el.appendChild(rm);
+        listEl.appendChild(el);
+      });
+    }
+
+    function showWinner(w) {
+      winnerEl.innerHTML = '🎉 Winner: <span class="name">' + nameOf(w) + '</span>';
+    }
+    function showStage() { clearTimeout(hideTimer); stage.classList.remove('hidden'); }
+    function hideStage() { if (overlayMode) stage.classList.add('hidden'); }
+
+    function applyPool(p) {
+      if (reelBusy) { pendingState = normPool(p); return; }
+      pool = normPool(p);
+      renderIdle(); renderPanel();
+      if (!overlayMode && pool.lastWinner && !winnerEl.textContent) showWinner(pool.lastWinner);
+    }
+
+    // CS2-style case reel: a long strip that eases to a stop with the winning
+    // card settled under the center ticker.
+    function playReel(reel, winner) {
+      if (!reel || !reel.length) return;
+      reelBusy = true; awaiting = false; showStage();
+      idleEl.style.display = 'none'; winnerEl.textContent = ''; renderPanel();
+      var RW = reel.length, reelW = reelEl.clientWidth || 900;
+      var winPos = 0;
+      for (var i = 0; i < RW; i++) { if (reel[i].userId === winner.userId) { winPos = i; break; } }
+      // Enough repeats for a long, fast runway before the deceleration.
+      var repeats = Math.max(6, Math.ceil((reelW * 3 + 1400) / (RW * STRIDE)) + 3);
+      var targetIdx = (repeats - 2) * RW + winPos; // a full copy still trails it, so the right side stays filled
+      strip.innerHTML = '';
+      var frag = document.createDocumentFragment();
+      for (var r = 0; r < repeats; r++) {
+        for (var j = 0; j < RW; j++) frag.appendChild(makeCard(reel[j], r * RW + j));
+      }
+      strip.appendChild(frag);
+      // A little off-center jitter so it doesn't always stop dead-center.
+      var jitter = (Math.random() * 2 - 1) * (CARD_W * 0.30);
+      var T = reelW / 2 - (targetIdx * STRIDE + CARD_W / 2) + jitter;
+      strip.style.transition = 'none';
+      strip.style.transform = 'translateX(0px)';
+      void strip.offsetWidth; // reflow so the transition runs from 0
+      strip.style.transition = 'transform ' + REEL_MS + 'ms cubic-bezier(0.05, 0.7, 0.1, 1)';
+      strip.style.transform = 'translateX(' + T + 'px)';
+      var winCard = strip.children[targetIdx];
+      setTimeout(function () {
+        if (winCard) winCard.classList.add('win');
+        showWinner(winner);
+        reelBusy = false;
+        if (pendingState) { pool = pendingState; pendingState = null; }
+        renderPanel();
+        if (overlayMode) hideTimer = setTimeout(hideStage, HOLD_MS);
+      }, REEL_MS + 80);
+    }
+
+    function post(action, extra) {
+      var body = { action: action };
+      if (extra) for (var k in extra) body[k] = extra[k];
+      return fetch('/api/giveaway', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }).then(function (r) { return r.ok ? r.json() : r.text().then(function (t) { throw new Error(t); }); })
+        .catch(function (e) { if (stateEl) stateEl.textContent = 'Error: ' + e.message; return null; });
+    }
+    function act(action, extra) {
+      post(action, extra).then(function (res) { if (res && res.state) applyPool(res.state); });
+    }
+    function resetPool() { if (!confirm('Clear all entrants?')) return; winnerEl.textContent = ''; act('reset'); }
+    // Inject sample entrants so you can run the reel without a live stream.
+    function demo() { winnerEl.textContent = ''; act('demo'); }
+
+    // Trigger a draw; the broadcast frame drives the reel here AND on the overlay.
+    function spin() {
+      if (reelBusy || awaiting || pool.entrants.length === 0) return;
+      winnerEl.textContent = ''; awaiting = true; renderPanel();
+      post('draw').then(function (res) { if (!res) { awaiting = false; renderPanel(); } });
+    }
+
+    function handle(ev) {
+      if (ev.type !== 'giveaway') return;
+      awaiting = false;
+      if (ev.draw && ev.draw.winner) {
+        pendingState = normPool(ev.data);
+        playReel(ev.draw.reel || [], ev.draw.winner);
+      } else {
+        applyPool(ev.data);
+      }
+    }
+
+    function connect() {
+      var es = new EventSource('/events');
+      es.onopen = function () { dot.className = 'live'; ctxt.textContent = 'Live'; };
+      es.onerror = function () { dot.className = 'err'; ctxt.textContent = 'Reconnecting'; };
+      es.onmessage = function (e) { try { handle(JSON.parse(e.data)); } catch (_) {} };
+    }
+
+    if (overlayMode) stage.classList.add('hidden');
+    renderIdle(); renderPanel();
+    if (cfg.enabled !== false) connect();
+  </script>
+</body>
+</html>`;
+
 /** Stable derived color for an author name (used when the platform gives none). */
 export function colorFor(name: string): string {
   let h = 0;
@@ -839,7 +1164,10 @@ const MAX_SSE_CLIENTS = 50;
 export function createServer(
   settings: Settings,
   hooks: ServerHooks = {},
-): Emitter {
+): {
+  emitter: Emitter;
+  broadcastGiveaway: (state: GiveawayState, draw?: GiveawayDraw) => void;
+} {
   const clients = new Set<ReadableStreamDefaultController<Uint8Array>>();
   const enc = new TextEncoder();
 
@@ -853,6 +1181,20 @@ export function createServer(
   const pageHtml = HTML.replace(
     "<!--ALERTS-->",
     `<script>window.MULTICHAT_ALERTS=${alertsJson}</script>`,
+  );
+
+  // The /giveaway page needs to know the command + channel to prompt with
+  // (never any secret). Same <-escaping as the alerts injection above.
+  const g = settings.giveaway;
+  const giveawayJson = JSON.stringify({
+    enabled: g?.enabled ?? false,
+    channel: g?.channel ?? "",
+    prefix: g?.prefix ?? "!",
+    command: g?.command ?? "enter",
+  }).replace(/</g, "\\u003c");
+  const giveawayHtml = GIVEAWAY_HTML.replace(
+    "<!--GIVEAWAY-->",
+    `<script>window.MULTICHAT_GIVEAWAY=${giveawayJson}</script>`,
   );
 
   // Seed one status entry per configured channel, all "connecting" until a client reports in.
@@ -874,6 +1216,10 @@ export function createServer(
     });
   }
 
+  // Last giveaway state broadcast, cached like `statuses` so a newly-connected
+  // /giveaway page gets the current pool on connect (see the /events replay below).
+  let lastGiveaway: GiveawayState | null = null;
+
   function broadcast(event: ServerEvent): void {
     const frame = enc.encode("data: " + JSON.stringify(event) + "\n\n");
     for (const ctrl of clients) {
@@ -883,6 +1229,21 @@ export function createServer(
         clients.delete(ctrl);
       }
     }
+  }
+
+  // Push giveaway pool state to every connected client. The `/giveaway` page acts
+  // on this frame; the public chat pages have no case for it and ignore it. A
+  // `draw` payload (winner + reel) rides along only on a draw, so every page —
+  // including the transparent OBS overlay — plays the same case-opening reel. The
+  // cached snapshot (replayed on connect) never carries `draw`, so a fresh page
+  // doesn't re-play an old animation.
+  function broadcastGiveaway(state: GiveawayState, draw?: GiveawayDraw): void {
+    lastGiveaway = state;
+    broadcast(
+      draw
+        ? { type: "giveaway", data: state, draw }
+        : { type: "giveaway", data: state },
+    );
   }
 
   // Keep SSE connections alive through proxies
@@ -978,6 +1339,70 @@ export function createServer(
         return ctl("Injected: " + describeFakeAction(a) + "\n", 200);
       }
 
+      // Operator control-plane for the giveaway (open/close/draw/reset/remove/
+      // status). Loopback-only like the endpoints above — the /giveaway page and
+      // `multichat giveaway` both drive it. Mutating actions broadcast the new
+      // pool to every connected page from inside the engine (see main.ts).
+      if (pathname === "/api/giveaway") {
+        const ctl = (body: string, status: number, json = false) =>
+          new Response(body, {
+            status,
+            headers: {
+              "x-multichat": "control",
+              ...(json ? { "content-type": "application/json" } : {}),
+            },
+          });
+        if (req.method !== "POST") return ctl("Method Not Allowed\n", 405);
+        if (!isLoopbackAddr(info.remoteAddr)) {
+          return ctl(
+            "Forbidden: the giveaway endpoint is loopback-only\n",
+            403,
+          );
+        }
+        if (!hooks.giveaway) {
+          return ctl("Giveaway is not enabled\n", 501);
+        }
+        const parsed = parseGiveawayAction(await req.text());
+        if (!parsed.ok) {
+          return ctl("Bad Request: " + parsed.message + "\n", 400);
+        }
+        const gh = hooks.giveaway;
+        const a = parsed.action;
+        let payload: unknown;
+        switch (a.action) {
+          case "open":
+            payload = { state: gh.open() };
+            break;
+          case "close":
+            payload = { state: gh.close() };
+            break;
+          case "reset":
+            payload = { state: gh.reset() };
+            break;
+          case "demo":
+            payload = { state: gh.demo() };
+            break;
+          case "remove":
+            payload = { state: gh.remove(a.userId) };
+            break;
+          case "draw": {
+            const r = gh.draw();
+            payload = { state: r.state, winner: r.winner };
+            break;
+          }
+          case "status":
+            payload = { state: gh.getState() };
+            break;
+        }
+        return ctl(JSON.stringify(payload) + "\n", 200, true);
+      }
+
+      if (pathname === "/giveaway") {
+        return new Response(giveawayHtml, {
+          headers: { "Content-Type": "text/html; charset=utf-8" },
+        });
+      }
+
       if (pathname === "/events") {
         if (clients.size >= MAX_SSE_CLIENTS) {
           return new Response("Too many connections", { status: 503 });
@@ -996,6 +1421,12 @@ export function createServer(
             ctrl.enqueue(
               enc.encode("data: " + JSON.stringify(snapshot) + "\n\n"),
             );
+            // Replay the current giveaway pool so a freshly-opened (or reconnected)
+            // /giveaway page renders the entrants without waiting for the next change.
+            if (lastGiveaway) {
+              const gv: ServerEvent = { type: "giveaway", data: lastGiveaway };
+              ctrl.enqueue(enc.encode("data: " + JSON.stringify(gv) + "\n\n"));
+            }
           },
           cancel() {
             clients.delete(ctrl);
@@ -1024,5 +1455,5 @@ export function createServer(
     },
   );
 
-  return emitter;
+  return { emitter, broadcastGiveaway };
 }

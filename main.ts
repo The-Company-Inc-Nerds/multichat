@@ -1,11 +1,16 @@
 import type {
   Emitter,
+  GiveawayConfig,
+  GiveawayDraw,
+  GiveawayMessages,
+  GiveawayState,
   Settings,
+  TwitchConfig,
   TwitchEventSubChannelConfig,
   TwitchEventSubConfig,
   YouTubeChannelConfig,
 } from "./src/types.ts";
-import { startTwitchClient } from "./src/twitch.ts";
+import { startTwitchClient, type TwitchChatMessage } from "./src/twitch.ts";
 import { startYouTubePoller } from "./src/youtube.ts";
 import { createServer } from "./src/server.ts";
 import { normalizeAlertsConfig } from "./src/alerts.ts";
@@ -16,13 +21,19 @@ import {
 import {
   buildAuthCodeRequest,
   buildAuthorizeUrl,
+  buildCheckFollowRequest,
   buildRefreshRequest,
+  buildSendChatMessageRequest,
   buildUsersRequest,
-  EVENTSUB_SCOPES,
+  CHAT_WRITE_SCOPE,
+  LOGIN_SCOPES,
+  parseFollowersResponse,
   parseTokenResponse,
   parseUsersResponse,
 } from "./src/twitchauth.ts";
 import {
+  type GiveawayHooks,
+  giveawayPoolStatePath,
   keyStatePath,
   type KeyUpdateResult,
   resolveStartupKey,
@@ -36,6 +47,24 @@ import {
   MESSAGE_KINDS,
   serializeFakeAction,
 } from "./src/fake.ts";
+import {
+  addEntrant,
+  closePool,
+  decideEligibility,
+  demoEntrants,
+  drawWinner,
+  emptyPool,
+  type GiveawayAction,
+  giveawayMessage,
+  hasEntrant,
+  matchGiveawayCommand,
+  normalizeGiveawayConfig,
+  normalizePoolState,
+  openPool,
+  removeEntrant,
+  resetPool,
+  serializeGiveawayAction,
+} from "./src/giveaway.ts";
 
 async function loadSettings(path: string): Promise<Settings> {
   let text: string;
@@ -66,6 +95,7 @@ async function loadSettings(path: string): Promise<Settings> {
       channels: raw.youtube?.channels ?? [],
     },
     alerts: normalizeAlertsConfig(raw.alerts),
+    giveaway: normalizeGiveawayConfig(raw.giveaway),
   };
 }
 
@@ -165,12 +195,23 @@ function createYouTubeKeyManager(opts: {
  * persists the rotated token before use. Broadcaster ids are resolved once and
  * cached. Mirrors createYouTubeKeyManager's "logic here, pure helpers in src/" split.
  */
+/** A channel's broadcaster id + token accessor, reused by the giveaway engine to
+ *  run the follow check and post chat replies with the broadcaster's authority. */
+export interface ChannelAuth {
+  broadcasterId: string;
+  getToken: (force?: boolean) => Promise<string | null>;
+}
+
 function createTwitchEventSubManager(opts: {
   getEmitter: () => Emitter;
   config: TwitchEventSubConfig;
   stateDir: string | null;
 }) {
   const { clientId, clientSecret } = opts.config;
+
+  // Per-channel auth, keyed by lowercased login and by broadcaster id, populated
+  // once a channel's broadcaster id + token are fully resolved (see startChannel).
+  const channelAuth = new Map<string, ChannelAuth>();
 
   async function startChannel(ch: TwitchEventSubChannelConfig): Promise<void> {
     const login = (ch.login ?? "").toLowerCase();
@@ -293,6 +334,12 @@ function createTwitchEventSubManager(opts: {
       if (tokenPath) await persistState(tokenPath, refreshToken);
     }
 
+    // Now that the broadcaster id + token are usable, publish this channel's auth
+    // so the giveaway engine can call Helix with the broadcaster's authority.
+    const auth: ChannelAuth = { broadcasterId, getToken };
+    if (login) channelAuth.set(login, auth);
+    channelAuth.set(broadcasterId, auth);
+
     const ctx: EventSubChannelContext = {
       clientId,
       broadcasterId,
@@ -316,7 +363,13 @@ function createTwitchEventSubManager(opts: {
     }
   }
 
-  return { start };
+  /** A channel's auth once resolved, by login or broadcaster id; undefined until
+   *  its startChannel completes (the giveaway engine treats that as "can't verify"). */
+  function getChannelAuth(key: string): ChannelAuth | undefined {
+    return channelAuth.get(key.toLowerCase());
+  }
+
+  return { start, getChannelAuth };
 }
 
 async function readKeyFile(path: string): Promise<string | null> {
@@ -324,6 +377,258 @@ async function readKeyFile(path: string): Promise<string | null> {
     return (await Deno.readTextFile(path)).trim() || null;
   } catch {
     return null; // not set yet — wait for a runtime key
+  }
+}
+
+/**
+ * The giveaway engine (Twitch-only). Watches chat for the configured command,
+ * gates entries on a live Helix follow check (fail-closed when it can't be run),
+ * collects eligible viewers, persists the pool, optionally replies in chat as the
+ * broadcaster (fail-soft), and drives the /giveaway page via the ServerHooks it
+ * exposes. Pure logic lives in src/giveaway.ts; this is the wiring.
+ */
+function createGiveawayEngine(opts: {
+  config: GiveawayConfig;
+  clientId: string;
+  stateDir: string | null;
+  getChannelAuth: (login: string) => ChannelAuth | undefined;
+  getBroadcast: () =>
+    | ((state: GiveawayState, draw?: GiveawayDraw) => void)
+    | undefined;
+}): {
+  onMessage: (m: TwitchChatMessage) => Promise<void>;
+  hooks: GiveawayHooks;
+  init: () => Promise<void>;
+} {
+  const { config } = opts;
+  const poolPath = giveawayPoolStatePath(opts.stateDir);
+  let state: GiveawayState = emptyPool(true);
+
+  // `draw` rides along only on a draw, so every connected page (incl. the OBS
+  // overlay) plays the case-opening reel over the pre-removal entrant list.
+  function broadcast(draw?: GiveawayDraw): void {
+    opts.getBroadcast()?.(state, draw);
+  }
+  function persist(): void {
+    if (poolPath) void persistState(poolPath, JSON.stringify(state));
+  }
+
+  /** Restore a persisted pool at startup (best-effort; corrupt file → empty pool). */
+  async function init(): Promise<void> {
+    if (!poolPath) return;
+    const raw = await readKeyFile(poolPath);
+    if (!raw) return;
+    try {
+      const restored = normalizePoolState(JSON.parse(raw));
+      if (restored) state = restored;
+    } catch { /* corrupt — start empty */ }
+  }
+
+  // Helix follow check with one forced-refresh retry on 401. Returns undefined
+  // when it can't be determined (no auth / network / rate limit) so callers fail
+  // closed — a "must follow" gate must not grant an unverifiable entry.
+  async function checkFollow(userId: string): Promise<boolean | undefined> {
+    const auth = opts.getChannelAuth(config.channel);
+    if (!auth) {
+      console.error(
+        `[Giveaway] ${config.channel}: no EventSub token — cannot verify follow ` +
+          `(authorize it with 'multichat login', or set requireFollow=false).`,
+      );
+      return undefined;
+    }
+    return await helixFollow(auth, userId, false);
+  }
+
+  async function helixFollow(
+    auth: ChannelAuth,
+    userId: string,
+    retried: boolean,
+  ): Promise<boolean | undefined> {
+    const token = await auth.getToken(retried);
+    if (!token) return undefined;
+    const req = buildCheckFollowRequest(
+      auth.broadcasterId,
+      userId,
+      opts.clientId,
+      token,
+    );
+    let res: Response;
+    try {
+      res = await fetch(req.url, { method: req.method, headers: req.headers });
+    } catch (e) {
+      console.error(`[Giveaway] follow check failed: ${e}`);
+      return undefined;
+    }
+    if (res.status === 401 && !retried) {
+      await res.body?.cancel();
+      return helixFollow(auth, userId, true); // token expired mid-flight — refresh once
+    }
+    if (!res.ok) {
+      await res.body?.cancel();
+      console.error(`[Giveaway] follow check HTTP ${res.status}`);
+      return undefined;
+    }
+    return parseFollowersResponse(await res.json().catch(() => null));
+  }
+
+  // Post a reply as the broadcaster. Fail-soft: a missing user:write:chat scope or
+  // any transient error is logged but never blocks an entry or the reel.
+  async function reply(
+    key: keyof GiveawayMessages,
+    user: string,
+  ): Promise<void> {
+    if (!config.replies) return;
+    const auth = opts.getChannelAuth(config.channel);
+    if (!auth) return;
+    const token = await auth.getToken();
+    if (!token) return;
+    const req = buildSendChatMessageRequest(
+      auth.broadcasterId,
+      auth.broadcasterId,
+      giveawayMessage(config, key, user),
+      opts.clientId,
+      token,
+    );
+    try {
+      const res = await fetch(req.url, {
+        method: req.method,
+        headers: req.headers,
+        body: req.body,
+      });
+      if (!res.ok) {
+        const t = await res.text().catch(() => "");
+        console.error(
+          `[Giveaway] chat reply failed (HTTP ${res.status}). Ensure the token ` +
+            `carries ${CHAT_WRITE_SCOPE} — re-run 'multichat login' for ` +
+            `${config.channel}. ${t}`,
+        );
+      } else {
+        await res.body?.cancel();
+      }
+    } catch (e) {
+      console.error(`[Giveaway] chat reply error: ${e}`);
+    }
+  }
+
+  async function onMessage(m: TwitchChatMessage): Promise<void> {
+    if (!config.enabled) return;
+    if (m.channel.toLowerCase() !== config.channel) return;
+    if (!matchGiveawayCommand(m.text, config.prefix, config.command)) return;
+    if (!m.userId) return; // no stable id — can't dedupe/verify
+    if (!state.open) return; // entries closed; ignore silently
+    if (hasEntrant(state, m.userId)) {
+      await reply("alreadyEntered", m.displayName);
+      return;
+    }
+    let following: boolean | undefined;
+    if (config.requireFollow) following = await checkFollow(m.userId);
+    const decision = decideEligibility(config.requireFollow, { following });
+    if (!decision.eligible) {
+      if (decision.reason === "not-following") {
+        await reply("notFollowing", m.displayName);
+      }
+      // "unverifiable" already logged in checkFollow; stay quiet in chat.
+      return;
+    }
+    const added = addEntrant(state, {
+      userId: m.userId,
+      login: m.login,
+      displayName: m.displayName,
+      enteredAt: Date.now(),
+    });
+    if (!added.added) return;
+    state = added.state;
+    persist();
+    broadcast();
+    await reply("entered", m.displayName);
+  }
+
+  const hooks: GiveawayHooks = {
+    getState: () => state,
+    open: () => {
+      state = openPool(state);
+      persist();
+      broadcast();
+      return state;
+    },
+    close: () => {
+      state = closePool(state);
+      persist();
+      broadcast();
+      return state;
+    },
+    reset: () => {
+      state = resetPool(state);
+      persist();
+      broadcast();
+      return state;
+    },
+    remove: (userId) => {
+      state = removeEntrant(state, userId);
+      persist();
+      broadcast();
+      return state;
+    },
+    draw: () => {
+      const reel = state.entrants.slice(); // pre-removal list, for the reel animation
+      const r = drawWinner(state, Math.random);
+      state = r.state;
+      persist();
+      broadcast(r.winner ? { winner: r.winner, reel } : undefined);
+      if (r.winner) void reply("winner", r.winner.displayName);
+      return { state, winner: r.winner };
+    },
+    demo: () => {
+      // Open the pool and add the sample entrants (deduped by their stable ids),
+      // so the reel has something to run without a live stream. No chat replies.
+      state = openPool(state);
+      for (const e of demoEntrants(Date.now())) {
+        state = addEntrant(state, e).state;
+      }
+      persist();
+      broadcast();
+      return state;
+    },
+  };
+
+  return { onMessage, hooks, init };
+}
+
+/** Log giveaway setup problems at startup (the follow gate depends on EventSub;
+ *  chat replies depend on a re-authorized token) so a misconfig is visible early. */
+function warnGiveawaySetup(config: GiveawayConfig, twitch: TwitchConfig): void {
+  console.log(
+    `[Giveaway] enabled on #${config.channel || "(unset)"} — command ` +
+      `"${config.prefix}${config.command}".`,
+  );
+  if (!config.channel) {
+    console.error(
+      "[Giveaway] no channel set — set giveaway.channel to the Twitch login to run it on.",
+    );
+    return;
+  }
+  const chatChannels = twitch.channels.map((c) => c.toLowerCase());
+  if (!chatChannels.includes(config.channel)) {
+    console.error(
+      `[Giveaway] "${config.channel}" is not in twitch.channels — the server won't ` +
+        `join its chat, so ${config.prefix}${config.command} will never be seen.`,
+    );
+  }
+  const esChannels = (twitch.eventsub?.channels ?? [])
+    .map((c) => (c.login ?? "").toLowerCase());
+  if (config.requireFollow && !esChannels.includes(config.channel)) {
+    console.error(
+      `[Giveaway] requireFollow is on but "${config.channel}" has no EventSub token ` +
+        `— follow checks can't run, so entries fail closed. Authorize it with ` +
+        `'multichat login', or set requireFollow=false.`,
+    );
+  }
+  if (config.replies) {
+    console.log(
+      `[Giveaway] replies are on — the bot posts as the broadcaster (needs the ` +
+        `${CHAT_WRITE_SCOPE} scope; re-run 'multichat login' for ${config.channel} ` +
+        `if replies return 401).`,
+    );
   }
 }
 
@@ -340,8 +645,29 @@ async function runServer(configPath: string): Promise<void> {
     channels: settings.youtube.channels,
     statePath,
   });
-  const emitter = createServer(settings, {
+
+  // The giveaway engine (when enabled) needs the per-channel broadcaster token to
+  // run the follow check + post replies, but the EventSub manager only resolves it
+  // later; this mutable accessor bridges the ordering (a no-op until start below).
+  let getChannelAuth: (login: string) => ChannelAuth | undefined = () =>
+    undefined;
+  const giveawayCfg = settings.giveaway;
+  const giveawayEngine = giveawayCfg?.enabled
+    ? createGiveawayEngine({
+      config: giveawayCfg,
+      clientId: settings.twitch.eventsub?.clientId ?? "",
+      stateDir,
+      getChannelAuth: (login) => getChannelAuth(login),
+      getBroadcast: () => broadcastGiveaway,
+    })
+    : undefined;
+  if (giveawayEngine) await giveawayEngine.init();
+
+  // `keys`/`giveawayEngine` reference `emitter`/`broadcastGiveaway` only through
+  // deferred callbacks, so the forward reference to this destructure is fine.
+  const { emitter, broadcastGiveaway } = createServer(settings, {
     setYouTubeKey: (key) => keys.apply(key, true),
+    giveaway: giveawayEngine?.hooks,
   });
 
   const { twitch, youtube } = settings;
@@ -359,6 +685,12 @@ async function runServer(configPath: string): Promise<void> {
       twitch,
       emitter,
       covered.size ? (ch) => covered.has(ch.toLowerCase()) : undefined,
+      giveawayEngine
+        ? (m) =>
+          void giveawayEngine.onMessage(m).catch((e) =>
+            console.error(`[Giveaway] handler error: ${e}`)
+          )
+        : undefined,
     );
   } else {
     console.log("No Twitch channels configured.");
@@ -371,13 +703,17 @@ async function runServer(configPath: string): Promise<void> {
           "skipping EventSub (follows/cheers/subs/raids will not appear).",
       );
     } else {
-      createTwitchEventSubManager({
+      const mgr = createTwitchEventSubManager({
         getEmitter: () => emitter,
         config: twitch.eventsub,
         stateDir,
-      }).start();
+      });
+      getChannelAuth = mgr.getChannelAuth;
+      mgr.start();
     }
   }
+
+  if (giveawayEngine && giveawayCfg) warnGiveawaySetup(giveawayCfg, twitch);
 
   if (youtube.channels.length === 0) {
     console.log("No YouTube channels configured.");
@@ -410,8 +746,9 @@ function cliUsage(): string {
     "  multichat set-youtube-key [opts] [KEY]     set the YouTube API key on a running server",
     "  multichat login [opts]                     authorize a Twitch channel for EventSub alerts",
     "  multichat fake [kind] [opts]               inject fake events (all kinds, or just one) into a running server",
+    "  multichat giveaway [verb] [opts]           control the giveaway (status|open|close|draw|reset|demo|remove <userId>)",
     "",
-    "Options (set-youtube-key and fake share these):",
+    "Options (set-youtube-key, fake, and giveaway share these):",
     "  -p, --port <port>   server port   (default: $PORT or 8080)",
     "  -h, --host <host>   server host   (default: $HOST or 127.0.0.1)",
     "      --help          show this help",
@@ -435,6 +772,16 @@ function cliUsage(): string {
     "  multichat fake            # the whole showcase",
     "  multichat fake follow     # just a Twitch follow (e.g. to preview an alert theme)",
     "  kind is one of: chat, action, cheer, sub, raid, follow, superchat, supersticker, membership, system",
+    "",
+    "giveaway: control the running !enter giveaway (Twitch-only) from the terminal —",
+    "an alternative to the /giveaway page (a CS2-style case reel). Loopback-only, like fake.",
+    "  multichat giveaway status   # entrant count + open/closed",
+    "  multichat giveaway open     # start accepting entries",
+    "  multichat giveaway close    # stop accepting entries",
+    "  multichat giveaway draw     # pick + remove a winner (announced in chat if replies are on)",
+    "  multichat giveaway reset    # clear the pool",
+    "  multichat giveaway demo     # add sample entrants to preview the reel (no live stream needed)",
+    "  multichat giveaway remove <userId>   # drop one entrant",
   ].join("\n");
 }
 
@@ -609,6 +956,89 @@ async function runFake(args: string[]): Promise<void> {
   Deno.exit(0);
 }
 
+/**
+ * CLI client: drive the giveaway on a running server via its loopback
+ * /api/giveaway endpoint. Useful for drawing a winner from the terminal or in a
+ * script, without the /giveaway page. See docs/development/testing.md.
+ */
+async function runGiveaway(args: string[]): Promise<void> {
+  let host = Deno.env.get("HOST") ?? "127.0.0.1";
+  let port = Number(Deno.env.get("PORT") ?? "8080");
+  let action = "";
+  let userId = "";
+
+  const VERBS = ["status", "open", "close", "draw", "reset", "demo", "remove"];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--help") {
+      console.log(cliUsage());
+      Deno.exit(0);
+    } else if (a === "-p" || a === "--port") {
+      port = Number(args[++i]);
+    } else if (a === "-h" || a === "--host") {
+      host = args[++i] ?? host;
+    } else if (VERBS.includes(a)) {
+      action = a;
+    } else if (action === "remove" && !userId) {
+      userId = a; // the userId positional after `remove`
+    } else {
+      console.error(`Unknown argument: ${a}`);
+      console.error(`Usage: multichat giveaway [${VERBS.join("|")}] [userId]`);
+      Deno.exit(2);
+    }
+  }
+  if (!action) action = "status";
+  if (!Number.isFinite(port) || port <= 0) {
+    console.error("Invalid --port.");
+    Deno.exit(2);
+  }
+  if (action === "remove" && !userId) {
+    console.error("giveaway remove needs a userId (see `giveaway status`).");
+    Deno.exit(2);
+  }
+
+  const wire: GiveawayAction = action === "remove"
+    ? { action: "remove", userId }
+    : { action } as GiveawayAction;
+  const { res, text } = await postControl(
+    host,
+    port,
+    "/api/giveaway",
+    serializeGiveawayAction(wire),
+    "application/json",
+  );
+  if (!res.ok) {
+    console.error(`Failed (HTTP ${res.status}): ${text}`);
+    Deno.exit(1);
+  }
+  try {
+    const data = JSON.parse(text) as {
+      state?: GiveawayState;
+      winner?: { userId: string; login: string; displayName: string } | null;
+    };
+    if (data.winner) {
+      console.log(
+        `Winner: ${
+          data.winner.displayName || data.winner.login ||
+          data.winner.userId
+        }`,
+      );
+    } else if (action === "draw") {
+      console.log("No entrants to draw from.");
+    }
+    if (data.state) {
+      console.log(
+        `Pool: ${data.state.entrants.length} entrant(s), entries ${
+          data.state.open ? "OPEN" : "CLOSED"
+        }.`,
+      );
+    }
+  } catch {
+    console.log(text);
+  }
+  Deno.exit(0);
+}
+
 /** Read the Twitch app clientId/clientSecret from env, then settings.json. */
 async function loadEventSubCreds(
   settingsPath: string,
@@ -691,7 +1121,7 @@ async function runTwitchLogin(args: string[]): Promise<void> {
   const authUrl = buildAuthorizeUrl(
     clientId,
     redirectUri,
-    EVENTSUB_SCOPES,
+    LOGIN_SCOPES,
     state,
   );
 
@@ -815,6 +1245,8 @@ if (first === "set-youtube-key") {
   await runTwitchLogin(rest);
 } else if (first === "fake") {
   await runFake(rest);
+} else if (first === "giveaway") {
+  await runGiveaway(rest);
 } else if (first === "--help" || first === "-h") {
   console.log(cliUsage());
 } else {

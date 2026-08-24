@@ -101,23 +101,37 @@ waits for the key. The control endpoint is loopback-only (see
 
 ## Module options
 
-| Option                             | Type                                                    | Default                | Description                                                                |
-| ---------------------------------- | ------------------------------------------------------- | ---------------------- | -------------------------------------------------------------------------- |
-| `enable`                           | bool                                                    | `false`                | Enable the service                                                         |
-| `package`                          | package                                                 | built from `build.nix` | Override the multichat package                                             |
-| `port`                             | port                                                    | `8080`                 | Web interface port                                                         |
-| `host`                             | string                                                  | `"127.0.0.1"`          | Bind address — must be `"127.0.0.1"` or `"0.0.0.0"`                        |
-| `openFirewall`                     | bool                                                    | `false`                | Open `port` in the firewall                                                |
-| `twitch.channels`                  | `[string]`                                              | `[]`                   | Twitch channel names (chat, anonymous)                                     |
-| `twitch.eventsub.clientId`         | string                                                  | `""`                   | Twitch app Client ID for alerts (not secret)                               |
-| `twitch.eventsub.clientSecret`     | string                                                  | `""`                   | Client Secret inline (Nix store — prefer `clientSecretFile`)               |
-| `twitch.eventsub.clientSecretFile` | path                                                    | `null`                 | File with the raw Client Secret; staged via `LoadCredential`               |
-| `twitch.eventsub.channels`         | `[{login,broadcasterId,refreshToken,refreshTokenFile}]` | `[]`                   | Channels to alert on (from `multichat login`)                              |
-| `youtube.apiKey`                   | string                                                  | `""`                   | API key inline (stored in the Nix store — prefer `apiKeyFile`)             |
-| `youtube.apiKeyFile`               | path                                                    | `null`                 | Path to a file containing just the raw key; takes precedence over `apiKey` |
-| `youtube.channels`                 | `[{handle,channelId,videoId}]`                          | `[]`                   | YouTube channels                                                           |
-| `alerts.activeTheme`               | string                                                  | `""`                   | Name of the active `/alerts` theme (empty = default look)                  |
-| `alerts.themes`                    | `[{name,style,events,options}]`                         | `[]`                   | Named alert themes; `style` = `default` or `company-memo`                  |
+| Option                             | Type                                                    | Default                | Description                                                                                    |
+| ---------------------------------- | ------------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------------------------------- |
+| `enable`                           | bool                                                    | `false`                | Enable the service                                                                             |
+| `package`                          | package                                                 | built from `build.nix` | Override the multichat package                                                                 |
+| `port`                             | port                                                    | `8080`                 | Web interface port                                                                             |
+| `host`                             | string                                                  | `"127.0.0.1"`          | Bind address — must be `"127.0.0.1"` or `"0.0.0.0"`                                            |
+| `openFirewall`                     | bool                                                    | `false`                | Open `port` in the firewall                                                                    |
+| `twitch.channels`                  | `[string]`                                              | `[]`                   | Twitch channel names (chat, anonymous)                                                         |
+| `twitch.eventsub.clientId`         | string                                                  | `""`                   | Twitch app Client ID for alerts (not secret)                                                   |
+| `twitch.eventsub.clientSecret`     | string                                                  | `""`                   | Client Secret inline (Nix store — prefer `clientSecretFile`)                                   |
+| `twitch.eventsub.clientSecretFile` | path                                                    | `null`                 | File with the raw Client Secret; staged via `LoadCredential`                                   |
+| `twitch.eventsub.channels`         | `[{login,broadcasterId,refreshToken,refreshTokenFile}]` | `[]`                   | Channels to alert on (from `multichat login`)                                                  |
+| `youtube.apiKey`                   | string                                                  | `""`                   | API key inline (stored in the Nix store — prefer `apiKeyFile`)                                 |
+| `youtube.apiKeyFile`               | path                                                    | `null`                 | Path to a file containing just the raw key; takes precedence over `apiKey`                     |
+| `youtube.channels`                 | `[{handle,channelId,videoId}]`                          | `[]`                   | YouTube channels                                                                               |
+| `alerts.activeTheme`               | string                                                  | `""`                   | Name of the active `/alerts` theme (empty = default look)                                      |
+| `alerts.themes`                    | `[{name,style,events,options}]`                         | `[]`                   | Named alert themes; `style` = `default` or `company-memo`                                      |
+| `giveaway.enable`                  | bool                                                    | `false`                | Enable the Twitch `!enter` giveaway / prize draw (CS2-style case reel)                         |
+| `giveaway.channel`                 | string                                                  | `""`                   | Twitch channel (login) the giveaway runs on (in `twitch.channels`)                             |
+| `giveaway.prefix`                  | string                                                  | `"!"`                  | Command prefix                                                                                 |
+| `giveaway.command`                 | string                                                  | `"enter"`              | Command word (default gives `!enter`)                                                          |
+| `giveaway.requireFollow`           | bool                                                    | `true`                 | Gate entries on a live follow check (needs the channel in `twitch.eventsub`)                   |
+| `giveaway.replies`                 | bool                                                    | `true`                 | Reply in chat as the broadcaster (needs re-`login` — see below)                                |
+| `giveaway.messages`                | `attrs of string`                                       | `{}`                   | Optional reply templates (`entered`/`notFollowing`/`alreadyEntered`/`winner`), `{user}` = name |
+
+See [Giveaway mode](configuration.md#giveaway-mode) for the full behavior. Two
+gotchas the module warns about at build time: `giveaway.requireFollow` needs the
+channel authorized in `twitch.eventsub.channels` (the follow check uses its
+broadcaster token — otherwise entries fail closed), and `giveaway.replies`
+requires re-running `multichat login` so the token gains the new
+`user:write:chat` scope (tokens minted before this release don't carry it).
 
 ## Secrets management
 
@@ -200,7 +214,8 @@ The module **fails the build** (assertion) when:
 - `host` is anything other than `"127.0.0.1"` or `"0.0.0.0"`;
 - a `twitch.eventsub.channels` entry has no `login`;
 - a `twitch.eventsub.channels` entry sets `refreshTokenFile` without a
-  `broadcasterId` (needed to name the persisted token file).
+  `broadcasterId` (needed to name the persisted token file);
+- `giveaway.enable` is set without a `giveaway.channel`.
 
 It emits a build-time **warning** when the insecure inline `youtube.apiKey`,
 `twitch.eventsub.clientSecret`, or a channel's inline `refreshToken` is used;
@@ -208,8 +223,12 @@ when both `twitch.channels` and `youtube.channels` are empty (the viewer would
 show no chat); when `youtube.channels` is set but no build-time key is given (a
 reminder that the key can be supplied at runtime — not an error); when
 `twitch.eventsub.channels` is set but `clientId` is empty (alerts would be
-skipped); or when `alerts.activeTheme` names no theme in `alerts.themes` (the
-overlay falls back to the default look).
+skipped); when `alerts.activeTheme` names no theme in `alerts.themes` (the
+overlay falls back to the default look); when the `giveaway.channel` isn't in
+`twitch.channels` (its chat won't be joined); when `giveaway.requireFollow` is
+on but the channel isn't in `twitch.eventsub.channels` (follow checks can't
+run); or when `giveaway.replies` is on (a reminder to re-run `multichat login`
+for the `user:write:chat` scope).
 
 ## Security hardening
 

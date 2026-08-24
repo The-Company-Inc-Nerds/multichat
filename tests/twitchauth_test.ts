@@ -1,11 +1,16 @@
 import {
   buildAuthCodeRequest,
   buildAuthorizeUrl,
+  buildCheckFollowRequest,
   buildCreateSubscriptionRequest,
   buildRefreshRequest,
+  buildSendChatMessageRequest,
   buildUsersRequest,
+  CHAT_WRITE_SCOPE,
   EVENTSUB_SCOPES,
+  LOGIN_SCOPES,
   parseCreateSubscriptionResponse,
+  parseFollowersResponse,
   parseTokenResponse,
   parseUsersResponse,
   SUBSCRIPTIONS,
@@ -147,6 +152,60 @@ Deno.test("buildCreateSubscriptionRequest: websocket transport body", () => {
   assertEquals(body.version, "1");
   assertEquals(body.condition, { broadcaster_user_id: "42" });
   assertEquals(body.transport, { method: "websocket", session_id: "sess-1" });
+});
+
+Deno.test("LOGIN_SCOPES: EVENTSUB_SCOPES plus chat write, EVENTSUB_SCOPES unchanged", () => {
+  // The login flow must request the chat-write scope for giveaway replies…
+  assert(LOGIN_SCOPES.includes(CHAT_WRITE_SCOPE));
+  assertEquals(CHAT_WRITE_SCOPE, "user:write:chat");
+  // …on top of every EventSub scope…
+  for (const s of EVENTSUB_SCOPES) assert(LOGIN_SCOPES.includes(s));
+  // …but the EventSub scope set itself must stay exactly the subscription set
+  // (SUBSCRIPTIONS drives EventSub creation — user:write:chat is not one of them).
+  assert(!EVENTSUB_SCOPES.includes(CHAT_WRITE_SCOPE));
+});
+
+Deno.test("buildCheckFollowRequest: Get Channel Followers filtered by user_id", () => {
+  const req = buildCheckFollowRequest("42", "1001", "cid", "AT");
+  const u = new URL(req.url);
+  assertEquals(
+    u.origin + u.pathname,
+    "https://api.twitch.tv/helix/channels/followers",
+  );
+  assertEquals(u.searchParams.get("broadcaster_id"), "42");
+  assertEquals(u.searchParams.get("user_id"), "1001");
+  assertEquals(req.method, "GET");
+  assertEquals(req.headers["client-id"], "cid");
+  assertEquals(req.headers["authorization"], "Bearer AT");
+});
+
+Deno.test("parseFollowersResponse: non-empty data means following", () => {
+  assert(parseFollowersResponse({ data: [{ user_id: "1001" }], total: 5 }));
+  assert(!parseFollowersResponse({ data: [], total: 5 })); // filtered → empty = not following
+  assert(!parseFollowersResponse({}));
+  assert(!parseFollowersResponse(null));
+  assert(!parseFollowersResponse("nope"));
+});
+
+Deno.test("buildSendChatMessageRequest: Helix POST /chat/messages as sender", () => {
+  const req = buildSendChatMessageRequest(
+    "42",
+    "42",
+    "you're in!",
+    "cid",
+    "AT",
+  );
+  assertEquals(req.url, "https://api.twitch.tv/helix/chat/messages");
+  assertEquals(req.method, "POST");
+  assertEquals(req.headers["client-id"], "cid");
+  assertEquals(req.headers["authorization"], "Bearer AT");
+  assertEquals(req.headers["content-type"], "application/json");
+  const body = JSON.parse(req.body!);
+  assertEquals(body, {
+    broadcaster_id: "42",
+    sender_id: "42",
+    message: "you're in!",
+  });
 });
 
 Deno.test("parseCreateSubscriptionResponse: 202 ok, 403 scope failure, 401 refresh", () => {

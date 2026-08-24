@@ -4,16 +4,34 @@
 // main.ts; everything here is side-effect-free so the test suite can drive it
 // directly, matching the project's "logic in src/, wiring in main.ts" split.
 
+import type { GiveawayEntrant, GiveawayState } from "./types.ts";
+
 /** Result of an attempt to set the runtime YouTube key (returned to the CLI client). */
 export interface KeyUpdateResult {
   ok: boolean;
   message: string;
 }
 
+/** Operations the loopback POST /api/giveaway route dispatches to. Implemented by
+ *  the giveaway engine in main.ts; each mutating op returns the resulting state so
+ *  the CLI/page can render it. */
+export interface GiveawayHooks {
+  getState(): GiveawayState;
+  open(): GiveawayState;
+  close(): GiveawayState;
+  reset(): GiveawayState;
+  remove(userId: string): GiveawayState;
+  draw(): { state: GiveawayState; winner: GiveawayEntrant | null };
+  /** Inject a batch of sample entrants for previewing the reel (loopback demo). */
+  demo(): GiveawayState;
+}
+
 /** Hooks createServer calls back into. Kept optional so tests can omit them. */
 export interface ServerHooks {
   /** Invoked with a validated key when a loopback POST /api/youtube-key arrives. */
   setYouTubeKey?: (key: string) => Promise<KeyUpdateResult>;
+  /** Present when a giveaway is enabled; drives the loopback POST /api/giveaway. */
+  giveaway?: GiveawayHooks;
 }
 
 /**
@@ -108,4 +126,14 @@ export function twitchBroadcasterStatePath(
   return dir && login
     ? `${dir}/twitch-broadcaster-${login.toLowerCase()}`
     : null;
+}
+
+/** Where the giveaway entrant pool is persisted (JSON), so it survives a restart.
+ *  Returns null with no state dir (the pool is then in-memory only). Mirrors
+ *  keyStatePath. */
+export function giveawayPoolStatePath(
+  stateDir: string | null | undefined,
+): string | null {
+  const dir = (stateDir ?? "").replace(/\/+$/, "");
+  return dir ? `${dir}/giveaway-pool` : null;
 }

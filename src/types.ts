@@ -60,7 +60,8 @@ export type ServerEvent =
     messageId?: string;
     author?: string;
   }
-  | { type: "status"; data: ChannelStatus[] };
+  | { type: "status"; data: ChannelStatus[] }
+  | { type: "giveaway"; data: GiveawayState; draw?: GiveawayDraw };
 
 export interface DeleteEvent {
   platform: Platform;
@@ -168,9 +169,69 @@ export interface AlertsConfig {
   themes?: AlertTheme[];
 }
 
+// ---- Giveaway (prize draw) -----------------------------------------------
+
+/** One eligible entrant in the giveaway pool. Keyed by the stable Twitch
+ *  `userId` (numeric) so a display-name change or a repeat `!enter` can't add
+ *  someone twice. */
+export interface GiveawayEntrant {
+  userId: string;
+  login: string;
+  displayName: string;
+  enteredAt: number;
+}
+
+/** The live giveaway state pushed to the `/giveaway` page over SSE. */
+export interface GiveawayState {
+  /** Whether `!enter` is currently accepted. */
+  open: boolean;
+  entrants: GiveawayEntrant[];
+  /** The most recently drawn winner (kept so a reloaded page can show it). */
+  lastWinner?: GiveawayEntrant;
+}
+
+/** Attached to a `giveaway` SSE frame only when a draw just happened, so every
+ *  connected page (incl. the transparent OBS overlay) can play the case-opening
+ *  reel: `reel` is the pre-removal entrant list to animate over, landing on
+ *  `winner`. Absent on ordinary state updates (open/close/reset/entry). */
+export interface GiveawayDraw {
+  winner: GiveawayEntrant;
+  reel: GiveawayEntrant[];
+}
+
+/** Optional chat-reply templates. `{user}` is replaced with the entrant's display
+ *  name; an empty/omitted field falls back to a built-in default. */
+export interface GiveawayMessages {
+  entered?: string;
+  notFollowing?: string;
+  alreadyEntered?: string;
+  winner?: string;
+}
+
+/** Giveaway / prize-draw config (Twitch-only). Watch one channel's chat for
+ *  `${prefix}${command}` (e.g. "!enter"), optionally gate on a live Helix follow
+ *  check, collect eligible viewers, and draw a winner from the `/giveaway` page.
+ *  `replies` posts confirmation/denial/winner messages back to chat as the
+ *  broadcaster (needs the `user:write:chat` scope — re-run `multichat login`). */
+export interface GiveawayConfig {
+  enabled: boolean;
+  /** The single Twitch channel (login, lowercase) the giveaway runs on. */
+  channel: string;
+  /** Command prefix, e.g. "!". */
+  prefix: string;
+  /** Command word after the prefix, e.g. "enter". */
+  command: string;
+  /** Require the entrant to follow the channel (verified via Helix). */
+  requireFollow: boolean;
+  /** Post confirmation/denial/winner messages back to Twitch chat. */
+  replies: boolean;
+  messages?: GiveawayMessages;
+}
+
 export interface Settings {
   server: ServerConfig;
   twitch: TwitchConfig;
   youtube: YouTubeConfig;
   alerts?: AlertsConfig;
+  giveaway?: GiveawayConfig;
 }

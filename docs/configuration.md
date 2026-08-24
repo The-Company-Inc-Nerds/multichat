@@ -249,6 +249,73 @@ follow event); other shoutouts keep the default card.
 (`/alerts?theme=The%20Company,%20Inc`) to override `activeTheme` for that OBS
 source — handy for testing or running different looks on different sources.
 
+## Giveaway mode
+
+The optional `giveaway` block runs a **Twitch-only** prize draw: viewers type a
+command (e.g. `!enter`) in chat, the server verifies eligibility, collects the
+eligible viewers into a pool, and you draw a winner on the
+[`/giveaway`](api.md#giveaway-mode-giveaway) page — a **CS2-style case reel**
+that scrolls and lands on the winner (also available as a transparent OBS
+overlay, see below).
+
+```json
+"giveaway": {
+  "enabled": true,
+  "channel": "streamer1",
+  "prefix": "!",
+  "command": "enter",
+  "requireFollow": true,
+  "replies": true
+}
+```
+
+| Field           | Type   | Description                                                                                                                           |
+| --------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `enabled`       | bool   | Turn the giveaway on. Default off.                                                                                                    |
+| `channel`       | string | The single Twitch channel (login, lowercase) it runs on. Must be in `twitch.channels`; for `requireFollow` also in `twitch.eventsub`. |
+| `prefix`        | string | Command prefix. Default `"!"`.                                                                                                        |
+| `command`       | string | Command word after the prefix. Default `"enter"` (so viewers type `!enter`).                                                          |
+| `requireFollow` | bool   | Only admit viewers who follow the channel, checked live via Helix. Default on. See the note below.                                    |
+| `replies`       | bool   | Post confirmation/denial/winner messages back to chat as the broadcaster. Default on. See the note below.                             |
+| `messages`      | object | Optional reply templates (`entered`, `notFollowing`, `alreadyEntered`, `winner`); `{user}` is the display name. Unset = defaults.     |
+
+**Why Twitch-only.** YouTube's API has no way to verify whether a viewer is
+subscribed to a channel (subscriber lists are private and un-queryable), so a
+follow/sub-gated giveaway can't be built for YouTube. The giveaway watches one
+Twitch channel's chat.
+
+**`requireFollow` needs EventSub.** The follow check calls Helix with the
+channel's **broadcaster token** (the `moderator:read:followers` scope, already
+requested), so the channel must be authorized in
+[`twitch.eventsub`](#twitch-eventsub-alerts) via `multichat login`. If it isn't,
+follows can't be verified and entries **fail closed** (nobody is admitted). Set
+`requireFollow: false` to let anyone who types the command enter.
+
+**`replies` needs a re-authorization.** Sending chat as the broadcaster uses the
+`user:write:chat` scope, which is **new** — the `login` flow now requests it,
+but tokens minted before this release don't carry it. If replies are on, re-run
+`multichat login` for the giveaway channel so its token gains the scope;
+otherwise the follow gate and reel still work, but replies log a `401` and are
+skipped. Set `replies: false` to run silently (the `/giveaway` page still shows
+entries and the winner).
+
+**Running it.** Open `/giveaway` (the control view) on the same machine as the
+server — its buttons use the loopback [`/api/giveaway`](api.md#post-apigiveaway)
+endpoint. Or drive it from the terminal:
+`multichat giveaway status|open|close|draw|reset|demo|remove
+<userId>`. The
+entrant pool is persisted to the state directory, so it survives a restart.
+
+**On stream (OBS overlay).** Point an OBS browser source at `/giveaway?overlay`
+— a **transparent** version that shows only the reel, stays blank between draws,
+and auto-hides shortly after the winner lands. When you draw (from the control
+view or the CLI), the overlay plays the reveal for your audience, so you never
+have to share the operator screen.
+
+**Previewing it.** No live stream? Click **Demo** on the `/giveaway` page (or
+run `multichat giveaway demo`) to inject a batch of sample entrants, then draw —
+handy for testing the reel before going live. `Reset` clears them.
+
 ## Environment variable overrides
 
 These override their `settings.json` counterparts at startup:

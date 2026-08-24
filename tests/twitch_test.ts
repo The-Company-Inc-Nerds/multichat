@@ -5,6 +5,7 @@ import {
   parseEmoteTag,
   parseIRC,
   parseTags,
+  type TwitchChatMessage,
   unescapeTag,
 } from "../src/twitch.ts";
 import { fakeEmitter } from "./_fake.ts";
@@ -36,6 +37,34 @@ Deno.test("parseIRC extracts tags, prefix, command, params", () => {
   assertEquals(msg.tags["display-name"], "Foo");
   assertEquals(msg.params[0], "#chan");
   assertEquals(msg.params[1], "hello world");
+});
+
+Deno.test("handleCommand: PRIVMSG invokes onMessage with raw identity", () => {
+  const line =
+    "@display-name=Ann;user-id=1001;badges=subscriber/3 :ann!ann@ann.tmi.twitch.tv PRIVMSG #chan :!enter please";
+  const msg = parseIRC(line);
+  assertExists(msg);
+  const em = fakeEmitter();
+  const seen: TwitchChatMessage[] = [];
+  handleCommand(msg, em, undefined, (m) => seen.push(m));
+  assertEquals(seen.length, 1);
+  const got = seen[0];
+  assertEquals(got.channel, "chan");
+  assertEquals(got.userId, "1001");
+  assertEquals(got.login, "ann");
+  assertEquals(got.displayName, "Ann");
+  assertEquals(got.text, "!enter please");
+  assertEquals(got.badges.map((b) => b.id), ["subscriber"]);
+  // The message still renders through the normal emitter path.
+  assertEquals(em.captured.messages.length, 1);
+});
+
+Deno.test("handleCommand: PRIVMSG without onMessage is a no-op (back-compat)", () => {
+  const msg = parseIRC(":ann!ann@ann.tmi.twitch.tv PRIVMSG #chan :hi");
+  assertExists(msg);
+  const em = fakeEmitter();
+  handleCommand(msg, em); // no onMessage arg — must not throw
+  assertEquals(em.captured.messages.length, 1);
 });
 
 Deno.test("parseBadges maps known ids to friendly labels", () => {

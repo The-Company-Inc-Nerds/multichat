@@ -2,20 +2,22 @@
 
 multichat serves a single page and a Server-Sent Events stream. The viewer
 surface is read-only and unauthenticated — meant to run on a trusted network —
-plus two loopback-only control endpoints: setting the YouTube API key, and
-injecting fake events for previewing how they render.
+plus loopback-only control endpoints: setting the YouTube API key, injecting
+fake events for previewing how they render, and driving the giveaway.
 
 ## Endpoints
 
-| Method | Path                    | Response            | Description                                                          |
-| ------ | ----------------------- | ------------------- | -------------------------------------------------------------------- |
-| `GET`  | `/` (and `/index.html`) | `text/html`         | The viewer page (HTML/CSS/JS embedded in the binary)                 |
-| `GET`  | `/overlay`              | `text/html`         | Same page in OBS overlay mode (see below)                            |
-| `GET`  | `/alerts`               | `text/html`         | Same page in OBS alerts mode — animated shoutout pop-ups (see below) |
-| `GET`  | `/events`               | `text/event-stream` | The live SSE feed of chat events                                     |
-| `POST` | `/api/youtube-key`      | `text/plain`        | Set the YouTube API key (loopback-only — see below)                  |
-| `POST` | `/api/fake`             | `text/plain`        | Inject a fake chat event for previewing (loopback-only — see below)  |
-| any    | anything else           | `404`               | Not found                                                            |
+| Method | Path                    | Response            | Description                                                                            |
+| ------ | ----------------------- | ------------------- | -------------------------------------------------------------------------------------- |
+| `GET`  | `/` (and `/index.html`) | `text/html`         | The viewer page (HTML/CSS/JS embedded in the binary)                                   |
+| `GET`  | `/overlay`              | `text/html`         | Same page in OBS overlay mode (see below)                                              |
+| `GET`  | `/alerts`               | `text/html`         | Same page in OBS alerts mode — animated shoutout pop-ups (see below)                   |
+| `GET`  | `/giveaway`             | `text/html`         | Giveaway picker — CS2-style case reel; `?overlay` = transparent OBS source (see below) |
+| `GET`  | `/events`               | `text/event-stream` | The live SSE feed of chat events                                                       |
+| `POST` | `/api/youtube-key`      | `text/plain`        | Set the YouTube API key (loopback-only — see below)                                    |
+| `POST` | `/api/fake`             | `text/plain`        | Inject a fake chat event for previewing (loopback-only — see below)                    |
+| `POST` | `/api/giveaway`         | `application/json`  | Drive the giveaway: open/close/draw/reset/remove (loopback-only)                       |
+| any    | anything else           | `404`               | Not found                                                                              |
 
 The viewer page also takes `?overlay` and `?alerts` query params (`/?overlay` is
 equivalent to `/overlay`, `/?alerts` to `/alerts`), plus `?direction=up|down`
@@ -58,6 +60,38 @@ The alerts overlay renders the configured **alert theme** (from
 [Alert themes](configuration.md#alert-themes)); a `?theme=NAME` query param
 overrides the active theme for that source
 (`/alerts?theme=The%20Company,%20Inc`).
+
+## Giveaway mode (`/giveaway`)
+
+The picker for the Twitch-only `!enter` giveaway. The reveal is a **CS2-style
+case reel**: entrant cards scroll past and ease to a stop with the winner
+centered under a ticker. It reads the same `/events` SSE feed (acting only on
+the `giveaway` frame — the public pages ignore it) and drives the loopback
+`POST /api/giveaway` control endpoint from its buttons.
+
+Two views of the same page, chosen by a query param:
+
+- **Control view** (`/giveaway`) — dark background, the reel, the operator
+  buttons (Draw winner / Open / Close / Reset / Demo) and the entrant list.
+  Because the control endpoint is loopback-only, open this on the **same
+  machine** as the server. `multichat giveaway` is the CLI equivalent of the
+  buttons.
+- **Overlay** (`/giveaway?overlay`) — **transparent** background, no controls,
+  just the reel; it stays blank between draws and auto-hides a few seconds after
+  the winner lands. Point an OBS browser source at it. It plays the reel
+  whenever a draw happens (triggered from the control view or the CLI), so your
+  audience sees the reveal without you sharing the operator screen.
+
+The draw is **server-authoritative**: the server picks the winner and removes
+them from the pool, then broadcasts the winner plus the entrant list to animate
+over — so every open page (control view and overlay) plays the _same_ reel and
+lands on the _same_ winner, and a reload can't re-draw. See
+[Giveaway mode](configuration.md#giveaway-mode) for setup.
+
+To try it without a live stream, click **Demo** (or run
+`multichat giveaway
+demo`) to inject sample entrants, then draw. `Reset` clears
+them.
 
 `/events` returns `503` once 50 concurrent streams are open (a flood guard,
 since the viewer is unauthenticated). The browser's `EventSource` retries
@@ -108,6 +142,36 @@ than called directly.
 | `400`  | Body was not valid JSON, or a field was missing/invalid    |
 | `403`  | Request did not originate from loopback                    |
 | `405`  | Method was not `POST`                                      |
+
+## `POST /api/giveaway`
+
+Drives the giveaway on the running server. Backs the `/giveaway` page's buttons
+and the `multichat giveaway` CLI verb; only present when a giveaway is enabled
+in settings.
+
+- **Loopback-only.** Same guard as the endpoints above — a non-loopback peer
+  gets `403`.
+- **Body.** A JSON object `{ "action": … }`, one of `open`, `close`, `draw`,
+  `reset`, `status`, `demo` (inject sample entrants to preview the reel), or
+  `{"action":"remove","userId":"<id>"}`.
+- **Response.** JSON `{ "state": GiveawayState }` (or `501` if no giveaway is
+  configured). `draw` also carries the picked entrant as `winner` (or `null`
+  when the pool is empty). `GiveawayState` is
+  `{ open, entrants: [{userId, login,
+  displayName, enteredAt}], lastWinner? }`.
+
+Mutating actions broadcast the new pool to every connected page as a `giveaway`
+SSE frame. Entries themselves are **not** an action here — they come from
+viewers typing the command in chat (see
+[Giveaway mode](configuration.md#giveaway-mode)).
+
+| Status | Meaning                                                    |
+| ------ | ---------------------------------------------------------- |
+| `200`  | Applied; JSON body carries the resulting state (+ winner)  |
+| `400`  | Body was not valid JSON, or the action was unknown/invalid |
+| `403`  | Request did not originate from loopback                    |
+| `405`  | Method was not `POST`                                      |
+| `501`  | No giveaway is enabled in settings                         |
 
 ## The SSE stream
 
@@ -160,6 +224,45 @@ changes).
 ```
 
 `state` is one of `connecting`, `live`, `offline`, `error`.
+
+### `giveaway`
+
+The current giveaway pool (sent to the `/giveaway` page on connect and whenever
+it changes). Only emitted when a giveaway is enabled; other pages ignore it.
+
+```json
+{
+  "type": "giveaway",
+  "data": {
+    "open": true,
+    "entrants": [
+      { "userId": "1001", "login": "ann", "displayName": "Ann", "enteredAt": 0 }
+    ]
+  }
+}
+```
+
+On a **draw**, the frame additionally carries a `draw` object — the just-picked
+`winner` plus `reel` (the pre-removal entrant list) — so every page plays the
+case reel and lands on the same winner. `data` is the post-removal pool; the
+snapshot replayed on connect never includes `draw`, so a fresh page doesn't
+replay an old animation.
+
+```json
+{
+  "type": "giveaway",
+  "data": { "open": false, "entrants": [/* winner removed */] },
+  "draw": {
+    "winner": {
+      "userId": "1001",
+      "login": "ann",
+      "displayName": "Ann",
+      "enteredAt": 0
+    },
+    "reel": [/* the entrants as they were, for the animation */]
+  }
+}
+```
 
 ## `ChatMessage` shape
 

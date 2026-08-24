@@ -86,6 +86,32 @@ through the very same `Emitter` a real message takes — so what you see is
 exactly what a real event would look like. The sequence and validation live in
 `src/fake.ts`.
 
+## Exercising the giveaway reel
+
+With a giveaway enabled in `settings.json` (see
+[Giveaway mode](../configuration.md#giveaway-mode)), open `/giveaway` on the
+same machine as the server and drive it from the terminal instead of waiting for
+real `!enter` chatter:
+
+```bash
+multichat giveaway demo         # inject sample entrants so the reel has something to spin
+multichat giveaway status       # entrant count + open/closed
+multichat giveaway open         # accept entries
+multichat giveaway draw         # pick + remove a winner (announced in chat if replies are on)
+multichat giveaway reset        # clear the pool
+```
+
+The quickest way to see the reveal is the **Demo** button on the `/giveaway`
+page (or `multichat giveaway demo`), then **Draw winner** — the CS2-style case
+reel plays with no live stream needed. Open `/giveaway?overlay` in another tab
+to watch the same reel on the transparent OBS overlay. Real entries only arrive
+from a viewer typing the command in the configured channel's Twitch chat (the
+eligibility follow check needs the channel authorized in `twitch.eventsub`), so
+end-to-end testing of the _entry_ path wants a live channel. The reel, draw,
+removal, open/close and persistence, though, are all exercisable with the CLI
+(or the page's buttons) against any running server. The pure
+pool/command/eligibility logic is covered in `tests/giveaway_test.ts`.
+
 ## Commit workflow
 
 Commits are GPG-signed via the `gcommit` helper:

@@ -18,5 +18,13 @@
   "alerts": {
     "activeTheme": "",
     "themes": []
+  },
+  "giveaway": {
+    "enabled": false,
+    "channel": "",
+    "prefix": "!",
+    "command": "enter",
+    "requireFollow": true,
+    "replies": true
   }
 }
