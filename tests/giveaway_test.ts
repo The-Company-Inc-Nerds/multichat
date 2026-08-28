@@ -1,7 +1,9 @@
 import {
   addEntrant,
+  buildDrawPlan,
   campaignSummary,
   closePool,
+  consumePlan,
   decideEligibility,
   DEFAULT_MESSAGES,
   demoEntrants,
@@ -15,8 +17,11 @@ import {
   giveawayMessage,
   hasEntrant,
   matchGiveawayCommand,
+  mulberry32,
+  nextPlannedUserId,
   normalizeCampaignState,
   normalizeGiveawayConfig,
+  normalizePlan,
   normalizePoolState,
   openPool,
   parseGiveawayAction,
@@ -24,7 +29,9 @@ import {
   recordFollower,
   removeEntrant,
   resetPool,
+  seededShuffle,
   serializeGiveawayAction,
+  serializePlan,
   serializeWinnerLine,
   winnersToCsv,
   winnerTier,
@@ -49,6 +56,7 @@ const baseConfig = (over: Partial<GiveawayConfig> = {}): GiveawayConfig => ({
   firstN: 0,
   followerStep: 0,
   milestoneDraws: 1,
+  timezone: "America/Denver",
   ...over,
 });
 
@@ -106,6 +114,47 @@ Deno.test("normalizeGiveawayConfig: campaign knobs coerce garbage/negatives", ()
   assertEquals(c.followerStep, 0);
   assertEquals(c.milestoneDraws, 1);
   assertEquals(normalizeGiveawayConfig({ firstN: 12.9 }).firstN, 12); // floored
+});
+
+Deno.test("normalizeGiveawayConfig: terms + disposition sub-configs", () => {
+  // Absent unless a block is supplied.
+  const bare = normalizeGiveawayConfig({ enabled: true });
+  assertEquals(bare.terms, undefined);
+  assertEquals(bare.disposition, undefined);
+
+  const c = normalizeGiveawayConfig({
+    terms: { url: "https://x.test/terms", version: 2, command: "Agree" },
+    disposition: { destroy: "RIP" },
+  });
+  // required defaults on when the block is present; command lowercased; version stringified.
+  assertEquals(c.terms, {
+    required: true,
+    command: "agree",
+    version: "2",
+    url: "https://x.test/terms",
+  });
+  assertEquals(c.disposition, {
+    enabled: true,
+    mail: "mail",
+    donate: "donate",
+    destroy: "rip",
+    pass: "pass",
+  });
+
+  // Explicit opt-outs honored.
+  const off = normalizeGiveawayConfig({
+    terms: { required: false },
+    disposition: { enabled: false },
+  });
+  assertEquals(off.terms?.required, false);
+  assertEquals(off.terms?.command, "accept"); // default word, default version "1"
+  assertEquals(off.terms?.version, "1");
+  assertEquals(off.disposition?.enabled, false);
+
+  // New reply keys have defaults.
+  assert(DEFAULT_MESSAGES.termsRequired.includes("{accept}"));
+  assert(DEFAULT_MESSAGES.passed.includes("{next}"));
+  assert(DEFAULT_MESSAGES.mailed.includes("{cards}"));
 });
 
 Deno.test("matchGiveawayCommand: whole-token, case-insensitive", () => {
@@ -228,6 +277,109 @@ Deno.test("drawSegmented: guaranteed queue first, then the pool", () => {
   assertEquals(empty.reel, []);
 });
 
+Deno.test("drawSegmented: forcedUserId wins when in segment, else random", () => {
+  let pool = emptyPool(true);
+  for (const id of ["a", "b", "c"]) pool = addEntrant(pool, entrant(id)).state;
+  // No firstN: everyone's in the pool → the forced user wins, reel is all.
+  const forced = drawSegmented(pool, 0, () => 0, "c");
+  assertEquals(forced.winner?.userId, "c");
+  assertEquals(forced.reel.map((e) => e.userId), ["a", "b", "c"]);
+
+  // With a guaranteed queue, forcing a pool user (out of segment) is ignored —
+  // the draw falls back to random within the guaranteed segment (rnd=0 → "a").
+  const outOfSeg = drawSegmented(pool, 2, () => 0, "c"); // c is #3 (pool)
+  assertEquals(outOfSeg.segment, "guaranteed");
+  assertEquals(outOfSeg.winner?.userId, "a");
+});
+
+Deno.test("mulberry32 / seededShuffle: deterministic, a permutation", () => {
+  // Same seed → identical stream; different seed → different (extremely likely).
+  const a = mulberry32(123);
+  const b = mulberry32(123);
+  assertEquals([a(), a(), a()], [b(), b(), b()]);
+
+  const items = [1, 2, 3, 4, 5, 6, 7, 8];
+  const s1 = seededShuffle(items, 42);
+  assertEquals(s1, seededShuffle(items, 42)); // reproducible
+  assert(JSON.stringify(s1) !== JSON.stringify(items)); // actually shuffled
+  assertEquals([...s1].sort((x, y) => x - y), items); // same multiset
+  assert(
+    JSON.stringify(seededShuffle(items, 42)) !==
+      JSON.stringify(seededShuffle(items, 99)),
+  );
+});
+
+Deno.test("buildDrawPlan: guaranteed-first, deterministic, sliced to count", () => {
+  let pool = emptyPool(true);
+  for (const id of ["a", "b", "c", "d", "e"]) {
+    pool = addEntrant(pool, entrant(id)).state; // numbers 1..5
+  }
+  const firstN = 3; // #1..3 guaranteed, #4..5 pool
+  const plan = buildDrawPlan(pool.entrants, firstN, 7, 0); // 0 = all
+  assertEquals(plan.length, 5);
+  // First three are the guaranteed queue (shuffled), last two the pool.
+  assert(plan.slice(0, 3).every((p) => p.number <= 3));
+  assert(plan.slice(3).every((p) => p.number > 3));
+  // Reproducible; count slices from the front.
+  assertEquals(buildDrawPlan(pool.entrants, firstN, 7, 0), plan);
+  assertEquals(
+    buildDrawPlan(pool.entrants, firstN, 7, 2).map((p) => p.userId),
+    plan.slice(0, 2).map((p) => p.userId),
+  );
+
+  // firstN=0: one shuffled order over everyone.
+  const flat = buildDrawPlan(pool.entrants, 0, 7, 0);
+  assertEquals(flat.length, 5);
+  assertEquals([...flat.map((p) => p.number)].sort((x, y) => x - y), [
+    1,
+    2,
+    3,
+    4,
+    5,
+  ]);
+});
+
+Deno.test("nextPlannedUserId / consumePlan: skip absent, consume in order", () => {
+  let pool = emptyPool(true);
+  for (const id of ["a", "b", "c"]) pool = addEntrant(pool, entrant(id)).state;
+  const plan = {
+    seed: 1,
+    createdAt: 0,
+    order: buildDrawPlan(pool.entrants, 0, 1, 0),
+  };
+  const first = nextPlannedUserId(plan, pool);
+  assert(["a", "b", "c"].includes(first!));
+
+  // If the next planned user has left the pool, skip to the next present one.
+  const without = removeEntrant(pool, first!);
+  const consumed = consumePlan(plan, first!);
+  const second = nextPlannedUserId(consumed, without);
+  assert(second !== first);
+
+  assertEquals(nextPlannedUserId(null, pool), undefined);
+  // Consuming everyone drains the plan.
+  let p = plan;
+  for (const e of plan.order) p = consumePlan(p, e.userId)!;
+  assertEquals(p.order.length, 0);
+  assertEquals(nextPlannedUserId(p, pool), undefined);
+});
+
+Deno.test("normalizePlan: validates, drops empties, round-trips", () => {
+  let pool = emptyPool(true);
+  for (const id of ["a", "b"]) pool = addEntrant(pool, entrant(id)).state;
+  const plan = {
+    seed: 99,
+    createdAt: 5,
+    order: buildDrawPlan(pool.entrants, 0, 99, 0),
+  };
+  const round = normalizePlan(JSON.parse(serializePlan(plan)));
+  assertEquals(round?.seed, 99);
+  assertEquals(round?.order.length, 2);
+  assertEquals(normalizePlan({ seed: 1, order: [] }), null); // empty → null
+  assertEquals(normalizePlan("nope"), null);
+  assertEquals(normalizePlan(null), null);
+});
+
 Deno.test("drawSegmented: firstN=0 behaves like drawWinner over everyone", () => {
   let pool = emptyPool(true);
   for (const id of ["a", "b"]) pool = addEntrant(pool, entrant(id)).state;
@@ -284,7 +436,10 @@ Deno.test("recordFollower: a lowered step arms multiple milestones at once", () 
   for (const id of ["a", "b", "c", "d", "e"]) {
     c = recordFollower(c, id, wide).campaign;
   }
-  const narrowed = recordFollower(c, "f", { followerStep: 2, milestoneDraws: 1 });
+  const narrowed = recordFollower(c, "f", {
+    followerStep: 2,
+    milestoneDraws: 1,
+  });
   assertEquals(narrowed.campaign.milestonesReached, 3);
   assertEquals(narrowed.campaign.creditsRemaining, 3);
   assertEquals(narrowed.milestoneCrossed, 3);
@@ -313,7 +468,11 @@ Deno.test("campaignSummary: queue/pool split, counts, recent winners", () => {
     wonAt: i,
     tier: "guaranteed",
   }));
-  const campaign = { ...emptyCampaign(), followerCount: 7, creditsRemaining: 3 };
+  const campaign = {
+    ...emptyCampaign(),
+    followerCount: 7,
+    creditsRemaining: 3,
+  };
   const s = campaignSummary(pool, campaign, { firstN: 2 }, winners, true);
   assertEquals(s.guaranteedRemaining, 2); // #1,#2
   assertEquals(s.poolSize, 2); // #3,#4
@@ -369,7 +528,10 @@ Deno.test("giveawayMessage: vars substitution, 3-arg back-compat, new keys", () 
     "#42 of 500, Ann!",
   );
   // Placeholders with no var pass through untouched; 3-arg calls still work.
-  assertEquals(giveawayMessage(cfg, "entered", "Ann"), "#{number} of {goal}, Ann!");
+  assertEquals(
+    giveawayMessage(cfg, "entered", "Ann"),
+    "#{number} of {goal}, Ann!",
+  );
   // The new keys have defaults.
   assert(DEFAULT_MESSAGES.enteredPool.includes("{user}"));
   assert(DEFAULT_MESSAGES.milestone.includes("{draws}"));
@@ -422,6 +584,27 @@ Deno.test("parseGiveawayAction: valid actions, remove userId, rejects junk", () 
     assertEquals(rem.action.userId, "42");
   }
 
+  // The newer simple actions parse too.
+  for (const action of ["packs", "turns", "report", "plan-clear"]) {
+    assert(parseGiveawayAction(JSON.stringify({ action })).ok);
+  }
+
+  // `plan` carries a count + reseed flag (count defaults to 0 = "show current").
+  const plan = parseGiveawayAction(
+    '{"action":"plan","count":30,"reseed":true}',
+  );
+  assert(plan.ok);
+  if (plan.ok && plan.action.action === "plan") {
+    assertEquals(plan.action.count, 30);
+    assertEquals(plan.action.reseed, true);
+  }
+  const planBare = parseGiveawayAction('{"action":"plan"}');
+  assert(planBare.ok);
+  if (planBare.ok && planBare.action.action === "plan") {
+    assertEquals(planBare.action.count, 0);
+    assertEquals(planBare.action.reseed, false);
+  }
+
   assert(!parseGiveawayAction('{"action":"remove"}').ok); // missing userId
   assert(!parseGiveawayAction('{"action":"bogus"}').ok);
   assert(!parseGiveawayAction("not json").ok);
@@ -447,7 +630,13 @@ Deno.test("normalizePoolState: validates, drops bad entrants, defaults open", ()
     open: false,
     nextNumber: 7,
     entrants: [
-      { userId: "1", login: "ann", displayName: "Ann", enteredAt: 5, number: 3 },
+      {
+        userId: "1",
+        login: "ann",
+        displayName: "Ann",
+        enteredAt: 5,
+        number: 3,
+      },
       { login: "no-id" }, // dropped (no userId)
     ],
     lastWinner: {
@@ -462,7 +651,13 @@ Deno.test("normalizePoolState: validates, drops bad entrants, defaults open", ()
   assertEquals(good, {
     open: false,
     entrants: [
-      { userId: "1", login: "ann", displayName: "Ann", enteredAt: 5, number: 3 },
+      {
+        userId: "1",
+        login: "ann",
+        displayName: "Ann",
+        enteredAt: 5,
+        number: 3,
+      },
     ],
     nextNumber: 7,
     lastWinner: {
@@ -553,7 +748,10 @@ Deno.test("winners log: JSONL round-trip, corrupt lines skipped, CSV quoting", (
   const csv = winnersToCsv(parsed);
   const lines = csv.trimEnd().split("\n");
   assertEquals(lines.length, 3); // header + 2 rows
-  assertEquals(lines[0], "number,displayName,login,userId,tier,enteredAt,wonAt");
+  assertEquals(
+    lines[0],
+    "number,displayName,login,userId,tier,enteredAt,wonAt",
+  );
   // Comma+quote display name is RFC-4180 quoted with doubled quotes.
   assert(lines[1].includes('"Ann ""The Ace"", PhD"'));
   assert(lines[1].includes("2023-")); // ISO timestamp

@@ -11,9 +11,13 @@ import type {
   GiveawayCampaignState,
   GiveawayCampaignSummary,
   GiveawayConfig,
+  GiveawayDispositionConfig,
   GiveawayEntrant,
   GiveawayMessages,
+  GiveawayPlan,
+  GiveawayPlanEntry,
   GiveawayState,
+  GiveawayTermsConfig,
   GiveawayWinner,
 } from "./types.ts";
 
@@ -38,6 +42,14 @@ export const DEFAULT_MESSAGES: Required<GiveawayMessages> = {
   enteredPool:
     "@{user} you're in the bonus pool — entry #{number}. Winners are drawn at each follower milestone!",
   milestone: "🎉 {count} new followers! {draws} bonus giveaway draws unlocked!",
+  termsRequired:
+    "@{user} please accept the giveaway terms first — type {accept} ({terms}) then enter.",
+  termsAccepted:
+    "@{user} thanks — terms accepted. Type {enter} to join the giveaway!",
+  mailed: "📬 @{user} — noted for mailing ({cards} card(s), ${value}).",
+  donated: "🎁 @{user} — donating to the shop ({cards} card(s), ${value}).",
+  destroyed: "💥 @{user} — ripping it live! ({cards} card(s), ${value}).",
+  passed: "🔀 @{user} passed the cards on to @{next}!",
 };
 
 const MESSAGE_KEYS: readonly (keyof GiveawayMessages)[] = [
@@ -47,6 +59,12 @@ const MESSAGE_KEYS: readonly (keyof GiveawayMessages)[] = [
   "winner",
   "enteredPool",
   "milestone",
+  "termsRequired",
+  "termsAccepted",
+  "mailed",
+  "donated",
+  "destroyed",
+  "passed",
 ];
 
 function normalizeMessages(x: unknown): GiveawayMessages | undefined {
@@ -63,6 +81,71 @@ function normalizeMessages(x: unknown): GiveawayMessages | undefined {
 function nonneg(x: unknown, fallback: number): number {
   const n = Math.floor(Number(x));
   return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
+function trimmed(x: unknown, fallback: string): string {
+  return typeof x === "string" && x.trim() ? x.trim() : fallback;
+}
+
+/** Default report timezone: Mountain Time (DST-aware). */
+export const DEFAULT_TIMEZONE = "America/Denver";
+
+/** Accept a usable IANA timezone, else fall back. Validated by trying to build a
+ *  formatter (throws on an unknown zone). */
+export function validTimezone(x: unknown, fallback: string): string {
+  if (typeof x !== "string" || !x.trim()) return fallback;
+  const tz = x.trim();
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: tz });
+    return tz;
+  } catch {
+    return fallback;
+  }
+}
+
+export const DEFAULT_ACCEPT_COMMAND = "accept";
+export const DEFAULT_DISPOSITION_WORDS = {
+  mail: "mail",
+  donate: "donate",
+  destroy: "destroy",
+  pass: "pass",
+} as const;
+
+/** Validate the optional terms gate. Returns undefined (no gate) unless a truthy
+ *  object is supplied; `required` still defaults on when the block is present but
+ *  omits it (a terms block you bothered to add is meant to gate). */
+export function normalizeTermsConfig(
+  raw: unknown,
+): GiveawayTermsConfig | undefined {
+  if (!isObj(raw)) return undefined;
+  // version may be written as a string or a number in settings.json.
+  const version =
+    (typeof raw.version === "string" || typeof raw.version === "number") &&
+      String(raw.version).trim()
+      ? String(raw.version).trim()
+      : "1";
+  return {
+    required: raw.required !== false,
+    command: trimmed(raw.command, DEFAULT_ACCEPT_COMMAND).toLowerCase(),
+    version,
+    url: typeof raw.url === "string" ? raw.url.trim() : "",
+  };
+}
+
+/** Validate the optional winner-turn disposition commands. Undefined unless a
+ *  block is supplied; `enabled` defaults on when present. */
+export function normalizeDispositionConfig(
+  raw: unknown,
+): GiveawayDispositionConfig | undefined {
+  if (!isObj(raw)) return undefined;
+  return {
+    enabled: raw.enabled !== false,
+    mail: trimmed(raw.mail, DEFAULT_DISPOSITION_WORDS.mail).toLowerCase(),
+    donate: trimmed(raw.donate, DEFAULT_DISPOSITION_WORDS.donate).toLowerCase(),
+    destroy: trimmed(raw.destroy, DEFAULT_DISPOSITION_WORDS.destroy)
+      .toLowerCase(),
+    pass: trimmed(raw.pass, DEFAULT_DISPOSITION_WORDS.pass).toLowerCase(),
+  };
 }
 
 /**
@@ -93,7 +176,12 @@ export function normalizeGiveawayConfig(raw: unknown): GiveawayConfig {
     firstN: nonneg(o.firstN, 0),
     followerStep: nonneg(o.followerStep, 0),
     milestoneDraws: Math.max(1, nonneg(o.milestoneDraws, 1)),
+    timezone: validTimezone(o.timezone, DEFAULT_TIMEZONE),
   };
+  const terms = normalizeTermsConfig(o.terms);
+  if (terms) config.terms = terms;
+  const disposition = normalizeDispositionConfig(o.disposition);
+  if (disposition) config.disposition = disposition;
   const messages = normalizeMessages(o.messages);
   if (messages) config.messages = messages;
   return config;
@@ -206,6 +294,7 @@ export function drawSegmented(
   state: GiveawayState,
   firstN: number,
   rnd: () => number = Math.random,
+  forcedUserId?: string,
 ): {
   state: GiveawayState;
   winner: GiveawayEntrant | null;
@@ -223,11 +312,18 @@ export function drawSegmented(
     : firstN > 0
     ? state.entrants.filter((e) => e.number > firstN)
     : state.entrants;
-  if (candidates.length === 0) return { state, winner: null, segment, reel: [] };
-  const idx = Math.min(
-    Math.floor(rnd() * candidates.length),
-    candidates.length - 1,
-  );
+  if (candidates.length === 0) {
+    return { state, winner: null, segment, reel: [] };
+  }
+  // A committed plan can force who wins — but only if they're in the current
+  // segment (the guaranteed queue drains first). Otherwise pick randomly. The
+  // reel is the whole segment either way, so a planned draw still looks random.
+  const forcedIdx = forcedUserId
+    ? candidates.findIndex((e) => e.userId === forcedUserId)
+    : -1;
+  const idx = forcedIdx >= 0
+    ? forcedIdx
+    : Math.min(Math.floor(rnd() * candidates.length), candidates.length - 1);
   const winner = candidates[idx];
   return {
     state: {
@@ -253,6 +349,123 @@ export function closePool(state: GiveawayState): GiveawayState {
  *  AND the entry-number counter — numbers are permanent, never reused. */
 export function resetPool(state: GiveawayState): GiveawayState {
   return { open: state.open, entrants: [], nextNumber: state.nextNumber };
+}
+
+// ---- Seeded draw plan (the "pick the next N" pre-commit) ------------------
+
+/** A small deterministic PRNG (mulberry32) so a seed reproduces a shuffle. */
+export function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0;
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** Deterministic Fisher-Yates shuffle (a copy) driven by `seed`. */
+export function seededShuffle<T>(items: readonly T[], seed: number): T[] {
+  const out = items.slice();
+  const rnd = mulberry32(seed);
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(rnd() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+}
+
+/**
+ * Build a committed draw order: the next winners in the order they'll be drawn,
+ * for off-stream prep. Respects segmentation — the guaranteed queue (number ≤
+ * firstN) is shuffled and drained first, then the pool — so the plan matches how
+ * draws actually run. Deterministic given `seed`; sliced to `count` (0 = all).
+ */
+export function buildDrawPlan(
+  entrants: readonly GiveawayEntrant[],
+  firstN: number,
+  seed: number,
+  count: number,
+): GiveawayPlanEntry[] {
+  const guaranteed = firstN > 0
+    ? entrants.filter((e) => e.number <= firstN)
+    : [];
+  const pool = firstN > 0
+    ? entrants.filter((e) => e.number > firstN)
+    : entrants.slice();
+  // Distinct seeds per segment so re-ordering one doesn't mirror the other.
+  const ordered = [
+    ...seededShuffle(guaranteed, seed),
+    ...seededShuffle(pool, seed ^ 0x9e3779b9),
+  ];
+  const sliced = count > 0 ? ordered.slice(0, count) : ordered;
+  return sliced.map((e) => ({
+    userId: e.userId,
+    login: e.login,
+    displayName: e.displayName,
+    number: e.number,
+  }));
+}
+
+/** The next planned winner still present in the pool (draws skip anyone who
+ *  left), or undefined when the plan is exhausted / empty. */
+export function nextPlannedUserId(
+  plan: GiveawayPlan | null,
+  state: GiveawayState,
+): string | undefined {
+  if (!plan) return undefined;
+  const present = new Set(state.entrants.map((e) => e.userId));
+  for (const p of plan.order) if (present.has(p.userId)) return p.userId;
+  return undefined;
+}
+
+/** Drop a drawn user from the plan (consume it in draw order). */
+export function consumePlan(
+  plan: GiveawayPlan | null,
+  userId: string,
+): GiveawayPlan | null {
+  if (!plan) return null;
+  return { ...plan, order: plan.order.filter((p) => p.userId !== userId) };
+}
+
+function normalizePlanEntry(x: unknown): GiveawayPlanEntry | null {
+  if (!isObj(x)) return null;
+  const userId = typeof x.userId === "string" ? x.userId : "";
+  if (!userId) return null;
+  const login = typeof x.login === "string" ? x.login : "";
+  return {
+    userId,
+    login,
+    displayName: typeof x.displayName === "string" && x.displayName
+      ? x.displayName
+      : (login || userId),
+    number: typeof x.number === "number" && Number.isInteger(x.number)
+      ? x.number
+      : 0,
+  };
+}
+
+/** Validate a persisted plan; null on garbage / empty. */
+export function normalizePlan(raw: unknown): GiveawayPlan | null {
+  if (!isObj(raw) || !Array.isArray(raw.order)) return null;
+  const order: GiveawayPlanEntry[] = [];
+  for (const e of raw.order) {
+    const p = normalizePlanEntry(e);
+    if (p) order.push(p);
+  }
+  if (order.length === 0) return null;
+  return {
+    seed: typeof raw.seed === "number" && Number.isFinite(raw.seed)
+      ? raw.seed
+      : 0,
+    createdAt: typeof raw.createdAt === "number" ? raw.createdAt : 0,
+    order,
+  };
+}
+
+export function serializePlan(plan: GiveawayPlan | null): string {
+  return JSON.stringify(plan);
 }
 
 /** A fixed batch of fake entrants for previewing the reel without a live stream
@@ -291,7 +504,10 @@ export function demoEntrants(now = 0): GiveawayEntry[] {
 /** Stable fake follower ids for previewing milestone progress (deduped by
  *  recordFollower, so re-running demo doesn't double count). */
 export function demoFollowerIds(count: number): string[] {
-  return Array.from({ length: Math.max(0, count) }, (_, i) => `demo-follower-${i + 1}`);
+  return Array.from(
+    { length: Math.max(0, count) },
+    (_, i) => `demo-follower-${i + 1}`,
+  );
 }
 
 /** Validate a persisted pool (best-effort) read back from the state dir. Returns
@@ -427,7 +643,9 @@ export function winnerTier(
   milestonesReached: number,
 ): string {
   if (firstN > 0 && number <= firstN) return "guaranteed";
-  if (creditsRemaining > 0) return `milestone-${Math.max(1, milestonesReached)}`;
+  if (creditsRemaining > 0) {
+    return `milestone-${Math.max(1, milestonesReached)}`;
+  }
   return "manual";
 }
 
@@ -567,8 +785,13 @@ export type GiveawayAction =
   | { action: "status" }
   | { action: "demo" }
   | { action: "winners" }
+  | { action: "packs" }
+  | { action: "turns" }
+  | { action: "report" }
+  | { action: "plan-clear" }
   | { action: "campaign-reset" }
-  | { action: "remove"; userId: string };
+  | { action: "remove"; userId: string }
+  | { action: "plan"; count: number; reseed: boolean };
 
 export type GiveawayParseResult =
   | { ok: true; action: GiveawayAction }
@@ -587,6 +810,10 @@ const SIMPLE_ACTIONS: readonly string[] = [
   "status",
   "demo",
   "winners",
+  "packs",
+  "turns",
+  "report",
+  "plan-clear",
   "campaign-reset",
 ];
 
@@ -608,6 +835,13 @@ export function parseGiveawayAction(raw: string): GiveawayParseResult {
     const userId = typeof body.userId === "string" ? body.userId.trim() : "";
     if (!userId) return { ok: false, message: "remove requires a userId" };
     return { ok: true, action: { action: "remove", userId } };
+  }
+  if (action === "plan") {
+    const count = nonneg(body.count, 0); // 0 = show/return the current plan
+    return {
+      ok: true,
+      action: { action: "plan", count, reseed: body.reseed === true },
+    };
   }
   if (typeof action === "string" && SIMPLE_ACTIONS.includes(action)) {
     return {

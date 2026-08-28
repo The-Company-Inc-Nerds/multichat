@@ -6,9 +6,14 @@
 
 import type {
   GiveawayEntrant,
+  GiveawayPlan,
   GiveawayState,
+  GiveawayTurn,
   GiveawayWinner,
+  PackReport,
+  TurnAggregates,
 } from "./types.ts";
+import type { ReportRow } from "./turns.ts";
 
 /** Result of an attempt to set the runtime YouTube key (returned to the CLI client). */
 export interface KeyUpdateResult {
@@ -37,6 +42,25 @@ export interface GiveawayHooks {
   /** Zero the whole campaign: counters, entry numbers, archived winners log.
    *  Distinct from reset(), which only clears the entrant pool. */
   campaignReset(): GiveawayState;
+  /** Record a pack-opening summary pushed back by an integration (chat-cards).
+   *  Upserts by packId; returns the stored report. Drives POST /api/turn-report. */
+  turnReport(report: PackReport): PackReport;
+  /** All recorded pack reports (newest opened first) — for the CLI / report. */
+  packs(): PackReport[];
+  /** The turn ledger + derived disposition aggregates — for the CLI / report. */
+  turns(): { turns: GiveawayTurn[]; aggregates: TurnAggregates };
+  /** The compiled per-user report (rows + totals + the render timezone). */
+  report(): {
+    rows: ReportRow[];
+    aggregates: TurnAggregates;
+    timezone: string;
+  };
+  /** Build/return the committed seeded draw plan (the pre-picked next-N order).
+   *  `count` 0 returns the current plan without rebuilding; `reseed` forces a new
+   *  seed. Operator-only (never broadcast). */
+  plan(count: number, reseed: boolean): GiveawayPlan | null;
+  /** Drop the committed plan — draws go back to fully random. */
+  planClear(): GiveawayPlan | null;
 }
 
 /** Hooks createServer calls back into. Kept optional so tests can omit them. */
@@ -167,4 +191,41 @@ export function giveawayWinnersLogPath(
 ): string | null {
   const dir = (stateDir ?? "").replace(/\/+$/, "");
   return dir ? `${dir}/giveaway-winners` : null;
+}
+
+/** Where pack reports pushed back by chat-cards are persisted (a JSON map keyed
+ *  by packId, last write wins) — so a restart keeps the cards/values already
+ *  reported for the current session. Returns null with no state dir. */
+export function giveawayPacksStatePath(
+  stateDir: string | null | undefined,
+): string | null {
+  const dir = (stateDir ?? "").replace(/\/+$/, "");
+  return dir ? `${dir}/giveaway-packs` : null;
+}
+
+/** Where the turn ledger (draw → disposition records) is persisted (a JSON
+ *  array, rewritten on change). Returns null with no state dir. */
+export function giveawayTurnsStatePath(
+  stateDir: string | null | undefined,
+): string | null {
+  const dir = (stateDir ?? "").replace(/\/+$/, "");
+  return dir ? `${dir}/giveaway-turns` : null;
+}
+
+/** Where the terms-acceptance ledger is persisted (a JSON map keyed by userId).
+ *  Returns null with no state dir. */
+export function giveawayTermsStatePath(
+  stateDir: string | null | undefined,
+): string | null {
+  const dir = (stateDir ?? "").replace(/\/+$/, "");
+  return dir ? `${dir}/giveaway-terms` : null;
+}
+
+/** Where the committed seeded draw plan is persisted (a JSON object). Returns
+ *  null with no state dir. */
+export function giveawayPlanStatePath(
+  stateDir: string | null | undefined,
+): string | null {
+  const dir = (stateDir ?? "").replace(/\/+$/, "");
+  return dir ? `${dir}/giveaway-plan` : null;
 }

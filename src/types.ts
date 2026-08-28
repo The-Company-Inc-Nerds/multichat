@@ -225,6 +225,75 @@ export interface GiveawayCampaignSummary {
   followTracking: boolean;
 }
 
+/** What a drawn winner chose to do with their pack (winner-only chat commands).
+ *  `pass` forfeits the pull to the next person's turn and advances the draw. */
+export type GiveawayDisposition = "mail" | "donate" | "destroy" | "pass";
+
+/** One giveaway "turn": a drawn winner's slot from draw → disposition. Links to
+ *  the chat-cards pack(s) opened for them via `ref === turn.id` on PackReport.
+ *  `startedAt` is UTC ms (rendered in the configured timezone in the report). */
+export interface GiveawayTurn {
+  id: string;
+  userId: string;
+  login: string;
+  displayName: string;
+  number: number;
+  tier: string;
+  startedAt: number;
+  endedAt?: number;
+  disposition?: GiveawayDisposition;
+  dispositionAt?: number;
+  /** The turn that passed its cards into this one (a `pass` chain), if any. */
+  carriedFromTurnId?: string;
+}
+
+/** One recorded terms acceptance (so `!enter` can gate on it). `version` lets a
+ *  changed T&C force re-acceptance. */
+export interface TermsAcceptance {
+  userId: string;
+  login: string;
+  displayName: string;
+  acceptedAt: number;
+  version: string;
+}
+
+/** A running total for one disposition across the campaign: how many turns chose
+ *  it, and the cards/value that flowed through (carry chains fold into the final
+ *  non-pass disposition). */
+export interface DispositionTotal {
+  turns: number;
+  cards: number;
+  value: number;
+}
+
+/** Campaign-wide disposition totals — what the stream mailed / donated / destroyed
+ *  / passed, by count and value. Derived from the turn ledger + pack reports. */
+export interface TurnAggregates {
+  mailed: DispositionTotal;
+  donated: DispositionTotal;
+  destroyed: DispositionTotal;
+  passed: DispositionTotal;
+}
+
+/** One entry in a committed draw plan — the pre-seeded order the next winners
+ *  will be drawn in (for off-stream prep). */
+export interface GiveawayPlanEntry {
+  userId: string;
+  login: string;
+  displayName: string;
+  number: number;
+}
+
+/** A committed, seeded draw order: the next winners in the order they'll be
+ *  drawn. `seed` makes it reproducible; draws consume it in order (skipping
+ *  anyone who left the pool). Kept operator-side (CLI) — never broadcast, so the
+ *  on-stream reel still looks random. */
+export interface GiveawayPlan {
+  seed: number;
+  createdAt: number;
+  order: GiveawayPlanEntry[];
+}
+
 /** The live giveaway state pushed to the `/giveaway` page over SSE. */
 export interface GiveawayState {
   /** Whether `!enter` is currently accepted. */
@@ -236,6 +305,10 @@ export interface GiveawayState {
   lastWinner?: GiveawayEntrant;
   /** Derived campaign snapshot (attached by the engine, not persisted). */
   campaign?: GiveawayCampaignSummary;
+  /** The current in-progress turn (drawn, awaiting a disposition), if any. */
+  activeTurn?: GiveawayTurn;
+  /** Derived disposition totals (attached by the engine, not persisted). */
+  aggregates?: TurnAggregates;
 }
 
 /** Attached to a `giveaway` SSE frame only when a draw just happened, so every
@@ -262,6 +335,41 @@ export interface GiveawayMessages {
   enteredPool?: string;
   /** Announcement posted when a follower milestone is crossed. */
   milestone?: string;
+  /** Shown at `!enter` when the entrant hasn't accepted the terms yet. Fills
+   *  `{accept}` (the accept command) and `{terms}` (the T&C url). */
+  termsRequired?: string;
+  /** Confirmation after `!accept`. */
+  termsAccepted?: string;
+  /** Winner-only disposition confirmations. `{cards}`/`{value}` are filled with
+   *  the pack tally where known. `passed` also fills `{next}` if a next winner
+   *  was drawn. */
+  mailed?: string;
+  donated?: string;
+  destroyed?: string;
+  passed?: string;
+}
+
+/** Terms & conditions gate for the giveaway. When `required`, `!enter` only
+ *  admits entrants who have accepted (via `${prefix}${command}`, e.g. `!accept`).
+ *  Bump `version` to force everyone to re-accept a changed T&C. `url` is shown in
+ *  the prompt. */
+export interface GiveawayTermsConfig {
+  required: boolean;
+  command: string;
+  version: string;
+  url: string;
+}
+
+/** Winner-turn disposition commands (Twitch chat words the current winner can
+ *  say to decide their pull's fate). `pass` carries the cards to the next
+ *  person's turn and advances the draw; the others record + tally. The words are
+ *  matched with or without the giveaway prefix. */
+export interface GiveawayDispositionConfig {
+  enabled: boolean;
+  mail: string;
+  donate: string;
+  destroy: string;
+  pass: string;
 }
 
 /** Giveaway / prize-draw config (Twitch-only). Watch one channel's chat for
@@ -290,7 +398,70 @@ export interface GiveawayConfig {
   followerStep: number;
   /** Draw credits armed per milestone crossed. */
   milestoneDraws: number;
+  /** IANA timezone the compiled report renders turn-start times in (default
+   *  "America/Denver" — Mountain Time). */
+  timezone: string;
+  /** Optional terms-acceptance gate on `!enter`. */
+  terms?: GiveawayTermsConfig;
+  /** Optional winner-turn disposition commands (mail/donate/destroy/pass). */
+  disposition?: GiveawayDispositionConfig;
   messages?: GiveawayMessages;
+}
+
+// ---- Integrations (outbound event bus + inbound pack reports) ------------
+
+/** One external tool multichat pushes giveaway-lifecycle events to. `adapter`
+ *  selects delivery: "webhook" POSTs a generic `{event, ts, data}` envelope to
+ *  `baseUrl`; "chat-cards" maps events to the chat-cards HTTP API (e.g. opening a
+ *  pack under the drawn winner). `events` filters which event types are sent
+ *  (`"*"` = all). `token` is the bearer the target requires; `packSize` (chat-
+ *  cards only) is the pack size to open (0/unset = chat-cards' own default). */
+export interface IntegrationSubscriber {
+  name: string;
+  adapter: "webhook" | "chat-cards";
+  baseUrl: string;
+  events: string[];
+  enabled: boolean;
+  token?: string;
+  packSize?: number;
+}
+
+/** Outbound-integration config (optional). `callbackToken`, when set, is the
+ *  bearer an external tool must present to POST results back to
+ *  `/api/turn-report`; without it that endpoint is loopback-only. */
+export interface IntegrationsConfig {
+  callbackToken?: string;
+  subscribers: IntegrationSubscriber[];
+}
+
+/** One card in a pack report pushed back by chat-cards — a trimmed view of its
+ *  richer card record (just what the giveaway ledger needs). */
+export interface PackCardSummary {
+  name: string;
+  number?: string;
+  set?: string;
+  rarity?: string;
+  value: number;
+  image?: string;
+}
+
+/** A pack-opening summary reported back to multichat by an integration
+ *  (chat-cards): whose pack, the cards pulled, and the running total value.
+ *  Keyed by `packId` (last write wins) and correlated to a giveaway turn by
+ *  `ref` (the winner's userId / a turn id). Timestamps are epoch ms. */
+export interface PackReport {
+  packId: string;
+  ref?: string;
+  winner?: string;
+  label?: string;
+  index?: number;
+  size?: number;
+  openedAt: number;
+  closedAt?: number;
+  totalValue: number;
+  cardCount: number;
+  cards: PackCardSummary[];
+  receivedAt: number;
 }
 
 export interface Settings {
@@ -299,4 +470,5 @@ export interface Settings {
   youtube: YouTubeConfig;
   alerts?: AlertsConfig;
   giveaway?: GiveawayConfig;
+  integrations?: IntegrationsConfig;
 }

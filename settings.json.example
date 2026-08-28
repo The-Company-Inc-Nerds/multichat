@@ -28,6 +28,34 @@
     "replies": true,
     "firstN": 0,
     "followerStep": 0,
-    "milestoneDraws": 1
+    "milestoneDraws": 1,
+    "timezone": "America/Denver",
+    "terms": {
+      "required": false,
+      "command": "accept",
+      "version": "1",
+      "url": ""
+    },
+    "disposition": {
+      "enabled": false,
+      "mail": "mail",
+      "donate": "donate",
+      "destroy": "destroy",
+      "pass": "pass"
+    }
+  },
+  "integrations": {
+    "callbackToken": "",
+    "subscribers": [
+      {
+        "name": "chat-cards",
+        "adapter": "chat-cards",
+        "baseUrl": "http://127.0.0.1:8787",
+        "token": "",
+        "events": ["*"],
+        "enabled": false,
+        "packSize": 0
+      }
+    ]
   }
 }

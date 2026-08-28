@@ -59,12 +59,17 @@ The same binary is also a small CLI client:
   just one (e.g. `fake follow`). See `docs/development/testing.md`.
 - `multichat giveaway <verb>` drives the Twitch `!enter` giveaway on a running
   server via its loopback `POST /api/giveaway` endpoint (`status` / `open` /
-  `close` / `draw` / `reset` / `demo` / `winners [--csv]` /
+  `close` / `draw` / `reset` / `demo` / `winners [--csv]` / `packs` / `turns` /
+  `report [--csv]` / `plan [N] [--reseed] [--csv]` / `plan-clear` /
   `campaign-reset --yes` / `remove <userId>`; `demo` injects sample entrants +
   follower progress to preview the reel, `winners` prints the recorded mailing
-  list) — the terminal equivalent of the `/giveaway` page (a CS2-style case
-  reel; `?overlay` is a transparent OBS source, `?overlay&progress` adds a
-  follower-milestone pill). See `docs/configuration.md#giveaway-mode`.
+  list, `packs` the pack reports pushed back by chat-cards, `turns` the turn
+  ledger + disposition totals, `report` the compiled per-user list (turn-start
+  in Mountain Time, cards pulled, value, disposition), `plan` commits/shows a
+  seeded next-N draw order for off-stream prep) — the terminal equivalent of the
+  `/giveaway` page (a CS2-style case reel; `?overlay` is a transparent OBS
+  source, `?overlay&progress` adds a follower-milestone pill). See
+  `docs/configuration.md#giveaway-mode`.
 
 ## Configuration
 
@@ -79,15 +84,32 @@ Copy `settings.json.example` to `settings.json` and edit:
   least one field per entry
 - `alerts` — optional `{activeTheme, themes}` registry that skins the `/alerts`
   overlay (built-in styles `default` / `company-memo`); unset = default look
-- `giveaway` — optional Twitch-only `!enter` prize draw `{enabled, channel,
+- `giveaway` — optional Twitch-only `!enter` prize draw
+  `{enabled, channel,
   prefix, command, requireFollow, replies, firstN, followerStep, milestoneDraws,
-  messages}`; `requireFollow`/`followerStep` need the channel in
-  `twitch.eventsub`, `replies` needs a `user:write:chat` token (re-run
-  `multichat login`). Campaign mode: `firstN` = guaranteed first-N queue (draws
-  pick who's next), `followerStep`/`milestoneDraws` = advisory draw credits per
-  N new followers, winners logged append-only (JSONL mailing list). Draw on
-  `/giveaway` (a CS2-style case reel; `?overlay` = transparent OBS source). See
-  `docs/configuration.md`
+  timezone, terms, disposition, messages}`;
+  `requireFollow`/`followerStep` need the channel in `twitch.eventsub`,
+  `replies` needs a `user:write:chat` token (re-run `multichat login`). Campaign
+  mode: `firstN` = guaranteed first-N queue (draws pick who's next),
+  `followerStep`/`milestoneDraws` = advisory draw credits per N new followers,
+  winners logged append-only (JSONL mailing list). `terms`
+  `{required, command, version, url}` gates `!enter` on a `!accept`
+  acknowledgement; `disposition` `{enabled, mail, donate, destroy, pass}` are
+  winner-only chat words deciding a pull's fate (`pass` carries the cards to the
+  next person's turn + auto-advances the draw); `timezone` (default
+  `America/Denver`) is what the compiled `report` renders turn-start times in.
+  Draw on `/giveaway` (a CS2-style case reel; `?overlay` = transparent OBS
+  source). See `docs/configuration.md`
+- `integrations` — optional outbound event bus
+  `{callbackToken, subscribers:
+  [{name, adapter, baseUrl, token, events, enabled, packSize}]}`.
+  Each giveaway draw fires `giveaway.turn.start` (+ disposition/end,
+  terms.accepted) to the subscribers: a `webhook` adapter POSTs a generic
+  `{event, ts, data}` envelope, a `chat-cards` adapter opens a pack under the
+  drawn winner (`POST baseUrl/api/pack`). chat-cards reports the cards pulled +
+  value back to `POST /api/turn-report` (bearer `callbackToken`), feeding the
+  `packs`/`report` views. Delivery is fire-and-forget — a subscriber outage
+  never blocks or rolls back a draw. See `docs/configuration.md`
 
 YouTube channels require an API key, but it need not be in `settings.json` — it
 can be set on the running server with `multichat set-youtube-key` (see above).
@@ -106,10 +128,13 @@ main.ts          entry point — loads settings, wires the emitter to server + c
                  one WebSocket per broadcaster; exposes getChannelAuth, forwards onFollow), and
                  the giveaway engine (follow check + chat replies + entrant pool + campaign:
                  guaranteed-queue draws, follower-milestone counter fed by onFollow, append-only
-                 winners JSONL, driving the /giveaway page)
+                 winners JSONL; the turn lifecycle: !accept terms gate, per-draw turns, winner-only
+                 mail/donate/destroy/pass disposition, seeded draw plan; driving the /giveaway page)
+                 + the integration dispatcher (fires giveaway.turn.* events to configured subscribers)
 src/types.ts     shared TypeScript interfaces (Settings, ChatMessage, ServerEvent, Emitter,
                  TwitchEventSubConfig, EventSub frames, GiveawayConfig/State/Entrant/
-                 CampaignState/CampaignSummary/Winner/Draw)
+                 CampaignState/CampaignSummary/Winner/Draw/Turn/Disposition/Plan, TermsAcceptance,
+                 TurnAggregates, IntegrationsConfig/Subscriber, PackReport)
 src/twitch.ts    Twitch IRC over WebSocket (wss://irc-ws.chat.twitch.tv), with reconnect;
                  handleCommand takes an optional isCovered predicate so EventSub-covered
                  channels emit only chat text (their events come from EventSub instead), and
@@ -135,21 +160,36 @@ src/server.ts    Deno.serve HTTP server: GET / + GET /overlay + GET /alerts + GE
                  ?direction=up|down flips the
                  message flow on any chat-rendering page), GET /events (SSE, replays the
                  giveaway pool on connect), POST /api/youtube-key + POST /api/fake +
-                 POST /api/giveaway (loopback-only control); createServer returns
+                 POST /api/giveaway (loopback-only control) + POST /api/turn-report (the inbound
+                 integration callback: chat-cards pushes back pack/card summaries; bearer
+                 integrations.callbackToken, else loopback-only); createServer returns
                  { emitter, broadcastGiveaway }
 src/alerts.ts    pure alerts-theme helpers: normalizeAlertsConfig (validates the theme
                  registry from settings.json) + ALERT_EVENT_KINDS; the resolved config is
                  injected into the page as window.MULTICHAT_ALERTS for the overlay to apply
-src/giveaway.ts  pure giveaway helpers: normalizeGiveawayConfig, matchGiveawayCommand, the
-                 entrant-pool reducers (add w/ permanent entry numbers, remove, draw +
-                 drawSegmented guaranteed-queue-then-pool, open/close/reset) + normalizePoolState
-                 (migrates number-less files), campaign reducers (recordFollower dedupe +
-                 milestone crossing, winnerTier, campaignSummary), the winners JSONL/CSV
-                 helpers, decideEligibility, and the POST /api/giveaway wire (de)serialization
+src/giveaway.ts  pure giveaway helpers: normalizeGiveawayConfig (incl. terms/disposition/
+                 timezone sub-configs), matchGiveawayCommand, the entrant-pool reducers (add w/
+                 permanent entry numbers, remove, draw + drawSegmented guaranteed-queue-then-pool
+                 w/ an optional forcedUserId for a committed plan, open/close/reset) +
+                 normalizePoolState (migrates number-less files), campaign reducers
+                 (recordFollower dedupe + milestone crossing, winnerTier, campaignSummary), the
+                 winners JSONL/CSV helpers, the seeded draw-plan primitives (mulberry32,
+                 seededShuffle, buildDrawPlan, nextPlannedUserId, consumePlan, normalizePlan),
+                 decideEligibility, and the POST /api/giveaway wire (de)serialization
+src/turns.ts     pure turn-lifecycle helpers: the terms-acceptance ledger (hasAccepted/
+                 recordAcceptance), matchDisposition (mail/donate/destroy/pass), the turn
+                 reducers (newTurn/recordTurnDisposition/activeTurn), computeAggregates +
+                 turnTotals (fold pass carry-chains via carriedFromTurnId), and the compiled
+                 report builder (buildTurnReport/reportToCsv + formatInZone for the MST render)
+src/integrations.ts  pure integration-bus helpers: normalizeIntegrationsConfig, the outbound
+                 event→request mapping per adapter (webhook envelope / chat-cards /api/pack) +
+                 subscriberWantsEvent, and the inbound pack-report parser (parseTurnReport /
+                 normalizePackReports behind POST /api/turn-report). The fetch wiring is in main.ts
 src/control.ts   pure control-plane helpers (loopback check, key-body parse, startup-key
                  resolution, state paths incl. Twitch token/broadcaster-id + giveaway
-                 pool/campaign/winners-log) + the ServerHooks (setYouTubeKey + giveaway) /
-                 GiveawayHooks / KeyUpdateResult types
+                 pool/campaign/winners-log/packs/turns/terms/plan) + the ServerHooks
+                 (setYouTubeKey + giveaway) / GiveawayHooks (draw/turnReport/packs/turns/report/
+                 plan/…) / KeyUpdateResult types
 src/fake.ts      pure fake-event helpers: the curated demo sequence + wire
                  (de)serialization/validation behind POST /api/fake
 tests/           one *_test.ts per source module; dependency-free assert shim in _assert.ts

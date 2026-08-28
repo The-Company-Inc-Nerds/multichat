@@ -2,11 +2,19 @@ import type {
   Emitter,
   GiveawayCampaignState,
   GiveawayConfig,
+  GiveawayDisposition,
   GiveawayDraw,
+  GiveawayEntrant,
   GiveawayMessages,
+  GiveawayPlan,
   GiveawayState,
+  GiveawayTurn,
   GiveawayWinner,
+  IntegrationsConfig,
+  PackReport,
   Settings,
+  TermsAcceptance,
+  TurnAggregates,
   TwitchConfig,
   TwitchEventSubChannelConfig,
   TwitchEventSubConfig,
@@ -38,7 +46,11 @@ import {
 import {
   giveawayCampaignStatePath,
   type GiveawayHooks,
+  giveawayPacksStatePath,
+  giveawayPlanStatePath,
   giveawayPoolStatePath,
+  giveawayTermsStatePath,
+  giveawayTurnsStatePath,
   giveawayWinnersLogPath,
   keyStatePath,
   type KeyUpdateResult,
@@ -46,6 +58,32 @@ import {
   twitchBroadcasterStatePath,
   twitchTokenStatePath,
 } from "./src/control.ts";
+import {
+  activeTurn,
+  buildTurnReport,
+  computeAggregates,
+  hasAccepted,
+  matchDisposition,
+  newTurn,
+  normalizeTermsLedger,
+  normalizeTurns,
+  recordAcceptance,
+  recordTurnDisposition,
+  type ReportRow,
+  reportToCsv,
+  serializeTermsLedger,
+  serializeTurns,
+  turnTotals,
+} from "./src/turns.ts";
+import {
+  buildIntegrationRequests,
+  type IntegrationEvent,
+  normalizeIntegrationsConfig,
+  normalizePackReports,
+  type OutboundRequest,
+  serializePackReports,
+  subscriberWantsEvent,
+} from "./src/integrations.ts";
 import {
   demoActions,
   type FakeAction,
@@ -55,8 +93,10 @@ import {
 } from "./src/fake.ts";
 import {
   addEntrant,
+  buildDrawPlan,
   campaignSummary,
   closePool,
+  consumePlan,
   decideEligibility,
   demoEntrants,
   demoFollowerIds,
@@ -67,8 +107,10 @@ import {
   giveawayMessage,
   hasEntrant,
   matchGiveawayCommand,
+  nextPlannedUserId,
   normalizeCampaignState,
   normalizeGiveawayConfig,
+  normalizePlan,
   normalizePoolState,
   openPool,
   parseWinnersLog,
@@ -76,6 +118,7 @@ import {
   removeEntrant,
   resetPool,
   serializeGiveawayAction,
+  serializePlan,
   serializeWinnerLine,
   winnersToCsv,
   winnerTier,
@@ -111,6 +154,7 @@ async function loadSettings(path: string): Promise<Settings> {
     },
     alerts: normalizeAlertsConfig(raw.alerts),
     giveaway: normalizeGiveawayConfig(raw.giveaway),
+    integrations: normalizeIntegrationsConfig(raw.integrations),
   };
 }
 
@@ -410,6 +454,70 @@ async function readKeyFile(path: string): Promise<string | null> {
 }
 
 /**
+ * The outbound integration bus. Pushes giveaway-lifecycle events to each
+ * configured subscriber (e.g. the chat-cards adapter, which opens a pack for the
+ * drawn winner). Delivery is fire-and-forget with a single retry: a subscriber
+ * being down must never block or roll back a draw — it's logged, and
+ * /api/turn-report reconciles values when the tool comes back. Pure event→request
+ * mapping lives in integrations.ts; this is the wiring.
+ */
+function createIntegrationDispatcher(config: IntegrationsConfig): {
+  emit: (ev: IntegrationEvent) => void;
+} {
+  const subs = config.subscribers.filter((s) => s.enabled);
+  if (subs.length > 0) {
+    console.log(
+      `[Integration] ${subs.length} subscriber(s): ${
+        subs.map((s) => `${s.name} (${s.adapter})`).join(", ")
+      }`,
+    );
+  }
+
+  async function fire(
+    name: string,
+    req: OutboundRequest,
+    retry: boolean,
+  ): Promise<void> {
+    try {
+      const res = await fetch(req.url, {
+        method: req.method,
+        headers: req.headers,
+        body: req.body,
+      });
+      if (!res.ok) {
+        const t = await res.text().catch(() => "");
+        console.error(
+          `[Integration:${name}] ${req.method} ${req.url} → HTTP ${res.status} ${
+            t.slice(0, 200)
+          }`,
+        );
+      } else {
+        await res.body?.cancel();
+      }
+    } catch (e) {
+      if (retry) {
+        // One retry after a short delay — a transient blip shouldn't drop the
+        // delivery, but it must never block the draw that triggered it.
+        setTimeout(() => void fire(name, req, false), 500);
+        return;
+      }
+      console.error(`[Integration:${name}] ${req.url} failed: ${e}`);
+    }
+  }
+
+  function emit(ev: IntegrationEvent): void {
+    for (const sub of subs) {
+      if (!subscriberWantsEvent(sub, ev.type)) continue;
+      for (const req of buildIntegrationRequests(sub, ev)) {
+        void fire(sub.name, req, true);
+      }
+    }
+  }
+
+  return { emit };
+}
+
+/**
  * The giveaway engine (Twitch-only). Watches chat for the configured command,
  * gates entries on a live Helix follow check (fail-closed when it can't be run),
  * collects eligible viewers, persists the pool, optionally replies in chat as the
@@ -429,6 +537,9 @@ function createGiveawayEngine(opts: {
   getBroadcast: () =>
     | ((state: GiveawayState, draw?: GiveawayDraw) => void)
     | undefined;
+  /** Push a giveaway-lifecycle event to the integration bus (chat-cards etc.).
+   *  No-op when integrations aren't configured. */
+  emitIntegration?: (ev: IntegrationEvent) => void;
 }): {
   onMessage: (m: TwitchChatMessage) => Promise<void>;
   onFollow: FollowHandler;
@@ -439,12 +550,24 @@ function createGiveawayEngine(opts: {
   const poolPath = giveawayPoolStatePath(opts.stateDir);
   const campaignPath = giveawayCampaignStatePath(opts.stateDir);
   const winnersPath = giveawayWinnersLogPath(opts.stateDir);
+  const packsPath = giveawayPacksStatePath(opts.stateDir);
+  const turnsPath = giveawayTurnsStatePath(opts.stateDir);
+  const termsPath = giveawayTermsStatePath(opts.stateDir);
+  const planPath = giveawayPlanStatePath(opts.stateDir);
   let state: GiveawayState = emptyPool(true);
   let campaign: GiveawayCampaignState = emptyCampaign();
   let winners: GiveawayWinner[] = [];
+  // Pack reports pushed back by chat-cards, keyed by packId (last write wins).
+  let packReports: Record<string, PackReport> = {};
+  // The turn ledger (draw → disposition) and the terms-acceptance ledger.
+  let turns: GiveawayTurn[] = [];
+  let terms: Record<string, TermsAcceptance> = {};
+  // The committed seeded draw plan (operator-only; consumed as draws happen).
+  let plan: GiveawayPlan | null = null;
 
   /** The broadcast/return view: state with the derived campaign snapshot
-   *  attached (counts + recent winners — never the full list). */
+   *  attached (counts + recent winners), plus the active turn and disposition
+   *  aggregates — all derived, none persisted (see persist()). */
   function view(): GiveawayState {
     state.campaign = campaignSummary(
       state,
@@ -453,6 +576,10 @@ function createGiveawayEngine(opts: {
       winners,
       opts.followTracking,
     );
+    const active = activeTurn(turns);
+    if (active) state.activeTurn = active;
+    else delete state.activeTurn;
+    state.aggregates = computeAggregates(turns, packReports);
     return state;
   }
 
@@ -462,14 +589,29 @@ function createGiveawayEngine(opts: {
     opts.getBroadcast()?.(view(), draw);
   }
   function persist(): void {
-    // The derived summary is not persisted (normalizePoolState drops it on load).
+    // Derived fields (campaign snapshot, active turn, aggregates) are not
+    // persisted — they're rebuilt in view() from the pool/turns/packs.
     if (poolPath) {
-      const { campaign: _drop, ...bare } = state;
+      const { campaign: _c, activeTurn: _a, aggregates: _g, ...bare } = state;
       void persistState(poolPath, JSON.stringify(bare));
     }
   }
   function persistCampaign(): void {
     if (campaignPath) void persistState(campaignPath, JSON.stringify(campaign));
+  }
+  function persistPacks(): void {
+    if (packsPath) {
+      void persistState(packsPath, serializePackReports(packReports));
+    }
+  }
+  function persistTurns(): void {
+    if (turnsPath) void persistState(turnsPath, serializeTurns(turns));
+  }
+  function persistTerms(): void {
+    if (termsPath) void persistState(termsPath, serializeTermsLedger(terms));
+  }
+  function persistPlan(): void {
+    if (planPath) void persistState(planPath, serializePlan(plan));
   }
 
   /** Restore persisted pool + campaign + winners at startup (best-effort;
@@ -497,6 +639,38 @@ function createGiveawayEngine(opts: {
       try {
         winners = parseWinnersLog(await Deno.readTextFile(winnersPath));
       } catch { /* no log yet */ }
+    }
+    if (packsPath) {
+      const raw = await readKeyFile(packsPath);
+      if (raw) {
+        try {
+          packReports = normalizePackReports(JSON.parse(raw));
+        } catch { /* corrupt — start empty */ }
+      }
+    }
+    if (turnsPath) {
+      const raw = await readKeyFile(turnsPath);
+      if (raw) {
+        try {
+          turns = normalizeTurns(JSON.parse(raw));
+        } catch { /* corrupt — start empty */ }
+      }
+    }
+    if (termsPath) {
+      const raw = await readKeyFile(termsPath);
+      if (raw) {
+        try {
+          terms = normalizeTermsLedger(JSON.parse(raw));
+        } catch { /* corrupt — start empty */ }
+      }
+    }
+    if (planPath) {
+      const raw = await readKeyFile(planPath);
+      if (raw) {
+        try {
+          plan = normalizePlan(JSON.parse(raw));
+        } catch { /* corrupt — no plan */ }
+      }
     }
   }
 
@@ -590,11 +764,42 @@ function createGiveawayEngine(opts: {
   async function onMessage(m: TwitchChatMessage): Promise<void> {
     if (!config.enabled) return;
     if (m.channel.toLowerCase() !== config.channel) return;
-    if (!matchGiveawayCommand(m.text, config.prefix, config.command)) return;
     if (!m.userId) return; // no stable id — can't dedupe/verify
+
+    // Terms acceptance (e.g. "!accept") — checked before the enter command.
+    if (
+      config.terms &&
+      matchGiveawayCommand(m.text, config.prefix, config.terms.command)
+    ) {
+      await handleAccept(m);
+      return;
+    }
+
+    // Winner-turn disposition (mail/donate/destroy/pass). Gated to the current
+    // winner inside handleDisposition — a non-winner saying the word is a no-op.
+    if (config.disposition) {
+      const disp = matchDisposition(m.text, config.prefix, config.disposition);
+      if (disp) {
+        await handleDisposition(m, disp);
+        return;
+      }
+    }
+
+    if (!matchGiveawayCommand(m.text, config.prefix, config.command)) return;
     if (!state.open) return; // entries closed; ignore silently
     if (hasEntrant(state, m.userId)) {
       await reply("alreadyEntered", m.displayName);
+      return;
+    }
+    // Terms gate: must have accepted the current T&C to enter.
+    if (
+      config.terms?.required &&
+      !hasAccepted(terms, m.userId, config.terms.version)
+    ) {
+      await reply("termsRequired", m.displayName, {
+        accept: `${config.prefix}${config.terms.command}`,
+        terms: config.terms.url || "see the panel",
+      });
       return;
     }
     let following: boolean | undefined;
@@ -626,9 +831,7 @@ function createGiveawayEngine(opts: {
     } else {
       await reply("entered", m.displayName, {
         number,
-        remaining: config.firstN > 0
-          ? Math.max(0, config.firstN - number)
-          : 0,
+        remaining: config.firstN > 0 ? Math.max(0, config.firstN - number) : 0,
       });
     }
   }
@@ -658,6 +861,180 @@ function createGiveawayEngine(opts: {
     }
   }
 
+  /** Draw the next winner (guaranteed queue first, then the pool), record the
+   *  win, open a turn, and tell the integration bus to open a pack. Shared by the
+   *  operator `draw` hook and the `pass` disposition (which auto-advances,
+   *  carrying the passed cards into the new turn via `carriedFromTurnId`). */
+  function performDraw(
+    carriedFromTurnId?: string,
+  ): {
+    state: GiveawayState;
+    winner: GiveawayEntrant | null;
+    segment: "guaranteed" | "pool";
+  } {
+    // A committed plan forces who's next (still looks like a random spin);
+    // otherwise it's a random draw. Guaranteed queue first, then the pool.
+    const forced = nextPlannedUserId(plan, state);
+    const r = drawSegmented(state, config.firstN, Math.random, forced);
+    state = r.state;
+    if (r.winner) {
+      if (plan) {
+        // Consume the drawn winner from the plan (in draw order).
+        plan = consumePlan(plan, r.winner.userId);
+        persistPlan();
+      }
+      const tier = winnerTier(
+        r.winner.number,
+        config.firstN,
+        campaign.creditsRemaining,
+        campaign.milestonesReached,
+      );
+      if (tier.startsWith("milestone-")) {
+        campaign = {
+          ...campaign,
+          creditsRemaining: campaign.creditsRemaining - 1,
+        };
+        persistCampaign();
+      }
+      const w: GiveawayWinner = {
+        userId: r.winner.userId,
+        login: r.winner.login,
+        displayName: r.winner.displayName,
+        number: r.winner.number,
+        enteredAt: r.winner.enteredAt,
+        wonAt: Date.now(),
+        tier,
+      };
+      // Append the mailing-list record BEFORE the pool persist: a crash here can
+      // only leave the winner still in the pool (operator-visible), never an
+      // un-recorded winner.
+      winners.push(w);
+      if (winnersPath) void appendState(winnersPath, serializeWinnerLine(w));
+      // Open the turn. Its id is the correlation `ref` chat-cards echoes back on
+      // the pack report, so a pull can be tied to the exact turn.
+      const turnId = crypto.randomUUID();
+      turns = [
+        ...turns,
+        newTurn({
+          id: turnId,
+          winner: r.winner,
+          tier,
+          now: Date.now(),
+          carriedFromTurnId,
+        }),
+      ];
+      persistTurns();
+      opts.emitIntegration?.({
+        type: "giveaway.turn.start",
+        ts: Date.now(),
+        data: {
+          winner: r.winner.displayName,
+          ref: turnId,
+          userId: r.winner.userId,
+          login: r.winner.login,
+          number: r.winner.number,
+          segment: r.segment,
+          tier,
+          ...(carriedFromTurnId ? { carriedFromTurnId } : {}),
+        },
+      });
+    }
+    persist();
+    broadcast(
+      r.winner
+        ? { winner: r.winner, reel: r.reel, segment: r.segment }
+        : undefined,
+    );
+    if (r.winner) {
+      void reply("winner", r.winner.displayName, { number: r.winner.number });
+    }
+    return { state: view(), winner: r.winner, segment: r.segment };
+  }
+
+  /** Record a viewer's terms acceptance (the configured accept command). */
+  async function handleAccept(m: TwitchChatMessage): Promise<void> {
+    if (!config.terms) return;
+    const r = recordAcceptance(
+      terms,
+      { userId: m.userId, login: m.login, displayName: m.displayName },
+      config.terms.version,
+      Date.now(),
+    );
+    if (!r.changed) return; // already accepted this version — stay quiet
+    terms = r.ledger;
+    persistTerms();
+    opts.emitIntegration?.({
+      type: "giveaway.terms.accepted",
+      ts: Date.now(),
+      data: {
+        userId: m.userId,
+        login: m.login,
+        displayName: m.displayName,
+        version: config.terms.version,
+      },
+    });
+    await reply("termsAccepted", m.displayName, {
+      enter: `${config.prefix}${config.command}`,
+    });
+  }
+
+  /** Apply a winner-only disposition (mail/donate/destroy/pass). No-op unless
+   *  it's the current winner's turn and they haven't already decided. `pass`
+   *  carries the pull to the next person and auto-advances the draw. */
+  async function handleDisposition(
+    m: TwitchChatMessage,
+    disposition: GiveawayDisposition,
+  ): Promise<void> {
+    const active = activeTurn(turns);
+    if (!active || active.userId !== m.userId || active.disposition) return;
+    const res = recordTurnDisposition(
+      turns,
+      active.id,
+      disposition,
+      Date.now(),
+    );
+    turns = res.turns;
+    persistTurns();
+    const tally = turnTotals(active.id, turns, packReports);
+    opts.emitIntegration?.({
+      type: "giveaway.turn.disposition",
+      ts: Date.now(),
+      data: {
+        ref: active.id,
+        userId: active.userId,
+        disposition,
+        cards: tally.cards,
+        value: tally.value,
+      },
+    });
+    if (disposition === "pass") {
+      // The forfeited cards carry into the next person's turn, and the draw
+      // advances so the next winner also opens a fresh pack.
+      const next = performDraw(active.id);
+      await reply("passed", m.displayName, {
+        next: next.winner?.displayName ?? "the next winner",
+        cards: tally.cards,
+        value: tally.value.toFixed(2),
+      });
+    } else {
+      broadcast(); // turn ended → clear activeTurn, refresh aggregates
+      const key = disposition === "mail"
+        ? "mailed"
+        : disposition === "donate"
+        ? "donated"
+        : "destroyed";
+      await reply(key, m.displayName, {
+        cards: tally.cards,
+        value: tally.value.toFixed(2),
+      });
+    }
+    opts.emitIntegration?.({
+      type: "giveaway.turn.end",
+      ts: Date.now(),
+      data: { ref: active.id, userId: active.userId, disposition },
+    });
+  }
+
   const hooks: GiveawayHooks = {
     getState: () => view(),
     open: () => {
@@ -674,6 +1051,9 @@ function createGiveawayEngine(opts: {
     },
     reset: () => {
       state = resetPool(state);
+      // The committed plan referenced the now-cleared entrants — drop it.
+      plan = null;
+      persistPlan();
       persist();
       broadcast();
       return view();
@@ -684,50 +1064,7 @@ function createGiveawayEngine(opts: {
       broadcast();
       return view();
     },
-    draw: () => {
-      // Guaranteed queue first (who's-next-pack), then the milestone pool.
-      const r = drawSegmented(state, config.firstN, Math.random);
-      state = r.state;
-      if (r.winner) {
-        const tier = winnerTier(
-          r.winner.number,
-          config.firstN,
-          campaign.creditsRemaining,
-          campaign.milestonesReached,
-        );
-        if (tier.startsWith("milestone-")) {
-          campaign = {
-            ...campaign,
-            creditsRemaining: campaign.creditsRemaining - 1,
-          };
-          persistCampaign();
-        }
-        const w: GiveawayWinner = {
-          userId: r.winner.userId,
-          login: r.winner.login,
-          displayName: r.winner.displayName,
-          number: r.winner.number,
-          enteredAt: r.winner.enteredAt,
-          wonAt: Date.now(),
-          tier,
-        };
-        // Append the mailing-list record BEFORE the pool persist: a crash here
-        // can only leave the winner still in the pool (operator-visible), never
-        // an un-recorded winner.
-        winners.push(w);
-        if (winnersPath) void appendState(winnersPath, serializeWinnerLine(w));
-      }
-      persist();
-      broadcast(
-        r.winner
-          ? { winner: r.winner, reel: r.reel, segment: r.segment }
-          : undefined,
-      );
-      if (r.winner) {
-        void reply("winner", r.winner.displayName, { number: r.winner.number });
-      }
-      return { state: view(), winner: r.winner, segment: r.segment };
-    },
+    draw: () => performDraw(),
     demo: () => {
       // Open the pool and add the sample entrants (deduped by their stable ids),
       // so the reel has something to run without a live stream. When follower
@@ -762,10 +1099,55 @@ function createGiveawayEngine(opts: {
       winners = [];
       campaign = emptyCampaign();
       state = { ...emptyPool(state.open) };
+      // The turn ledger + pack reports + plan are per-campaign, so clear them.
+      // Terms acceptances are durable (a bumped terms.version re-gates), so keep.
+      turns = [];
+      packReports = {};
+      plan = null;
+      persistTurns();
+      persistPacks();
+      persistPlan();
       persistCampaign();
       persist();
       broadcast();
       return view();
+    },
+    turnReport: (report) => {
+      // Upsert by packId: chat-cards re-reports the same pack as cards are priced,
+      // so the latest report is the authoritative one.
+      packReports[report.packId] = report;
+      persistPacks();
+      return report;
+    },
+    packs: () =>
+      Object.values(packReports).sort((a, b) => b.openedAt - a.openedAt),
+    turns: () => ({
+      turns: turns.slice(),
+      aggregates: computeAggregates(turns, packReports),
+    }),
+    report: () => ({
+      rows: buildTurnReport(turns, packReports, config.timezone),
+      aggregates: computeAggregates(turns, packReports),
+      timezone: config.timezone,
+    }),
+    plan: (count, reseed) => {
+      if (count > 0) {
+        // Reuse the stored seed unless reseeding, so re-running `plan` (e.g. to
+        // extend the count) keeps the same order; reseed shuffles afresh.
+        const seed = reseed || !plan ? Date.now() >>> 0 : plan.seed;
+        plan = {
+          seed,
+          createdAt: Date.now(),
+          order: buildDrawPlan(state.entrants, config.firstN, seed, count),
+        };
+        persistPlan();
+      }
+      return plan; // count 0 → return the current plan without rebuilding
+    },
+    planClear: () => {
+      plan = null;
+      persistPlan();
+      return plan;
     },
   };
 
@@ -845,6 +1227,12 @@ async function runServer(configPath: string): Promise<void> {
   let getChannelAuth: (login: string) => ChannelAuth | undefined = () =>
     undefined;
   const giveawayCfg = settings.giveaway;
+  // The outbound integration bus (chat-cards etc.). Always constructed; a no-op
+  // when no subscribers are configured. The giveaway engine emits lifecycle
+  // events into it (e.g. a draw → open a pack for the winner).
+  const integrations = createIntegrationDispatcher(
+    settings.integrations ?? normalizeIntegrationsConfig(undefined),
+  );
   // Follower milestones need follow events, which only arrive for channels with
   // an EventSub connection — surface "tracking unavailable" honestly in the UI.
   const esLogins = new Set(
@@ -862,6 +1250,7 @@ async function runServer(configPath: string): Promise<void> {
       followTracking,
       getChannelAuth: (login) => getChannelAuth(login),
       getBroadcast: () => broadcastGiveaway,
+      emitIntegration: (ev) => integrations.emit(ev),
     })
     : undefined;
   if (giveawayEngine) await giveawayEngine.init();
@@ -952,7 +1341,7 @@ function cliUsage(): string {
     "  multichat set-youtube-key [opts] [KEY]     set the YouTube API key on a running server",
     "  multichat login [opts]                     authorize a Twitch channel for EventSub alerts",
     "  multichat fake [kind] [opts]               inject fake events (all kinds, or just one) into a running server",
-    "  multichat giveaway [verb] [opts]           control the giveaway (status|open|close|draw|reset|demo|winners|campaign-reset|remove <userId>)",
+    "  multichat giveaway [verb] [opts]           control the giveaway (status|open|close|draw|reset|demo|winners|packs|turns|report|plan|campaign-reset|remove <userId>)",
     "",
     "Options (set-youtube-key, fake, and giveaway share these):",
     "  -p, --port <port>   server port   (default: $PORT or 8080)",
@@ -988,6 +1377,11 @@ function cliUsage(): string {
     "  multichat giveaway reset    # clear the entrant pool (keeps campaign + winners)",
     "  multichat giveaway demo     # add sample entrants (+ follower progress) to preview the reel",
     "  multichat giveaway winners [--csv]   # the recorded winners / mailing list",
+    "  multichat giveaway packs   # pack-opening reports pushed back by chat-cards (cards pulled + value)",
+    "  multichat giveaway turns   # the turn ledger (winner, disposition) + mailed/donated/destroyed/passed totals",
+    "  multichat giveaway report [--csv]   # compiled per-user report: MST turn-start, cards pulled, value, disposition",
+    "  multichat giveaway plan [N] [--reseed] [--csv]   # commit/show the next-N seeded draw order (off-stream prep)",
+    "  multichat giveaway plan-clear   # drop the committed draw order (draws go fully random)",
     "  multichat giveaway campaign-reset --yes   # zero campaign + numbers; archives the winners log",
     "  multichat giveaway remove <userId>   # drop one entrant",
   ].join("\n");
@@ -1176,6 +1570,8 @@ async function runGiveaway(args: string[]): Promise<void> {
   let userId = "";
   let csv = false;
   let yes = false;
+  let count = 0;
+  let reseed = false;
 
   const VERBS = [
     "status",
@@ -1185,6 +1581,11 @@ async function runGiveaway(args: string[]): Promise<void> {
     "reset",
     "demo",
     "winners",
+    "packs",
+    "turns",
+    "report",
+    "plan",
+    "plan-clear",
     "campaign-reset",
     "remove",
   ];
@@ -1201,13 +1602,19 @@ async function runGiveaway(args: string[]): Promise<void> {
       csv = true;
     } else if (a === "--yes") {
       yes = true;
+    } else if (a === "--reseed") {
+      reseed = true;
     } else if (VERBS.includes(a)) {
       action = a;
     } else if (action === "remove" && !userId) {
       userId = a; // the userId positional after `remove`
+    } else if (action === "plan" && Number.isFinite(Number(a))) {
+      count = Math.max(0, Math.floor(Number(a))); // `plan <N>` positional
     } else {
       console.error(`Unknown argument: ${a}`);
-      console.error(`Usage: multichat giveaway [${VERBS.join("|")}] [userId]`);
+      console.error(
+        `Usage: multichat giveaway [${VERBS.join("|")}] [userId|N]`,
+      );
       Deno.exit(2);
     }
   }
@@ -1230,6 +1637,8 @@ async function runGiveaway(args: string[]): Promise<void> {
 
   const wire: GiveawayAction = action === "remove"
     ? { action: "remove", userId }
+    : action === "plan"
+    ? { action: "plan", count, reseed }
     : { action } as GiveawayAction;
   const { res, text } = await postControl(
     host,
@@ -1248,7 +1657,144 @@ async function runGiveaway(args: string[]): Promise<void> {
       winner?: GiveawayWinner | null;
       segment?: string;
       winners?: GiveawayWinner[];
+      packs?: PackReport[];
+      turns?: GiveawayTurn[];
+      aggregates?: TurnAggregates;
+      rows?: ReportRow[];
+      timezone?: string;
+      plan?: GiveawayPlan | null;
     };
+    if (action === "report") {
+      const rows = data.rows ?? [];
+      if (csv) {
+        console.log(reportToCsv(rows).trimEnd()); // raw CSV, pipe to a file
+        Deno.exit(0);
+      }
+      if (rows.length === 0) {
+        console.log("No turns to report yet.");
+      } else {
+        console.log(`Compiled report (times in ${data.timezone ?? "?"}):`);
+        for (const r of rows) {
+          console.log(
+            `  #${r.number} ${r.displayName} [${r.tier}]  ${r.startedLocal}  → ${
+              r.disposition || "(in progress)"
+            }`,
+          );
+          if (r.cardCount > 0) {
+            console.log(
+              `      ${r.cardCount} card(s), $${r.totalValue.toFixed(2)}: ${
+                r.cardNames.join(", ")
+              }`,
+            );
+          }
+          if (r.carriedFrom) {
+            console.log(`      ↳ received a pass from ${r.carriedFrom}`);
+          }
+          if (r.passedTo) console.log(`      ↳ passed to ${r.passedTo}`);
+        }
+      }
+      const a = data.aggregates;
+      if (a) {
+        const fmt = (d: { turns: number; cards: number; value: number }) =>
+          `${d.turns}/${d.cards}c/$${d.value.toFixed(2)}`;
+        console.log(
+          `  Totals (turns/cards/value) — mailed ${fmt(a.mailed)} · donated ${
+            fmt(a.donated)
+          } · destroyed ${fmt(a.destroyed)} · passed ${fmt(a.passed)}`,
+        );
+      }
+      Deno.exit(0);
+    }
+    if (action === "plan-clear") {
+      console.log("Draw plan cleared — draws are fully random again.");
+      Deno.exit(0);
+    }
+    if (action === "plan") {
+      const p = data.plan ?? null;
+      if (!p || p.order.length === 0) {
+        console.log(
+          "No draw plan committed. Run `giveaway plan <N>` with entrants in the pool.",
+        );
+        Deno.exit(0);
+      }
+      if (csv) {
+        const q = (s: string) =>
+          /[",\n\r]/.test(s) ? `"${s.replaceAll('"', '""')}"` : s;
+        console.log("position,number,displayName,login,userId");
+        p.order.forEach((e, i) =>
+          console.log(
+            `${i + 1},${e.number},${q(e.displayName)},${q(e.login)},${
+              q(e.userId)
+            }`,
+          )
+        );
+        Deno.exit(0);
+      }
+      console.log(
+        `Committed draw order (seed ${p.seed}, ${p.order.length} planned) — ` +
+          `keep this off-stream:`,
+      );
+      p.order.forEach((e, i) =>
+        console.log(
+          `  ${String(i + 1).padStart(3)}. #${e.number} ${e.displayName} (${
+            e.login || e.userId
+          })`,
+        )
+      );
+      Deno.exit(0);
+    }
+    if (action === "turns") {
+      const list = data.turns ?? [];
+      const a = data.aggregates;
+      if (list.length === 0) {
+        console.log("No turns yet.");
+      } else {
+        for (const t of list) {
+          const started = t.startedAt
+            ? new Date(t.startedAt).toISOString()
+            : "?";
+          const disp = t.disposition ? `→ ${t.disposition}` : "(in progress)";
+          console.log(
+            `#${t.number} ${t.displayName} [${t.tier}] ${disp}  started ${started}` +
+              (t.carriedFromTurnId ? "  (received a pass)" : ""),
+          );
+        }
+        console.log(`${list.length} turn(s).`);
+      }
+      if (a) {
+        const fmt = (d: { turns: number; cards: number; value: number }) =>
+          `${d.turns} turn(s), ${d.cards} card(s), $${d.value.toFixed(2)}`;
+        console.log(
+          `Totals — mailed: ${fmt(a.mailed)} · donated: ${fmt(a.donated)} · ` +
+            `destroyed: ${fmt(a.destroyed)} · passed: ${fmt(a.passed)}`,
+        );
+      }
+      Deno.exit(0);
+    }
+    if (action === "packs") {
+      const list = data.packs ?? [];
+      if (list.length === 0) {
+        console.log("No pack reports yet (chat-cards hasn't reported any).");
+      } else {
+        for (const p of list) {
+          const opened = p.openedAt ? new Date(p.openedAt).toISOString() : "?";
+          const who = p.winner || p.ref || "?";
+          console.log(
+            `${who}  ${p.cardCount} card(s)  $${p.totalValue.toFixed(2)}  ` +
+              `[${p.closedAt ? "closed" : "open"}]  opened ${opened}`,
+          );
+          for (const c of p.cards) {
+            console.log(
+              `    · ${c.name}${c.number ? ` #${c.number}` : ""}  $${
+                c.value.toFixed(2)
+              }`,
+            );
+          }
+        }
+        console.log(`${list.length} pack(s).`);
+      }
+      Deno.exit(0);
+    }
     if (action === "winners") {
       const list = data.winners ?? [];
       if (csv) {
@@ -1288,8 +1834,10 @@ async function runGiveaway(args: string[]): Promise<void> {
         }.`,
       );
       const c = s.campaign;
-      if (c && (c.guaranteedRemaining > 0 || c.followerCount > 0 ||
-            c.winnersTotal > 0 || c.poolSize !== s.entrants.length)) {
+      if (
+        c && (c.guaranteedRemaining > 0 || c.followerCount > 0 ||
+          c.winnersTotal > 0 || c.poolSize !== s.entrants.length)
+      ) {
         console.log(
           `Campaign: ${c.guaranteedRemaining} guaranteed in queue · ` +
             `${c.poolSize} in bonus pool · ${c.winnersTotal} winner(s) recorded.`,

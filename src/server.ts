@@ -17,6 +17,7 @@ import {
 } from "./control.ts";
 import { describeFakeAction, parseFakeAction } from "./fake.ts";
 import { parseGiveawayAction } from "./giveaway.ts";
+import { parseTurnReport } from "./integrations.ts";
 
 const HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -1345,6 +1346,22 @@ const GIVEAWAY_HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
+/** Constant-time string compare for the turn-report bearer token, so a mismatch
+ *  can't be probed byte-by-byte via response timing. */
+function safeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+/** Extract a bearer token from an `Authorization: Bearer …` header or `?token=`. */
+function requestToken(req: Request): string {
+  const header = req.headers.get("authorization") ?? "";
+  if (header.toLowerCase().startsWith("bearer ")) return header.slice(7).trim();
+  return new URL(req.url).searchParams.get("token") ?? "";
+}
+
 /** Stable derived color for an author name (used when the platform gives none). */
 export function colorFor(name: string): string {
   let h = 0;
@@ -1397,6 +1414,9 @@ export function createServer(
     "<!--GIVEAWAY-->",
     `<script>window.MULTICHAT_GIVEAWAY=${giveawayJson}</script>`,
   );
+
+  // Bearer required on POST /api/turn-report (else that endpoint is loopback-only).
+  const callbackToken = settings.integrations?.callbackToken ?? "";
 
   // Seed one status entry per configured channel, all "connecting" until a client reports in.
   const statuses = new Map<string, ChannelStatus>();
@@ -1597,11 +1617,65 @@ export function createServer(
           case "winners":
             payload = { winners: gh.winners() };
             break;
+          case "packs":
+            payload = { packs: gh.packs() };
+            break;
+          case "turns":
+            payload = gh.turns();
+            break;
+          case "report":
+            payload = gh.report();
+            break;
+          case "plan":
+            payload = { plan: gh.plan(a.count, a.reseed) };
+            break;
+          case "plan-clear":
+            payload = { plan: gh.planClear() };
+            break;
           case "campaign-reset":
             payload = { state: gh.campaignReset() };
             break;
         }
         return ctl(JSON.stringify(payload) + "\n", 200, true);
+      }
+
+      // Inbound integration callback: an external tool (chat-cards) pushes back a
+      // pack-opening summary — the cards pulled + their values — so the giveaway
+      // ledger is complete. Authenticated by the configured callbackToken (bearer
+      // or ?token=); with no token set it falls back to loopback-only, matching
+      // the other control endpoints. See integrations.ts / control.ts.
+      if (pathname === "/api/turn-report") {
+        const ctl = (body: string, status: number, json = false) =>
+          new Response(body, {
+            status,
+            headers: {
+              "x-multichat": "control",
+              ...(json ? { "content-type": "application/json" } : {}),
+            },
+          });
+        if (req.method !== "POST") return ctl("Method Not Allowed\n", 405);
+        if (callbackToken) {
+          const token = requestToken(req);
+          if (!token || !safeEqual(token, callbackToken)) {
+            return ctl("Forbidden: bad or missing callback token\n", 403);
+          }
+        } else if (!isLoopbackAddr(info.remoteAddr)) {
+          return ctl(
+            "Forbidden: set integrations.callbackToken to allow non-loopback reports\n",
+            403,
+          );
+        }
+        if (!hooks.giveaway) return ctl("Giveaway is not enabled\n", 501);
+        const parsed = parseTurnReport(await req.text(), Date.now());
+        if (!parsed.ok) {
+          return ctl("Bad Request: " + parsed.message + "\n", 400);
+        }
+        const stored = hooks.giveaway.turnReport(parsed.report);
+        return ctl(
+          JSON.stringify({ ok: true, report: stored }) + "\n",
+          200,
+          true,
+        );
       }
 
       if (pathname === "/giveaway") {
