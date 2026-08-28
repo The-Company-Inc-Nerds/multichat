@@ -92,7 +92,22 @@ let
       enabled = cfg.giveaway.enable;
       inherit (cfg.giveaway)
         channel prefix command requireFollow replies messages
-        firstN followerStep milestoneDraws;
+        firstN followerStep milestoneDraws timezone;
+    }
+    # Both blocks are omitted entirely when off, rather than emitted with a false
+    # flag: the app reads a *present* block as "this gate was configured on
+    # purpose", so shipping a disabled one is more surprising than shipping none.
+    // lib.optionalAttrs cfg.giveaway.terms.enable {
+      terms = {
+        required = true;
+        inherit (cfg.giveaway.terms) command version url;
+      };
+    }
+    // lib.optionalAttrs cfg.giveaway.disposition.enable {
+      disposition = {
+        enabled = true;
+        inherit (cfg.giveaway.disposition) mail donate destroy pass;
+      };
     };
     # File-sourced tokens are blanked here and supplied from the environment at
     # runtime (see the unit script), so this store-readable file holds no secret.
@@ -504,6 +519,90 @@ in
       '';
     };
 
+    giveaway.timezone = lib.mkOption {
+      type = lib.types.str;
+      default = "America/Denver";
+      example = "America/New_York";
+      description = ''
+        IANA timezone the compiled winners/turns report renders turn-start times
+        in. Defaults to Mountain Time (DST-aware — do NOT use a fixed "MST",
+        which would be an hour off for half the year). An unrecognised zone falls
+        back to the default at runtime rather than failing.
+      '';
+    };
+
+    giveaway.terms.enable = lib.mkEnableOption ''
+      a terms-acceptance gate on the entry command. With it on, `!enter` admits
+      only entrants who have already typed the accept command; everyone else gets
+      the `termsRequired` reply instead of an entry
+    '';
+
+    giveaway.terms.command = lib.mkOption {
+      type = lib.types.str;
+      default = "accept";
+      description = ''
+        Command word entrants type to accept, after the same
+        {option}`giveaway.prefix` — so the default gives `!accept`.
+      '';
+    };
+
+    giveaway.terms.version = lib.mkOption {
+      type = lib.types.str;
+      default = "1";
+      example = "2";
+      description = ''
+        Bump this to invalidate every acceptance on file and make entrants accept
+        again. Use it whenever the terms change in a way that matters.
+      '';
+    };
+
+    giveaway.terms.url = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      example = "https://example.com/giveaway-terms";
+      description = ''
+        Where the full terms live. multichat does NOT host them — this string is
+        only substituted into the `termsRequired` chat reply as `{terms}`, so it
+        must point at a page you publish yourself. Leave it empty and write the
+        terms into the `termsRequired` message instead.
+      '';
+    };
+
+    giveaway.disposition.enable = lib.mkEnableOption ''
+      the winner-turn disposition commands. The current winner can say one of the
+      words below in chat (with or without the command prefix) to choose what
+      happens to their pull; each choice is recorded and tallied for the campaign
+      report
+    '';
+
+    giveaway.disposition.mail = lib.mkOption {
+      type = lib.types.str;
+      default = "mail";
+      description = "Word that records the cards as being mailed to the winner.";
+    };
+
+    giveaway.disposition.donate = lib.mkOption {
+      type = lib.types.str;
+      default = "donate";
+      description = "Word that records the cards as donated (e.g. to a shop's free pile).";
+    };
+
+    giveaway.disposition.destroy = lib.mkOption {
+      type = lib.types.str;
+      default = "destroy";
+      description = "Word that records the cards as destroyed on air.";
+    };
+
+    giveaway.disposition.pass = lib.mkOption {
+      type = lib.types.str;
+      default = "pass";
+      description = ''
+        Word that carries the cards to the next winner's turn and advances the
+        draw. Unlike the other three this one changes the giveaway's state, not
+        just the tally.
+      '';
+    };
+
     giveaway.messages = lib.mkOption {
       type = lib.types.attrsOf lib.types.str;
       default = { };
@@ -646,6 +745,18 @@ in
           + cfg.giveaway.channel
           + "\" has no EventSub connection — follow events can't be received, so milestone "
           + "progress won't advance. Add it to twitch.eventsub.channels (via `multichat login`).")
+      ++ lib.optional
+        (cfg.giveaway.enable && cfg.giveaway.terms.enable && !cfg.giveaway.replies)
+        ("services.multichat.giveaway.terms.enable is on but giveaway.replies is off — the "
+          + "`termsRequired` prompt is a chat reply, so entrants are refused with no way to "
+          + "learn they must type \"" + cfg.giveaway.prefix + cfg.giveaway.terms.command
+          + "\" first. Turn replies on, or announce the accept command another way.")
+      ++ lib.optional
+        (cfg.giveaway.enable && cfg.giveaway.terms.enable && cfg.giveaway.terms.url == ""
+          && !(cfg.giveaway.messages ? termsRequired))
+        ("services.multichat.giveaway.terms.enable is on with no terms.url and no custom "
+          + "`termsRequired` message — the built-in prompt renders an empty \"()\" where the "
+          + "link should be. Set terms.url, or write the terms into messages.termsRequired.")
       ++ lib.optional (intCfg.callbackTokenFile == null && intCfg.callbackToken != "")
         ("services.multichat.integrations.callbackToken is written into the Nix store and shown by "
           + "`systemctl show multichat`. Use callbackTokenFile for real secrets.")

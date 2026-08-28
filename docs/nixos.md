@@ -128,6 +128,13 @@ waits for the key. The control endpoint is loopback-only (see
 | `giveaway.followerStep`            | int                                                     | `0`                    | Arm draw credits every N new followers via EventSub (0 = no tracking), e.g. `100`              |
 | `giveaway.milestoneDraws`          | int                                                     | `1`                    | Draw credits armed per milestone, e.g. `10`                                                    |
 | `giveaway.messages`                | `attrs of string`                                       | `{}`                   | Optional reply templates incl. `enteredPool`/`milestone`; placeholders `{user}`/`{number}`/…   |
+| `giveaway.timezone`                | string                                                  | `"America/Denver"`     | IANA zone the compiled report renders turn times in (DST-aware — not a fixed `MST`)            |
+| `giveaway.terms.enable`            | bool                                                    | `false`                | Gate entry on accepting the terms; needs `replies` (the prompt is a chat reply)                |
+| `giveaway.terms.command`           | string                                                  | `"accept"`             | Accept command word after `prefix`, giving `!accept`                                           |
+| `giveaway.terms.version`           | string                                                  | `"1"`                  | Bump to invalidate every acceptance on file                                                    |
+| `giveaway.terms.url`               | string                                                  | `""`                   | Where the full T&C is published — multichat does **not** host it                               |
+| `giveaway.disposition.enable`      | bool                                                    | `false`                | Let the winner pick their pull's fate in chat                                                  |
+| `giveaway.disposition.{mail,donate,destroy,pass}` | string                                   | the same word          | The chat words for each choice; `pass` also advances the draw                                  |
 | `integrations.callbackToken`       | string                                                  | `""`                   | Callback bearer inline (Nix store — prefer `callbackTokenFile`)                                |
 | `integrations.callbackTokenFile`   | path                                                    | `null`                 | File with the raw callback bearer; staged via `LoadCredential`                                 |
 | `integrations.subscribers`         | `[{name,adapter,baseUrl,events,enabled,token,tokenFile,packSize}]` | `[]`        | External tools to push giveaway events to (see below)                                          |
@@ -307,6 +314,13 @@ env var — `"chat-cards"` and `"chat cards"` both become
 token. Inline `integrations.callbackToken` / subscriber `token` warn like the
 other in-store secrets, and configuring subscribers with `giveaway.enable = false`
 warns too: the bus only carries giveaway events, so nothing would ever be sent.
+
+The terms gate warns in two more cases: with `replies` off (the "you must accept
+first" prompt is a chat reply, so entrants would be refused in silence), and with
+neither `terms.url` nor a custom `messages.termsRequired` (the built-in prompt
+renders an empty `()` where the link belongs). `terms` and `disposition` are
+emitted into `settings.json` only when enabled — the app reads a present block as
+"configured on purpose", so a disabled one is never written.
 
 ## Security hardening
 

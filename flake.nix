@@ -49,6 +49,9 @@
                 channel = "demo";
                 requireFollow = false; # no EventSub in the test VM
                 replies = false;
+                timezone = "America/Denver";
+                terms = { enable = true; version = "3"; url = "https://example.test/terms"; };
+                disposition.enable = true;
               };
               integrations = {
                 callbackTokenFile = "/etc/multichat-callback-token";
@@ -108,6 +111,21 @@
             # Neither token may appear in the world-readable settings file.
             machine.fail("grep -rq callback-secret /nix/store/*-multichat-settings.json")
             machine.fail("grep -rq outbound-secret /nix/store/*-multichat-settings.json")
+
+            # The gates the module emits conditionally: present and switched on,
+            # with the operator's own values rather than the app's defaults.
+            settings = json.loads(
+                machine.succeed("cat /nix/store/*-multichat-settings.json")
+            )["giveaway"]
+            assert settings["timezone"] == "America/Denver", settings
+            assert settings["terms"] == {
+                "required": True,
+                "command": "accept",
+                "version": "3",
+                "url": "https://example.test/terms",
+            }, settings
+            assert settings["disposition"]["enabled"] is True, settings
+            assert settings["disposition"]["destroy"] == "destroy", settings
 
             # Outbound: a draw must open a pack in the subscriber.
             giveaway("open")

@@ -284,6 +284,9 @@ overlay, see below).
 | `followerStep`   | number | Arm `milestoneDraws` draw credits every N **new** followers (live via EventSub). 0 = no tracking. See below.                          |
 | `milestoneDraws` | number | Draw credits armed per milestone crossed. Default 1.                                                                                  |
 | `messages`       | object | Optional reply templates — see [Message templates](#giveaway-message-templates) below.                                                |
+| `timezone`       | string | IANA zone the compiled report renders turn times in. Default `"America/Denver"`.                                                      |
+| `terms`          | object | Optional terms-acceptance gate on entry — see below. Omit the block for no gate.                                                      |
+| `disposition`    | object | Optional winner-turn commands for what happens to the pull — see below. Omit for none.                                               |
 
 **Why Twitch-only.** YouTube's API has no way to verify whether a viewer is
 subscribed to a channel (subscriber lists are private and un-queryable), so a
@@ -366,6 +369,55 @@ more packs for random people from the pool"*:
   the log to a `.bak-<timestamp>` file (never deletes it) and zeroes the
   counters + entry numbers.
 
+### Terms gate
+
+```json
+"terms": { "required": true, "command": "accept", "version": "1", "url": "https://example.com/terms" }
+```
+
+With the block present, `!enter` admits only entrants who have already typed the
+accept command (`prefix` + `terms.command`, so `!accept` by default); everyone
+else gets the `termsRequired` reply instead of an entry. Acceptances are
+persisted with the rest of the giveaway state. Bump `version` to invalidate every
+acceptance on file and make people accept again after the terms change.
+
+**multichat does not host a terms page.** `url` is only substituted into the
+`termsRequired` reply as `{terms}` — it has to point at a page you publish
+yourself. If you have no page yet, leave `url` empty and write the terms into the
+`termsRequired` message; the built-in prompt would otherwise render an empty
+`()` where the link belongs.
+
+The gate is only as visible as your chat replies. With `replies: false` an
+entrant who hasn't accepted is refused **in silence**, with nothing telling them
+the accept command exists — so keep replies on whenever the gate is, or announce
+the command another way.
+
+Omitting the block entirely is what turns the gate off. A block that is present
+but sets `"required": false` is treated as "configured on purpose, then
+disabled"; the NixOS module never emits one.
+
+### Winner dispositions
+
+```json
+"disposition": { "enabled": true, "mail": "mail", "donate": "donate", "destroy": "destroy", "pass": "pass" }
+```
+
+The current winner can say one of these words in chat — with or without the
+command prefix — to choose what happens to their pull. `mail`, `donate` and
+`destroy` record the choice and add to the campaign tally; `pass` also carries
+the cards onto the next winner's turn and advances the draw, so it changes state
+rather than just recording. Each choice fires `giveaway.turn.disposition` on the
+[integration bus](#integrations) and gets a `mailed`/`donated`/`destroyed`/
+`passed` chat reply.
+
+**Chat is the only route, and only the winner can take it.** The handler checks
+the speaker's own Twitch user id against the active turn and ignores everyone
+else, including you; it also refuses a second decision once one is recorded.
+There is no operator override — no `/api/giveaway` action, no CLI verb, and no
+control on the `/giveaway` page, which only *displays* the active turn. So a
+winner who says nothing leaves their turn open indefinitely, and a winner who
+won't cooperate cannot be dispositioned on their behalf.
+
 ### Giveaway message templates
 
 The `messages` object overrides any of the built-in chat replies. `{user}` is
@@ -379,6 +431,12 @@ always the viewer's display name; the other placeholders are filled per key:
 | `notFollowing`   | `requireFollow` rejects a non-follower        | —                                                                        |
 | `winner`         | a draw lands                                  | `{number}`                                                               |
 | `milestone`      | a follower milestone is crossed               | `{count}` total new follows, `{milestone}` ordinal, `{draws}` credits    |
+| `termsRequired`  | `!enter` from someone who hasn't accepted the terms | `{accept}` the accept command, `{terms}` the T&C url            |
+| `termsAccepted`  | a successful `!accept`                        | `{enter}` the entry command                                              |
+| `mailed`         | the winner chooses `mail`                     | `{cards}` count, `{value}` pack total                                    |
+| `donated`        | the winner chooses `donate`                   | `{cards}`, `{value}`                                                     |
+| `destroyed`      | the winner chooses `destroy`                  | `{cards}`, `{value}`                                                     |
+| `passed`         | the winner chooses `pass`                     | `{cards}`, `{value}`, `{next}` the winner drawn next                     |
 
 ```json
 "messages": {

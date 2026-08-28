@@ -99,7 +99,12 @@ Copy `settings.json.example` to `settings.json` and edit:
   next person's turn + auto-advances the draw); `timezone` (default
   `America/Denver`) is what the compiled `report` renders turn-start times in.
   Draw on `/giveaway` (a CS2-style case reel; `?overlay` = transparent OBS
-  source). See `docs/configuration.md`
+  source). `terms`/`disposition` are only honoured when the block is PRESENT —
+  module.nix therefore emits each one only when its `enable` is set, rather than
+  writing a disabled block. The terms gate needs `replies`: the prompt is a chat
+  reply, so with replies off an unaccepted entrant is refused in silence. There
+  is no `/terms` route — `terms.url` is substituted into the prompt as `{terms}`
+  and nothing more. See `docs/configuration.md`
 - `integrations` — optional outbound event bus
   `{callbackToken, subscribers:
   [{name, adapter, baseUrl, token, events, enabled, packSize}]}`.
