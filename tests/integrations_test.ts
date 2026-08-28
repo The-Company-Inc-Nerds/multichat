@@ -1,10 +1,12 @@
 import {
+  applyIntegrationEnv,
   buildIntegrationRequests,
   type IntegrationEvent,
   normalizeIntegrationsConfig,
   normalizePackReports,
   parseTurnReport,
   serializePackReports,
+  subscriberTokenEnvVar,
   subscriberWantsEvent,
 } from "../src/integrations.ts";
 import type { IntegrationSubscriber, PackReport } from "../src/types.ts";
@@ -241,4 +243,69 @@ Deno.test("normalizePackReports: round-trips, drops garbage entries", () => {
   assertEquals(restored.p1.cards[0], { name: "Pikachu", value: 9.5 });
 
   assertEquals(normalizePackReports("garbage"), {});
+});
+
+Deno.test("subscriberTokenEnvVar: name → env var, punctuation collapsed", () => {
+  assertEquals(
+    subscriberTokenEnvVar("chat-cards"),
+    "MULTICHAT_INTEGRATION_TOKEN_CHAT_CARDS",
+  );
+  assertEquals(
+    subscriberTokenEnvVar("My Tool v2"),
+    "MULTICHAT_INTEGRATION_TOKEN_MY_TOOL_V2",
+  );
+  // Leading/trailing punctuation must not leave a dangling underscore, or the
+  // NixOS module and the app would compute different names for the same tool.
+  assertEquals(
+    subscriberTokenEnvVar("-cc-"),
+    "MULTICHAT_INTEGRATION_TOKEN_CC",
+  );
+});
+
+Deno.test("applyIntegrationEnv: env tokens win over the settings file", () => {
+  const cfg = normalizeIntegrationsConfig({
+    callbackToken: "from-file",
+    subscribers: [
+      {
+        name: "chat-cards",
+        adapter: "chat-cards",
+        baseUrl: "http://cc:8787",
+        token: "file-token",
+      },
+      { name: "hook", baseUrl: "http://hook" },
+    ],
+  });
+  const env: Record<string, string> = {
+    MULTICHAT_CALLBACK_TOKEN: "  from-env ",
+    MULTICHAT_INTEGRATION_TOKEN_CHAT_CARDS: "env-token",
+  };
+  const out = applyIntegrationEnv(cfg, (n) => env[n]);
+
+  assertEquals(out.callbackToken, "from-env");
+  assertEquals(out.subscribers[0].token, "env-token");
+  // A subscriber with no env var keeps whatever the file said (here: nothing).
+  assertEquals(out.subscribers[1].token, undefined);
+  // The input must not be mutated — loadSettings reuses the normalized value.
+  assertEquals(cfg.callbackToken, "from-file");
+  assertEquals(cfg.subscribers[0].token, "file-token");
+});
+
+Deno.test("applyIntegrationEnv: no env leaves the file config intact", () => {
+  const cfg = normalizeIntegrationsConfig({
+    callbackToken: "keep",
+    subscribers: [{
+      name: "cc",
+      adapter: "chat-cards",
+      baseUrl: "http://cc",
+      token: "t",
+    }],
+  });
+  const out = applyIntegrationEnv(cfg, () => undefined);
+  assertEquals(out.callbackToken, "keep");
+  assertEquals(out.subscribers[0].token, "t");
+
+  // An empty/blank env value is not a token — it must not blank out the file's.
+  const blank = applyIntegrationEnv(cfg, () => "   ");
+  assertEquals(blank.callbackToken, "keep");
+  assertEquals(blank.subscribers[0].token, "t");
 });

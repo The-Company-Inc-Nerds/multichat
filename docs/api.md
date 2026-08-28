@@ -188,6 +188,38 @@ viewers typing the command in chat (see
 | `405`  | Method was not `POST`                                      |
 | `501`  | No giveaway is enabled in settings                         |
 
+## `POST /api/turn-report`
+
+Where an integration pushes a result back so it lands on the winner's turn in the
+giveaway ledger. chat-cards calls this for every pack it opens, re-sending the
+whole pack each time a card is scanned or repriced.
+
+- **Auth.** The bearer configured as `integrations.callbackToken`, sent as
+  `Authorization: Bearer …` or `?token=`. With no token configured the endpoint
+  is loopback-only, like the other control endpoints.
+- **Body.** A JSON object. `packId` is required — it is the upsert key, so a
+  re-send of the same pack replaces the previous report rather than duplicating
+  it. Everything else defaults defensively, so a partial report still records:
+  `ref` (the turn id from `giveaway.turn.start`, which is what attaches the
+  report to a turn), `winner`, `label`, `index`, `size`, `openedAt`, `closedAt`,
+  `totalValue`, `cardCount`, and `cards[]` of
+  `{name, number?, set?, rarity?, value, image?}`. Timestamps are epoch ms.
+- **Response.** JSON `{ "ok": true, "report": PackReport }` with `receivedAt`
+  stamped by the server.
+
+Reports are persisted with the rest of the giveaway state, so they survive a
+restart.
+
+| Status | Meaning                                       |
+| ------ | --------------------------------------------- |
+| `200`  | Recorded; the stored report is echoed back    |
+| `400`  | Body was not valid JSON, or `packId` was missing |
+| `403`  | Bad/missing callback token, or a non-loopback peer with no token configured |
+| `405`  | Method was not `POST`                         |
+| `501`  | No giveaway is enabled in settings            |
+
+See [Integrations](configuration.md#integrations) for the outbound half.
+
 ## The SSE stream
 
 `/events` is a Server-Sent Events stream. On connect, the server sends a

@@ -5,6 +5,34 @@
 let
   cfg = config.services.multichat;
   esCfg = cfg.twitch.eventsub;
+  intCfg = cfg.integrations;
+
+  # Subscribers whose outbound bearer token is staged from a file.
+  intTokenFiles = builtins.filter (s: s.tokenFile != null) intCfg.subscribers;
+
+  # Uppercase, every run of non-alphanumerics collapsed to one "_", no leading or
+  # trailing "_". Used for both the env-var name and the systemd credential id, so
+  # the credential id is always a safe filename whatever the subscriber is called.
+  intTokenSlug = name:
+    lib.concatStringsSep "_"
+      (builtins.filter (p: builtins.isString p && p != "")
+        (builtins.split "[^A-Z0-9]+" (lib.toUpper name)));
+
+  # Must mirror subscriberTokenEnvVar() in src/integrations.ts exactly. If the two
+  # ever disagree the token is exported under a name the app doesn't read, and the
+  # subscriber silently calls out unauthenticated.
+  intTokenEnv = name: "MULTICHAT_INTEGRATION_TOKEN_" + intTokenSlug name;
+
+  intTokenCred = name: "integration-token-" + intTokenSlug name;
+
+  # Host part of a subscriber's baseUrl, for the package's --allow-net allow-list.
+  # Scheme and any port/path are dropped (Deno matches a bare host on any port).
+  # Bracketed IPv6 literals aren't handled — set `package` yourself for those.
+  urlHost = url:
+    lib.head (lib.splitString ":"
+      (lib.head (lib.splitString "/" (lib.last (lib.splitString "://" url)))));
+
+  subscriberHosts = lib.unique (map (s: urlHost s.baseUrl) intCfg.subscribers);
 
   # EventSub channels whose seed refresh token is staged from a file (needs the
   # broadcasterId to name the persisted state file).
@@ -20,7 +48,12 @@ let
       "twitch-client-secret:${toString esCfg.clientSecretFile}"
     ++ map
       (ch: "twitch-refresh-${ch.broadcasterId}:${toString ch.refreshTokenFile}")
-      esTokenFiles;
+      esTokenFiles
+    ++ lib.optional (intCfg.callbackTokenFile != null)
+      "integration-callback-token:${toString intCfg.callbackTokenFile}"
+    ++ map
+      (s: "${intTokenCred s.name}:${toString s.tokenFile}")
+      intTokenFiles;
 
   # Inline (non-file) secrets passed as env. These land in the Nix store /
   # `systemctl show` — the *File options are preferred for real secrets.
@@ -61,6 +94,18 @@ let
         channel prefix command requireFollow replies messages
         firstN followerStep milestoneDraws;
     };
+    # File-sourced tokens are blanked here and supplied from the environment at
+    # runtime (see the unit script), so this store-readable file holds no secret.
+    integrations = {
+      callbackToken =
+        if intCfg.callbackTokenFile != null then "" else intCfg.callbackToken;
+      subscribers = map
+        (s: {
+          inherit (s) name adapter baseUrl events enabled packSize;
+          token = if s.tokenFile != null then "" else s.token;
+        })
+        intCfg.subscribers;
+    };
   });
 in
 {
@@ -69,9 +114,19 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = import ./build.nix { inherit pkgs; };
-      defaultText = lib.literalExpression "import ./build.nix { inherit pkgs; }";
-      description = "The multichat package to use.";
+      default = import ./build.nix {
+        inherit pkgs;
+        extraNetHosts = subscriberHosts;
+      };
+      defaultText = lib.literalExpression
+        "import ./build.nix { inherit pkgs; extraNetHosts = <integration subscriber hosts>; }";
+      description = ''
+        The multichat package to use. The default is built with each
+        {option}`integrations.subscribers` host added to the deno wrapper's
+        --allow-net allow-list, so the outbound integration bus can reach them.
+        Override it and you must widen that list yourself (build.nix takes an
+        `extraNetHosts` argument) or every outbound call is denied by Deno.
+      '';
     };
 
     port = lib.mkOption {
@@ -277,6 +332,128 @@ in
       description = "Named alert themes for the /alerts overlay; select one with alerts.activeTheme.";
     };
 
+    integrations.callbackToken = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = ''
+        Bearer token an external tool must present to POST results back to
+        `/api/turn-report`. With no token set that endpoint accepts loopback
+        requests only — which is all two services on the same machine need.
+
+        Ends up in the Nix store and in `systemctl show multichat` — use
+        callbackTokenFile for a real secret.
+      '';
+    };
+
+    integrations.callbackTokenFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      example = "/run/secrets/multichat-callback-token";
+      description = ''
+        Path to a file containing the raw callback token. Staged via systemd
+        LoadCredential and exported as MULTICHAT_CALLBACK_TOKEN, so it never
+        enters the Nix store. Takes precedence over callbackToken.
+      '';
+    };
+
+    integrations.subscribers = lib.mkOption {
+      type = lib.types.listOf (lib.types.submodule {
+        options = {
+          name = lib.mkOption {
+            type = lib.types.str;
+            default = "";
+            example = "chat-cards";
+            description = ''
+              Identifies this subscriber in logs and names its token env var.
+              Must be unique across subscribers.
+            '';
+          };
+
+          adapter = lib.mkOption {
+            type = lib.types.enum [ "webhook" "chat-cards" ];
+            default = "webhook";
+            description = ''
+              How events are delivered. "webhook" POSTs a generic
+              `{event, ts, data}` envelope to baseUrl. "chat-cards" maps events
+              onto the chat-cards HTTP API — today `giveaway.turn.start` opens a
+              pack for the drawn winner via `POST baseUrl/api/pack`, carrying the
+              turn id as `ref` so the pack report can be correlated back.
+            '';
+          };
+
+          baseUrl = lib.mkOption {
+            type = lib.types.str;
+            example = "http://127.0.0.1:8787";
+            description = ''
+              Where to deliver. For the webhook adapter this is the exact POST
+              target; for chat-cards it is the service root (paths are appended).
+              A trailing slash is trimmed. This host is added to the deno
+              wrapper's --allow-net allow-list via the default `package`.
+            '';
+          };
+
+          events = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [ "*" ];
+            example = [ "giveaway.turn.start" ];
+            description = ''
+              Event types to deliver; "*" means all of them. Known types:
+              giveaway.turn.start, giveaway.turn.disposition, giveaway.turn.end,
+              giveaway.entrant.added, giveaway.terms.accepted. Events an adapter
+              has no mapping for are skipped regardless.
+            '';
+          };
+
+          enabled = lib.mkOption {
+            type = lib.types.bool;
+            default = true;
+            description = "Whether to deliver to this subscriber at all.";
+          };
+
+          token = lib.mkOption {
+            type = lib.types.str;
+            default = "";
+            description = ''
+              Bearer token sent with every delivery, when the target requires
+              one. Ends up in the Nix store — use tokenFile for a real secret.
+            '';
+          };
+
+          tokenFile = lib.mkOption {
+            type = lib.types.nullOr lib.types.path;
+            default = null;
+            example = "/run/secrets/chat-cards-token";
+            description = ''
+              Path to a file containing the raw bearer token. Staged via systemd
+              LoadCredential and exported to the service, so it never enters the
+              Nix store. Requires a non-empty `name`. Takes precedence over token.
+            '';
+          };
+
+          packSize = lib.mkOption {
+            type = lib.types.ints.unsigned;
+            default = 0;
+            example = 5;
+            description = ''
+              chat-cards adapter only: how many cards the opened pack holds.
+              0 leaves it to chat-cards' own default pack size.
+            '';
+          };
+        };
+      });
+      default = [ ];
+      example = lib.literalExpression ''
+        [ { name = "chat-cards"; adapter = "chat-cards"; baseUrl = "http://127.0.0.1:8787"; packSize = 5; } ]
+      '';
+      description = ''
+        External tools to push giveaway-lifecycle events to. The chat-cards
+        adapter completes a loop: a draw opens a pack in chat-cards, and
+        chat-cards POSTs the pulled cards and their value back to
+        `/api/turn-report`, where they land on the winner's turn in the ledger.
+        Point chat-cards at this server with `services.chat-cards.report.url`.
+      '';
+    };
+
     giveaway.enable =
       lib.mkEnableOption "the Twitch !enter giveaway / prize-wheel";
 
@@ -403,6 +580,22 @@ in
         assertion = !cfg.giveaway.enable || cfg.giveaway.channel != "";
         message = "services.multichat.giveaway.enable requires giveaway.channel (the Twitch login the giveaway runs on).";
       }
+      {
+        assertion = lib.all (s: s.baseUrl != "") intCfg.subscribers;
+        message = "services.multichat.integrations.subscribers: every entry must set a baseUrl (a subscriber with nowhere to deliver is dropped at runtime).";
+      }
+      {
+        assertion = lib.all (s: s.tokenFile == null || s.name != "") intCfg.subscribers;
+        message = "services.multichat.integrations.subscribers: name is required when tokenFile is set (it names the credential and the env var the app reads).";
+      }
+      {
+        # Names map to env vars by collapsing non-alphanumerics, so "chat-cards"
+        # and "chat cards" would fight over one variable and one credential.
+        assertion =
+          let named = map (s: s.name) (builtins.filter (s: s.name != "") intCfg.subscribers);
+          in lib.length (lib.unique (map intTokenEnv named)) == lib.length named;
+        message = "services.multichat.integrations.subscribers: names must be unique after uppercasing and collapsing punctuation (e.g. \"chat-cards\" and \"chat cards\" collide).";
+      }
     ];
 
     warnings =
@@ -452,7 +645,18 @@ in
         ("services.multichat.giveaway.followerStep is set but \""
           + cfg.giveaway.channel
           + "\" has no EventSub connection — follow events can't be received, so milestone "
-          + "progress won't advance. Add it to twitch.eventsub.channels (via `multichat login`).");
+          + "progress won't advance. Add it to twitch.eventsub.channels (via `multichat login`).")
+      ++ lib.optional (intCfg.callbackTokenFile == null && intCfg.callbackToken != "")
+        ("services.multichat.integrations.callbackToken is written into the Nix store and shown by "
+          + "`systemctl show multichat`. Use callbackTokenFile for real secrets.")
+      ++ lib.optional (lib.any (s: s.tokenFile == null && s.token != "") intCfg.subscribers)
+        ("services.multichat.integrations.subscribers has an inline token written into the Nix store. "
+          + "Use tokenFile for real secrets.")
+      ++ lib.optional
+        (intCfg.subscribers != [ ] && !cfg.giveaway.enable)
+        ("services.multichat.integrations.subscribers is set but giveaway.enable is false — the bus "
+          + "only carries giveaway-lifecycle events, so nothing will ever be delivered and "
+          + "POST /api/turn-report answers 501.");
 
     # Make the `multichat` CLI available so an operator can run
     # `multichat set-youtube-key <KEY>` against the running service.
@@ -481,6 +685,12 @@ in
         ${lib.optionalString (esCfg.clientSecretFile != null) ''
           export TWITCH_CLIENT_SECRET="$(cat "$CREDENTIALS_DIRECTORY/twitch-client-secret")"
         ''}
+        ${lib.optionalString (intCfg.callbackTokenFile != null) ''
+          export MULTICHAT_CALLBACK_TOKEN="$(cat "$CREDENTIALS_DIRECTORY/integration-callback-token")"
+        ''}
+        ${lib.concatMapStringsSep "\n" (s: ''
+          export ${intTokenEnv s.name}="$(cat "$CREDENTIALS_DIRECTORY/${intTokenCred s.name}")"
+        '') intTokenFiles}
         ${lib.concatMapStringsSep "\n" (ch: ''
           # Seed the refresh token once; never overwrite the rotated token the app persists.
           if [ ! -e "$STATE_DIRECTORY/twitch-refresh-${ch.broadcasterId}" ]; then

@@ -76,6 +76,7 @@ import {
   turnTotals,
 } from "./src/turns.ts";
 import {
+  applyIntegrationEnv,
   buildIntegrationRequests,
   type IntegrationEvent,
   normalizeIntegrationsConfig,
@@ -124,6 +125,19 @@ import {
   winnerTier,
 } from "./src/giveaway.ts";
 
+/** Read an env var without ever throwing. Deno's `--allow-env` is an allow-list
+ *  (see the wrapper in build.nix), and reading a name outside it raises
+ *  NotCapable. The integration token names are dynamic — one per subscriber — so
+ *  a wrapper built before those names existed must degrade to "no override"
+ *  rather than take the server down at startup. */
+function readEnv(name: string): string | undefined {
+  try {
+    return Deno.env.get(name);
+  } catch {
+    return undefined;
+  }
+}
+
 async function loadSettings(path: string): Promise<Settings> {
   let text: string;
   try {
@@ -154,7 +168,12 @@ async function loadSettings(path: string): Promise<Settings> {
     },
     alerts: normalizeAlertsConfig(raw.alerts),
     giveaway: normalizeGiveawayConfig(raw.giveaway),
-    integrations: normalizeIntegrationsConfig(raw.integrations),
+    // Tokens may arrive from the environment instead of the file, so a
+    // Nix-store settings.json carries no secrets; see src/integrations.ts.
+    integrations: applyIntegrationEnv(
+      normalizeIntegrationsConfig(raw.integrations),
+      readEnv,
+    ),
   };
 }
 

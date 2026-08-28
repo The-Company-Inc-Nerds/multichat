@@ -109,6 +109,47 @@ export function normalizeIntegrationsConfig(raw: unknown): IntegrationsConfig {
   return cfg;
 }
 
+/**
+ * Env-var name carrying a subscriber's outbound bearer token:
+ * `MULTICHAT_INTEGRATION_TOKEN_<NAME>`, where `<NAME>` is the subscriber's name
+ * uppercased with every run of non-alphanumerics collapsed to a single `_`
+ * (so "chat-cards" → MULTICHAT_INTEGRATION_TOKEN_CHAT_CARDS). Exported so the
+ * NixOS module can compute the same name from the same rule.
+ */
+export function subscriberTokenEnvVar(name: string): string {
+  const slug = name.toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(
+    /^_+|_+$/g,
+    "",
+  );
+  return `MULTICHAT_INTEGRATION_TOKEN_${slug}`;
+}
+
+/**
+ * Overlay integration secrets from the environment, so tokens need not sit in
+ * settings.json (mirrors YOUTUBE_API_KEY / TWITCH_CLIENT_SECRET). The callback
+ * token comes from MULTICHAT_CALLBACK_TOKEN; each subscriber's outbound token
+ * from its `subscriberTokenEnvVar` name. Env wins over the file — that is the
+ * point: the file ships in the Nix store, the env comes from a credential.
+ *
+ * Pure: the caller supplies the lookup, so this is testable without touching
+ * the real environment. Returns a new config; the input is not mutated.
+ */
+export function applyIntegrationEnv(
+  cfg: IntegrationsConfig,
+  getEnv: (name: string) => string | undefined,
+): IntegrationsConfig {
+  const callback = str(getEnv("MULTICHAT_CALLBACK_TOKEN"))?.trim();
+  const out: IntegrationsConfig = {
+    subscribers: cfg.subscribers.map((sub) => {
+      const token = str(getEnv(subscriberTokenEnvVar(sub.name)))?.trim();
+      return token ? { ...sub, token } : { ...sub };
+    }),
+  };
+  const resolved = callback || cfg.callbackToken;
+  if (resolved) out.callbackToken = resolved;
+  return out;
+}
+
 /** True when a subscriber should receive this event type (`"*"` = all). A
  *  disabled subscriber wants nothing. */
 export function subscriberWantsEvent(

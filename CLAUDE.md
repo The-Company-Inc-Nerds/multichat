@@ -107,9 +107,15 @@ Copy `settings.json.example` to `settings.json` and edit:
   terms.accepted) to the subscribers: a `webhook` adapter POSTs a generic
   `{event, ts, data}` envelope, a `chat-cards` adapter opens a pack under the
   drawn winner (`POST baseUrl/api/pack`). chat-cards reports the cards pulled +
-  value back to `POST /api/turn-report` (bearer `callbackToken`), feeding the
-  `packs`/`report` views. Delivery is fire-and-forget — a subscriber outage
-  never blocks or rolls back a draw. See `docs/configuration.md`
+  value back to `POST /api/turn-report` (bearer `callbackToken`; loopback-only
+  when unset), feeding the `packs`/`report` views. Delivery is fire-and-forget —
+  a subscriber outage never blocks or rolls back a draw. Both tokens can come
+  from the environment instead of the file (`MULTICHAT_CALLBACK_TOKEN`,
+  `MULTICHAT_INTEGRATION_TOKEN_<NAME>` — see `subscriberTokenEnvVar`), which is
+  how the NixOS module keeps them out of the store. Note that `--allow-net` is an
+  allow-list: a subscriber host must be passed to `build.nix`'s `extraNetHosts`
+  (module.nix derives it from `baseUrl`) or every delivery is denied. See
+  `docs/configuration.md`
 
 YouTube channels require an API key, but it need not be in `settings.json` — it
 can be set on the running server with `multichat set-youtube-key` (see above).
@@ -184,7 +190,9 @@ src/turns.ts     pure turn-lifecycle helpers: the terms-acceptance ledger (hasAc
 src/integrations.ts  pure integration-bus helpers: normalizeIntegrationsConfig, the outbound
                  event→request mapping per adapter (webhook envelope / chat-cards /api/pack) +
                  subscriberWantsEvent, and the inbound pack-report parser (parseTurnReport /
-                 normalizePackReports behind POST /api/turn-report). The fetch wiring is in main.ts
+                 normalizePackReports behind POST /api/turn-report), plus applyIntegrationEnv /
+                 subscriberTokenEnvVar (env overrides for both tokens; the env-var naming rule
+                 is mirrored in module.nix and must stay in sync). The fetch wiring is in main.ts
 src/control.ts   pure control-plane helpers (loopback check, key-body parse, startup-key
                  resolution, state paths incl. Twitch token/broadcaster-id + giveaway
                  pool/campaign/winners-log/packs/turns/terms/plan) + the ServerHooks

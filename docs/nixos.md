@@ -128,6 +128,9 @@ waits for the key. The control endpoint is loopback-only (see
 | `giveaway.followerStep`            | int                                                     | `0`                    | Arm draw credits every N new followers via EventSub (0 = no tracking), e.g. `100`              |
 | `giveaway.milestoneDraws`          | int                                                     | `1`                    | Draw credits armed per milestone, e.g. `10`                                                    |
 | `giveaway.messages`                | `attrs of string`                                       | `{}`                   | Optional reply templates incl. `enteredPool`/`milestone`; placeholders `{user}`/`{number}`/…   |
+| `integrations.callbackToken`       | string                                                  | `""`                   | Callback bearer inline (Nix store — prefer `callbackTokenFile`)                                |
+| `integrations.callbackTokenFile`   | path                                                    | `null`                 | File with the raw callback bearer; staged via `LoadCredential`                                 |
+| `integrations.subscribers`         | `[{name,adapter,baseUrl,events,enabled,token,tokenFile,packSize}]` | `[]`        | External tools to push giveaway events to (see below)                                          |
 
 See [Giveaway mode](configuration.md#giveaway-mode) for the full behavior
 (including the campaign mode the 500/100/10 example configures). Three gotchas
@@ -188,6 +191,65 @@ channel once and never re-login on an upgrade. The refresh token in Nix
 (`refreshTokenFile` / `refreshToken`) is only the first-run seed; after that the
 persisted, rotated token wins and the seed is ignored.
 
+## Integrations (chat-cards)
+
+`integrations.subscribers` pushes giveaway-lifecycle events to external tools,
+and `/api/turn-report` takes results back. The pair completes a loop with
+[chat-cards](https://github.com/The-Company-Inc-Nerds/chat-cards): a draw opens a
+physical card pack under the winner's name, and the cards pulled — with their
+prices — come back onto that winner's turn.
+
+```nix
+services.multichat = {
+  enable = true;
+  port = 8081;
+  giveaway = { enable = true; channel = "yourchannel"; };
+  integrations.subscribers = [{
+    name = "chat-cards";
+    adapter = "chat-cards";
+    baseUrl = "http://127.0.0.1:8787";
+    events = [ "giveaway.turn.start" ];
+    packSize = 5;
+  }];
+};
+
+services.chat-cards = {
+  enable = true;
+  port = 8787;
+  report.url = "http://127.0.0.1:8081/api/turn-report";
+};
+```
+
+Both halves are needed: without the subscriber no pack is ever opened, and
+without `report.url` nothing comes back. `/api/turn-report` also needs
+`giveaway.enable` — with no giveaway running it answers `501`, and the module
+warns at build time if subscribers are configured without one.
+
+The field-by-field reference is in
+[Integrations](configuration.md#integrations); the module options map onto it
+one-to-one.
+
+### Tokens and the store
+
+`integrations.callbackTokenFile` and a subscriber's `tokenFile` are staged via
+`LoadCredential` and exported into the service's environment at start, exactly
+like the YouTube key. Their `settings.json` counterparts are written as `""`, so
+the world-readable store copy carries no secret. The inline `callbackToken` /
+`token` options do land in the store, and the module warns when they are set.
+
+Neither token is needed when both services share a machine: `/api/turn-report`
+accepts unauthenticated loopback requests, and a same-box chat-cards typically
+runs without a token of its own.
+
+### `--allow-net` and subscriber hosts
+
+The packaged deno wrapper runs with an `--allow-net` allow-list, so a subscriber
+on a host that isn't on it would have every delivery denied. The default
+`package` handles this: it passes each subscriber's `baseUrl` host to
+`build.nix`'s `extraNetHosts`, so configuring a subscriber is enough. **Override
+`package` and you take that over** — build it with `extraNetHosts` yourself, or
+outbound calls fail.
+
 ## Alert themes
 
 `alerts.themes` is a registry of named looks for the `/alerts` OBS overlay, and
@@ -236,6 +298,15 @@ run); when `giveaway.followerStep` is set but the channel isn't in
 `twitch.eventsub.channels` (follow events can't be received, so milestone
 progress won't advance); or when `giveaway.replies` is on (a reminder to re-run
 `multichat login` for the `user:write:chat` scope).
+
+Integrations add three assertions: a subscriber without a `baseUrl` (nothing to
+deliver to), a `tokenFile` without a `name` (the name is what identifies the
+credential and its env var), and two subscriber names that collapse to the same
+env var — `"chat-cards"` and `"chat cards"` both become
+`MULTICHAT_INTEGRATION_TOKEN_CHAT_CARDS`, so one would silently take the other's
+token. Inline `integrations.callbackToken` / subscriber `token` warn like the
+other in-store secrets, and configuring subscribers with `giveaway.enable = false`
+warns too: the bus only carries giveaway events, so nothing would ever be sent.
 
 ## Security hardening
 

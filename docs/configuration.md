@@ -401,6 +401,104 @@ These override their `settings.json` counterparts at startup:
 | `TWITCH_CLIENT_SECRET` | `twitch.eventsub.clientSecret`                           |
 | `TWITCH_CLIENT_ID`     | `twitch.eventsub.clientId` (read by `multichat login`)   |
 | `STATE_DIRECTORY`      | directory runtime keys/tokens are persisted in (systemd) |
+| `MULTICHAT_CALLBACK_TOKEN` | `integrations.callbackToken` |
+| `MULTICHAT_INTEGRATION_TOKEN_<NAME>` | a subscriber's `token` (see [Integrations](#integrations)) |
+
+## Integrations
+
+The `integrations` block wires multichat's giveaway to external tools. It has two
+halves that together form a loop: multichat pushes giveaway-lifecycle events
+**out** to subscribers, and a subscriber pushes results **back** to
+`POST /api/turn-report`, where they attach to the winner's turn in the ledger.
+
+```json
+{
+  "integrations": {
+    "callbackToken": "",
+    "subscribers": [
+      {
+        "name": "chat-cards",
+        "adapter": "chat-cards",
+        "baseUrl": "http://127.0.0.1:8787",
+        "token": "",
+        "events": ["giveaway.turn.start"],
+        "enabled": true,
+        "packSize": 5
+      }
+    ]
+  }
+}
+```
+
+| Field           | Meaning                                                                      |
+| --------------- | ---------------------------------------------------------------------------- |
+| `callbackToken` | Bearer an external tool must present on `/api/turn-report`. Empty = loopback only |
+| `name`          | Identifies the subscriber in logs; also names its token env var               |
+| `adapter`       | `"webhook"` or `"chat-cards"` — how events become HTTP calls                  |
+| `baseUrl`       | Where to deliver. Trailing slash trimmed. A subscriber without one is dropped |
+| `token`         | Bearer sent with every delivery, when the target requires one                 |
+| `events`        | Event types to deliver; `["*"]` (or omitted) means all of them                |
+| `enabled`       | `false` silences this subscriber without deleting its config                  |
+| `packSize`      | chat-cards only: cards per pack. `0`/unset uses chat-cards' own default       |
+
+### Events
+
+| Event                         | Fires when…                                    |
+| ----------------------------- | ---------------------------------------------- |
+| `giveaway.turn.start`         | a draw lands and the winner's turn opens       |
+| `giveaway.turn.disposition`   | the winner picks mail / donate / destroy / pass |
+| `giveaway.turn.end`           | the turn closes                                |
+| `giveaway.entrant.added`      | an entrant is accepted into the pool           |
+| `giveaway.terms.accepted`     | an entrant accepts the T&Cs                    |
+
+The `webhook` adapter POSTs `{event, ts, data}` for every subscribed event. The
+`chat-cards` adapter only maps events it has a call for — today that is
+`giveaway.turn.start`, which becomes `POST {baseUrl}/api/pack` with
+`{winner, ref, label?, size?}`. `ref` is the turn id; it comes back on the pack
+report, which is how a report finds its turn.
+
+Delivery is fire-and-forget with one retry. A subscriber being down never blocks
+or rolls back a draw — the draw stands, and the report reconciles values whenever
+the tool comes back.
+
+### The chat-cards loop
+
+[chat-cards](https://github.com/The-Company-Inc-Nerds/chat-cards) opens and
+prices a physical card pack on stream. Wired as a subscriber, a draw opens a pack
+under the winner's name; as each card is scanned and priced, chat-cards POSTs the
+pack back to `/api/turn-report` and the `/giveaway` page shows what was pulled and
+what it was worth.
+
+Point chat-cards back at this server with its own `--report-url`
+(`services.chat-cards.report.url` on NixOS):
+
+```
+multichat: integrations.subscribers[].baseUrl  →  http://chat-cards:8787
+chat-cards: --report-url                       →  http://multichat:8080/api/turn-report
+```
+
+`/api/turn-report` needs the giveaway enabled — with no giveaway it answers
+`501`.
+
+### Tokens
+
+Neither token is required when both services share a machine: `/api/turn-report`
+accepts loopback requests with no `callbackToken` set, the same rule the other
+control endpoints follow. Across machines both halves need one.
+
+Tokens can come from the environment instead of `settings.json`, so a
+world-readable config file (a Nix store path, say) carries no secrets. The
+callback token reads from `MULTICHAT_CALLBACK_TOKEN`; a subscriber's outbound
+token from `MULTICHAT_INTEGRATION_TOKEN_<NAME>`, where `<NAME>` is its `name`
+uppercased with every run of non-alphanumerics collapsed to one `_` — so
+`chat-cards` becomes `MULTICHAT_INTEGRATION_TOKEN_CHAT_CARDS`. The environment
+wins over the file. The [NixOS module](nixos.md) does all of this for you from
+`callbackTokenFile` / `tokenFile`.
+
+Because those names are derived from your config, the packaged deno wrapper
+allows the whole `MULTICHAT_INTEGRATION_TOKEN_*` prefix rather than an
+enumerated list. A wrapper built before this existed simply finds no override
+instead of failing to start.
 
 ## Getting a YouTube API key
 
