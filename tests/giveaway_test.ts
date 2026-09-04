@@ -147,12 +147,12 @@ Deno.test("normalizeGiveawayConfig: terms + disposition sub-configs", () => {
     disposition: { enabled: false },
   });
   assertEquals(off.terms?.required, false);
-  assertEquals(off.terms?.command, "accept"); // default word, default version "1"
+  assertEquals(off.terms?.command, "terms"); // default word, default version "1"
   assertEquals(off.terms?.version, "1");
   assertEquals(off.disposition?.enabled, false);
 
   // New reply keys have defaults.
-  assert(DEFAULT_MESSAGES.termsRequired.includes("{accept}"));
+  assert(DEFAULT_MESSAGES.terms.includes("{terms}"));
   assert(DEFAULT_MESSAGES.passed.includes("{next}"));
   assert(DEFAULT_MESSAGES.mailed.includes("{cards}"));
 });

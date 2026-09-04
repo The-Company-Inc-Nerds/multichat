@@ -335,11 +335,9 @@ export interface GiveawayMessages {
   enteredPool?: string;
   /** Announcement posted when a follower milestone is crossed. */
   milestone?: string;
-  /** Shown at `!enter` when the entrant hasn't accepted the terms yet. Fills
-   *  `{accept}` (the accept command) and `{terms}` (the T&C url). */
-  termsRequired?: string;
-  /** Confirmation after `!accept`. */
-  termsAccepted?: string;
+  /** Reply to the terms command (e.g. `!terms`): points viewers at the published
+   *  T&C. Fills `{terms}` (the T&C url) and `{enter}` (the entry command). */
+  terms?: string;
   /** Winner-only disposition confirmations. `{cards}`/`{value}` are filled with
    *  the pack tally where known. `passed` also fills `{next}` if a next winner
    *  was drawn. */
@@ -349,10 +347,10 @@ export interface GiveawayMessages {
   passed?: string;
 }
 
-/** Terms & conditions gate for the giveaway. When `required`, `!enter` only
- *  admits entrants who have accepted (via `${prefix}${command}`, e.g. `!accept`).
- *  Bump `version` to force everyone to re-accept a changed T&C. `url` is shown in
- *  the prompt. */
+/** Terms & conditions for the giveaway. Not an acceptance gate: entry is never
+ *  blocked on it. Viewers type `${prefix}${command}` (e.g. `!terms`) and the bot
+ *  replies with a link to the published terms at `url`. `required`/`version` are
+ *  retained for config compatibility but no longer affect entry. */
 export interface GiveawayTermsConfig {
   required: boolean;
   command: string;

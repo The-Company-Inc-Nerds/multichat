@@ -93,17 +93,19 @@ Copy `settings.json.example` to `settings.json` and edit:
   mode: `firstN` = guaranteed first-N queue (draws pick who's next),
   `followerStep`/`milestoneDraws` = advisory draw credits per N new followers,
   winners logged append-only (JSONL mailing list). `terms`
-  `{required, command, version, url}` gates `!enter` on a `!accept`
-  acknowledgement; `disposition` `{enabled, mail, donate, destroy, pass}` are
+  `{required, command, version, url}` is an informational terms command — viewers
+  type `!terms` and the bot replies with a link to `url`. It does NOT gate entry
+  (`required`/`version` are retained for config compatibility only); `disposition`
+  `{enabled, mail, donate, destroy, pass}` are
   winner-only chat words deciding a pull's fate (`pass` carries the cards to the
   next person's turn + auto-advances the draw); `timezone` (default
   `America/Denver`) is what the compiled `report` renders turn-start times in.
   Draw on `/giveaway` (a CS2-style case reel; `?overlay` = transparent OBS
   source). `terms`/`disposition` are only honoured when the block is PRESENT —
   module.nix therefore emits each one only when its `enable` is set, rather than
-  writing a disabled block. The terms gate needs `replies`: the prompt is a chat
-  reply, so with replies off an unaccepted entrant is refused in silence. There
-  is no `/terms` route — `terms.url` is substituted into the prompt as `{terms}`
+  writing a disabled block. The terms command needs `replies`: the response is a
+  chat reply, so with replies off the command is silently inert. There is no
+  `/terms` HTTP route — `terms.url` is substituted into the reply as `{terms}`
   and nothing more. See `docs/configuration.md`
 - `integrations` — optional outbound event bus
   `{callbackToken, subscribers:
@@ -139,7 +141,7 @@ main.ts          entry point — loads settings, wires the emitter to server + c
                  one WebSocket per broadcaster; exposes getChannelAuth, forwards onFollow), and
                  the giveaway engine (follow check + chat replies + entrant pool + campaign:
                  guaranteed-queue draws, follower-milestone counter fed by onFollow, append-only
-                 winners JSONL; the turn lifecycle: !accept terms gate, per-draw turns, winner-only
+                 winners JSONL; the turn lifecycle: per-draw turns, winner-only
                  mail/donate/destroy/pass disposition, seeded draw plan; driving the /giveaway page)
                  + the integration dispatcher (fires giveaway.turn.* events to configured subscribers)
 src/types.ts     shared TypeScript interfaces (Settings, ChatMessage, ServerEvent, Emitter,

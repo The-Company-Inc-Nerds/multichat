@@ -13,7 +13,6 @@ import type {
   IntegrationsConfig,
   PackReport,
   Settings,
-  TermsAcceptance,
   TurnAggregates,
   TwitchConfig,
   TwitchEventSubChannelConfig,
@@ -49,7 +48,6 @@ import {
   giveawayPacksStatePath,
   giveawayPlanStatePath,
   giveawayPoolStatePath,
-  giveawayTermsStatePath,
   giveawayTurnsStatePath,
   giveawayWinnersLogPath,
   keyStatePath,
@@ -62,16 +60,12 @@ import {
   activeTurn,
   buildTurnReport,
   computeAggregates,
-  hasAccepted,
   matchDisposition,
   newTurn,
-  normalizeTermsLedger,
   normalizeTurns,
-  recordAcceptance,
   recordTurnDisposition,
   type ReportRow,
   reportToCsv,
-  serializeTermsLedger,
   serializeTurns,
   turnTotals,
 } from "./src/turns.ts";
@@ -571,16 +565,14 @@ function createGiveawayEngine(opts: {
   const winnersPath = giveawayWinnersLogPath(opts.stateDir);
   const packsPath = giveawayPacksStatePath(opts.stateDir);
   const turnsPath = giveawayTurnsStatePath(opts.stateDir);
-  const termsPath = giveawayTermsStatePath(opts.stateDir);
   const planPath = giveawayPlanStatePath(opts.stateDir);
   let state: GiveawayState = emptyPool(true);
   let campaign: GiveawayCampaignState = emptyCampaign();
   let winners: GiveawayWinner[] = [];
   // Pack reports pushed back by chat-cards, keyed by packId (last write wins).
   let packReports: Record<string, PackReport> = {};
-  // The turn ledger (draw → disposition) and the terms-acceptance ledger.
+  // The turn ledger (draw → disposition).
   let turns: GiveawayTurn[] = [];
-  let terms: Record<string, TermsAcceptance> = {};
   // The committed seeded draw plan (operator-only; consumed as draws happen).
   let plan: GiveawayPlan | null = null;
 
@@ -626,9 +618,6 @@ function createGiveawayEngine(opts: {
   function persistTurns(): void {
     if (turnsPath) void persistState(turnsPath, serializeTurns(turns));
   }
-  function persistTerms(): void {
-    if (termsPath) void persistState(termsPath, serializeTermsLedger(terms));
-  }
   function persistPlan(): void {
     if (planPath) void persistState(planPath, serializePlan(plan));
   }
@@ -672,14 +661,6 @@ function createGiveawayEngine(opts: {
       if (raw) {
         try {
           turns = normalizeTurns(JSON.parse(raw));
-        } catch { /* corrupt — start empty */ }
-      }
-    }
-    if (termsPath) {
-      const raw = await readKeyFile(termsPath);
-      if (raw) {
-        try {
-          terms = normalizeTermsLedger(JSON.parse(raw));
         } catch { /* corrupt — start empty */ }
       }
     }
@@ -785,12 +766,14 @@ function createGiveawayEngine(opts: {
     if (m.channel.toLowerCase() !== config.channel) return;
     if (!m.userId) return; // no stable id — can't dedupe/verify
 
-    // Terms acceptance (e.g. "!accept") — checked before the enter command.
+    // Terms command (e.g. "!terms") — replies with a link to the published T&C.
+    // Purely informational; it does not gate entry. Checked before the enter
+    // command so the terms word can't also be read as an entry.
     if (
       config.terms &&
       matchGiveawayCommand(m.text, config.prefix, config.terms.command)
     ) {
-      await handleAccept(m);
+      await handleTerms(m);
       return;
     }
 
@@ -808,17 +791,6 @@ function createGiveawayEngine(opts: {
     if (!state.open) return; // entries closed; ignore silently
     if (hasEntrant(state, m.userId)) {
       await reply("alreadyEntered", m.displayName);
-      return;
-    }
-    // Terms gate: must have accepted the current T&C to enter.
-    if (
-      config.terms?.required &&
-      !hasAccepted(terms, m.userId, config.terms.version)
-    ) {
-      await reply("termsRequired", m.displayName, {
-        accept: `${config.prefix}${config.terms.command}`,
-        terms: config.terms.url || "see the panel",
-      });
       return;
     }
     let following: boolean | undefined;
@@ -970,29 +942,12 @@ function createGiveawayEngine(opts: {
     return { state: view(), winner: r.winner, segment: r.segment };
   }
 
-  /** Record a viewer's terms acceptance (the configured accept command). */
-  async function handleAccept(m: TwitchChatMessage): Promise<void> {
+  /** Reply to the terms command (e.g. `!terms`) with a link to the published
+   *  T&C. Nothing is recorded — the campaign no longer gates entry on the terms. */
+  async function handleTerms(m: TwitchChatMessage): Promise<void> {
     if (!config.terms) return;
-    const r = recordAcceptance(
-      terms,
-      { userId: m.userId, login: m.login, displayName: m.displayName },
-      config.terms.version,
-      Date.now(),
-    );
-    if (!r.changed) return; // already accepted this version — stay quiet
-    terms = r.ledger;
-    persistTerms();
-    opts.emitIntegration?.({
-      type: "giveaway.terms.accepted",
-      ts: Date.now(),
-      data: {
-        userId: m.userId,
-        login: m.login,
-        displayName: m.displayName,
-        version: config.terms.version,
-      },
-    });
-    await reply("termsAccepted", m.displayName, {
+    await reply("terms", m.displayName, {
+      terms: config.terms.url || "see the panel",
       enter: `${config.prefix}${config.command}`,
     });
   }
@@ -1119,7 +1074,6 @@ function createGiveawayEngine(opts: {
       campaign = emptyCampaign();
       state = { ...emptyPool(state.open) };
       // The turn ledger + pack reports + plan are per-campaign, so clear them.
-      // Terms acceptances are durable (a bumped terms.version re-gates), so keep.
       turns = [];
       packReports = {};
       plan = null;

@@ -532,17 +532,17 @@ in
     };
 
     giveaway.terms.enable = lib.mkEnableOption ''
-      a terms-acceptance gate on the entry command. With it on, `!enter` admits
-      only entrants who have already typed the accept command; everyone else gets
-      the `termsRequired` reply instead of an entry
+      a terms command on the giveaway. With it on, viewers who type the terms
+      command (e.g. `!terms`) get the `terms` reply — a link to the published
+      T&C. This is NOT an acceptance gate: entry is never blocked on it
     '';
 
     giveaway.terms.command = lib.mkOption {
       type = lib.types.str;
-      default = "accept";
+      default = "terms";
       description = ''
-        Command word entrants type to accept, after the same
-        {option}`giveaway.prefix` — so the default gives `!accept`.
+        Command word viewers type to get the terms link, after the same
+        {option}`giveaway.prefix` — so the default gives `!terms`.
       '';
     };
 
@@ -551,8 +551,8 @@ in
       default = "1";
       example = "2";
       description = ''
-        Bump this to invalidate every acceptance on file and make entrants accept
-        again. Use it whenever the terms change in a way that matters.
+        Retained for config compatibility; no longer affects entry (there is no
+        acceptance ledger anymore). Safe to leave at the default.
       '';
     };
 
@@ -562,9 +562,8 @@ in
       example = "https://example.com/giveaway-terms";
       description = ''
         Where the full terms live. multichat does NOT host them — this string is
-        only substituted into the `termsRequired` chat reply as `{terms}`, so it
-        must point at a page you publish yourself. Leave it empty and write the
-        terms into the `termsRequired` message instead.
+        substituted into the `terms` chat reply as `{terms}`, so it must point at
+        a page you publish yourself.
       '';
     };
 
@@ -748,15 +747,15 @@ in
       ++ lib.optional
         (cfg.giveaway.enable && cfg.giveaway.terms.enable && !cfg.giveaway.replies)
         ("services.multichat.giveaway.terms.enable is on but giveaway.replies is off — the "
-          + "`termsRequired` prompt is a chat reply, so entrants are refused with no way to "
-          + "learn they must type \"" + cfg.giveaway.prefix + cfg.giveaway.terms.command
-          + "\" first. Turn replies on, or announce the accept command another way.")
+          + "`terms` reply (to \"" + cfg.giveaway.prefix + cfg.giveaway.terms.command
+          + "\") is a chat reply, so nothing is posted and the terms command is silently inert. "
+          + "Turn replies on, or drop the terms command.")
       ++ lib.optional
         (cfg.giveaway.enable && cfg.giveaway.terms.enable && cfg.giveaway.terms.url == ""
-          && !(cfg.giveaway.messages ? termsRequired))
+          && !(cfg.giveaway.messages ? terms))
         ("services.multichat.giveaway.terms.enable is on with no terms.url and no custom "
-          + "`termsRequired` message — the built-in prompt renders an empty \"()\" where the "
-          + "link should be. Set terms.url, or write the terms into messages.termsRequired.")
+          + "`terms` message — the built-in reply renders \"see the panel\" where the link "
+          + "should be. Set terms.url, or write the terms into messages.terms.")
       ++ lib.optional (intCfg.callbackTokenFile == null && intCfg.callbackToken != "")
         ("services.multichat.integrations.callbackToken is written into the Nix store and shown by "
           + "`systemctl show multichat`. Use callbackTokenFile for real secrets.")

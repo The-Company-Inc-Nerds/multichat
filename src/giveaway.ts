@@ -42,10 +42,7 @@ export const DEFAULT_MESSAGES: Required<GiveawayMessages> = {
   enteredPool:
     "@{user} you're in the bonus pool — entry #{number}. Winners are drawn at each follower milestone!",
   milestone: "🎉 {count} new followers! {draws} bonus giveaway draws unlocked!",
-  termsRequired:
-    "@{user} please accept the giveaway terms first — type {accept} ({terms}) then enter.",
-  termsAccepted:
-    "@{user} thanks — terms accepted. Type {enter} to join the giveaway!",
+  terms: "@{user} giveaway terms & conditions: {terms}",
   mailed: "📬 @{user} — noted for mailing ({cards} card(s), ${value}).",
   donated: "🎁 @{user} — donating to the shop ({cards} card(s), ${value}).",
   destroyed: "💥 @{user} — ripping it live! ({cards} card(s), ${value}).",
@@ -59,8 +56,7 @@ const MESSAGE_KEYS: readonly (keyof GiveawayMessages)[] = [
   "winner",
   "enteredPool",
   "milestone",
-  "termsRequired",
-  "termsAccepted",
+  "terms",
   "mailed",
   "donated",
   "destroyed",
@@ -103,7 +99,7 @@ export function validTimezone(x: unknown, fallback: string): string {
   }
 }
 
-export const DEFAULT_ACCEPT_COMMAND = "accept";
+export const DEFAULT_TERMS_COMMAND = "terms";
 export const DEFAULT_DISPOSITION_WORDS = {
   mail: "mail",
   donate: "donate",
@@ -111,9 +107,10 @@ export const DEFAULT_DISPOSITION_WORDS = {
   pass: "pass",
 } as const;
 
-/** Validate the optional terms gate. Returns undefined (no gate) unless a truthy
- *  object is supplied; `required` still defaults on when the block is present but
- *  omits it (a terms block you bothered to add is meant to gate). */
+/** Validate the optional terms config. Returns undefined unless a truthy object
+ *  is supplied. This is no longer an acceptance gate — `required`/`version` are
+ *  normalized for config compatibility but do not affect entry; the terms command
+ *  (`command`, e.g. `terms`) just replies with a link to `url`. */
 export function normalizeTermsConfig(
   raw: unknown,
 ): GiveawayTermsConfig | undefined {
@@ -126,7 +123,7 @@ export function normalizeTermsConfig(
       : "1";
   return {
     required: raw.required !== false,
-    command: trimmed(raw.command, DEFAULT_ACCEPT_COMMAND).toLowerCase(),
+    command: trimmed(raw.command, DEFAULT_TERMS_COMMAND).toLowerCase(),
     version,
     url: typeof raw.url === "string" ? raw.url.trim() : "",
   };
