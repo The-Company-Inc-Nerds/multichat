@@ -52,7 +52,9 @@ import {
   giveawayWinnersLogPath,
   keyStatePath,
   type KeyUpdateResult,
+  normalizeControlAccess,
   resolveStartupKey,
+  resolveStateDir,
   twitchBroadcasterStatePath,
   twitchTokenStatePath,
 } from "./src/control.ts";
@@ -110,7 +112,7 @@ import {
   openPool,
   parseWinnersLog,
   recordFollower,
-  removeEntrant,
+  removeByNeedle,
   resetPool,
   serializeGiveawayAction,
   serializePlan,
@@ -149,6 +151,13 @@ async function loadSettings(path: string): Promise<Settings> {
     server: {
       port: Number(Deno.env.get("PORT") ?? raw.server?.port ?? 8080),
       host: Deno.env.get("HOST") ?? raw.server?.host ?? "127.0.0.1",
+      // Who may press Draw. Env overrides exist so the NixOS unit can carry the
+      // token via LoadCredential instead of the Nix-store settings.json.
+      controlAccess: normalizeControlAccess(
+        readEnv("MULTICHAT_CONTROL_ACCESS") ?? raw.server?.controlAccess,
+      ),
+      controlToken: (readEnv("MULTICHAT_CONTROL_TOKEN") ??
+        raw.server?.controlToken ?? "").trim(),
     },
     twitch: {
       channels: raw.twitch?.channels ?? [],
@@ -185,6 +194,26 @@ function parseEventSubConfig(raw: any): TwitchEventSubConfig | undefined {
       "",
     channels,
   };
+}
+
+/**
+ * Make sure the resolved state directory exists and is ours (0700), returning it
+ * — or null when it can't be created, in which case every persist below degrades
+ * to in-memory, exactly as it did before a state dir was resolved outside
+ * systemd. Never fatal: losing persistence must not cost you the stream.
+ */
+async function ensureStateDir(dir: string | null): Promise<string | null> {
+  if (!dir) return null;
+  try {
+    await Deno.mkdir(dir, { recursive: true, mode: 0o700 });
+    return dir;
+  } catch (e) {
+    console.error(
+      `[Control] Cannot use state directory ${dir} (${e}) — the giveaway pool, ` +
+        `winners log and turn ledger will not survive a restart.`,
+    );
+    return null;
+  }
 }
 
 /** Best-effort persist a value to a state file (0600). Never throws — a failure
@@ -1032,11 +1061,21 @@ function createGiveawayEngine(opts: {
       broadcast();
       return view();
     },
-    remove: (userId) => {
-      state = removeEntrant(state, userId);
+    remove: (target) => {
+      const r = removeByNeedle(state, target);
+      // A miss or an ambiguous needle changes nothing — don't persist or
+      // broadcast a no-op, and let the caller say so.
+      if (!r.removed) {
+        return { state: view(), removed: null, matches: r.matches };
+      }
+      state = r.state;
+      // The committed plan may name the entrant we just dropped; consuming them
+      // keeps the plan and the pool from disagreeing on who is next.
+      plan = consumePlan(plan, r.removed.userId);
+      persistPlan();
       persist();
       broadcast();
-      return view();
+      return { state: view(), removed: r.removed, matches: r.matches };
     },
     draw: () => performDraw(),
     demo: () => {
@@ -1182,7 +1221,9 @@ function warnGiveawaySetup(config: GiveawayConfig, twitch: TwitchConfig): void {
 
 async function runServer(configPath: string): Promise<void> {
   const settings = await loadSettings(configPath);
-  const stateDir = Deno.env.get("STATE_DIRECTORY") ?? null;
+  const stateDir = await ensureStateDir(
+    resolveStateDir(readEnv),
+  );
   const statePath = keyStatePath(stateDir);
 
   // `keys` and `emitter` reference each other; the cycle is fine because each
@@ -1314,7 +1355,7 @@ function cliUsage(): string {
     "  multichat set-youtube-key [opts] [KEY]     set the YouTube API key on a running server",
     "  multichat login [opts]                     authorize a Twitch channel for EventSub alerts",
     "  multichat fake [kind] [opts]               inject fake events (all kinds, or just one) into a running server",
-    "  multichat giveaway [verb] [opts]           control the giveaway (status|open|close|draw|reset|demo|winners|packs|turns|report|plan|campaign-reset|remove <userId>)",
+    "  multichat giveaway [verb] [opts]           control the giveaway (status|open|close|draw|reset|demo|winners|packs|turns|report|plan|campaign-reset|remove <who>)",
     "",
     "Options (set-youtube-key, fake, and giveaway share these):",
     "  -p, --port <port>   server port   (default: $PORT or 8080)",
@@ -1356,7 +1397,7 @@ function cliUsage(): string {
     "  multichat giveaway plan [N] [--reseed] [--csv]   # commit/show the next-N seeded draw order (off-stream prep)",
     "  multichat giveaway plan-clear   # drop the committed draw order (draws go fully random)",
     "  multichat giveaway campaign-reset --yes   # zero campaign + numbers; archives the winners log",
-    "  multichat giveaway remove <userId>   # drop one entrant",
+    "  multichat giveaway remove <who>      # drop one entrant: login, display name, #entry-number or userId",
   ].join("\n");
 }
 
@@ -1540,7 +1581,7 @@ async function runGiveaway(args: string[]): Promise<void> {
   let host = Deno.env.get("HOST") ?? "127.0.0.1";
   let port = Number(Deno.env.get("PORT") ?? "8080");
   let action = "";
-  let userId = "";
+  let target = "";
   let csv = false;
   let yes = false;
   let count = 0;
@@ -1579,14 +1620,14 @@ async function runGiveaway(args: string[]): Promise<void> {
       reseed = true;
     } else if (VERBS.includes(a)) {
       action = a;
-    } else if (action === "remove" && !userId) {
-      userId = a; // the userId positional after `remove`
+    } else if (action === "remove" && !target) {
+      target = a; // the name/userId/#number positional after `remove`
     } else if (action === "plan" && Number.isFinite(Number(a))) {
       count = Math.max(0, Math.floor(Number(a))); // `plan <N>` positional
     } else {
       console.error(`Unknown argument: ${a}`);
       console.error(
-        `Usage: multichat giveaway [${VERBS.join("|")}] [userId|N]`,
+        `Usage: multichat giveaway [${VERBS.join("|")}] [name|N]`,
       );
       Deno.exit(2);
     }
@@ -1596,8 +1637,11 @@ async function runGiveaway(args: string[]): Promise<void> {
     console.error("Invalid --port.");
     Deno.exit(2);
   }
-  if (action === "remove" && !userId) {
-    console.error("giveaway remove needs a userId (see `giveaway status`).");
+  if (action === "remove" && !target) {
+    console.error(
+      "giveaway remove needs someone to remove: a login, display name, " +
+        "#entry-number or userId (see `giveaway status`).",
+    );
     Deno.exit(2);
   }
   if (action === "campaign-reset" && !yes) {
@@ -1609,7 +1653,7 @@ async function runGiveaway(args: string[]): Promise<void> {
   }
 
   const wire: GiveawayAction = action === "remove"
-    ? { action: "remove", userId }
+    ? { action: "remove", target }
     : action === "plan"
     ? { action: "plan", count, reseed }
     : { action } as GiveawayAction;
@@ -1636,7 +1680,36 @@ async function runGiveaway(args: string[]): Promise<void> {
       rows?: ReportRow[];
       timezone?: string;
       plan?: GiveawayPlan | null;
+      removed?: GiveawayEntrant | null;
+      matches?: GiveawayEntrant[];
     };
+    if (action === "remove") {
+      // Say what actually happened. An unmatched or ambiguous needle leaves the
+      // pool alone, and exits non-zero so a script notices.
+      if (data.removed) {
+        const n = data.removed.number ? `#${data.removed.number} ` : "";
+        console.log(
+          `Removed ${n}${data.removed.displayName || data.removed.login} ` +
+            `(${data.removed.userId}). ${data.state?.entrants.length ?? 0} ` +
+            `entrant(s) left.`,
+        );
+        Deno.exit(0);
+      }
+      const matches = data.matches ?? [];
+      if (matches.length > 1) {
+        console.error(`"${target}" matches ${matches.length} entrants:`);
+        for (const m of matches) {
+          console.error(
+            `  ${m.userId}  ${m.displayName || m.login}` +
+              (m.number ? `  (#${m.number})` : ""),
+          );
+        }
+        console.error("Re-run with the userId to pick one.");
+      } else {
+        console.error(`No entrant matches "${target}".`);
+      }
+      Deno.exit(1);
+    }
     if (action === "report") {
       const rows = data.rows ?? [];
       if (csv) {

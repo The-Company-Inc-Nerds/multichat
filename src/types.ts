@@ -146,9 +146,31 @@ export interface YouTubeConfig {
   channels: YouTubeChannelConfig[];
 }
 
+/**
+ * Who may drive the operator control endpoints (`POST /api/giveaway`).
+ *
+ * - `loopback` (default) — only the machine running the server. Safe anywhere.
+ * - `lan`      — loopback plus private/link-local addresses (RFC1918, CGNAT,
+ *                169.254/16, fc00::/7, fe80::/10), so a phone or a second PC on
+ *                the same home network can press Draw. A public IP is still
+ *                refused, which is what makes this safe to leave on for a box
+ *                that is only reachable from the LAN.
+ * - `any`      — no address check at all. Only sane behind a `controlToken`
+ *                (or an authenticating reverse proxy).
+ */
+export type ControlAccess = "loopback" | "lan" | "any";
+
 export interface ServerConfig {
   port: number;
   host: string;
+  /** Who may drive `POST /api/giveaway` (open/close/draw/…). "loopback" (the
+   *  default) is the host machine only; "lan" also accepts private/link-local
+   *  peers so anyone in the room can press Draw; "any" drops the address check
+   *  entirely and should be paired with `controlToken`. See src/control.ts. */
+  controlAccess?: ControlAccess;
+  /** Optional shared secret required of non-loopback control requests. The
+   *  /giveaway page picks it up from `?token=` and remembers it in a cookie. */
+  controlToken?: string;
 }
 
 /** A named look for the /alerts overlay. `style` selects a built-in visual engine

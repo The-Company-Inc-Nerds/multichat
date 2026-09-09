@@ -31,6 +31,14 @@ let
     "PORT"
     "HOST"
     "STATE_DIRECTORY"
+    # State-dir fallback for a binary run outside systemd (see resolveStateDir).
+    # Reading an unlisted name *throws* under Deno's allow-list, so these must be
+    # here even though the packaged service always has STATE_DIRECTORY set.
+    "MULTICHAT_STATE_DIR"
+    "XDG_STATE_HOME"
+    "HOME"
+    "MULTICHAT_CONTROL_ACCESS"
+    "MULTICHAT_CONTROL_TOKEN"
     "MULTICHAT_CALLBACK_TOKEN"
     "MULTICHAT_INTEGRATION_TOKEN_*"
   ];

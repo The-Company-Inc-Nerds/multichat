@@ -12,6 +12,7 @@ import {
   drawWinner,
   emptyCampaign,
   emptyPool,
+  findEntrants,
   type GiveawayAction,
   type GiveawayEntry,
   giveawayMessage,
@@ -27,6 +28,7 @@ import {
   parseGiveawayAction,
   parseWinnersLog,
   recordFollower,
+  removeByNeedle,
   removeEntrant,
   resetPool,
   seededShuffle,
@@ -36,7 +38,11 @@ import {
   winnersToCsv,
   winnerTier,
 } from "../src/giveaway.ts";
-import type { GiveawayConfig, GiveawayWinner } from "../src/types.ts";
+import type {
+  GiveawayConfig,
+  GiveawayState,
+  GiveawayWinner,
+} from "../src/types.ts";
 import { assert, assertEquals } from "./_assert.ts";
 
 const entrant = (userId: string, name = userId): GiveawayEntry => ({
@@ -578,10 +584,18 @@ Deno.test("parseGiveawayAction: valid actions, remove userId, rejects junk", () 
     assert(r.ok);
     if (r.ok) assertEquals(r.action.action, action);
   }
-  const rem = parseGiveawayAction('{"action":"remove","userId":"  42 "}');
+  const rem = parseGiveawayAction(
+    '{"action":"remove","target":"  pixelpanda "}',
+  );
   assert(rem.ok);
   if (rem.ok && rem.action.action === "remove") {
-    assertEquals(rem.action.userId, "42");
+    assertEquals(rem.action.target, "pixelpanda");
+  }
+  // The page (and any older caller) still sends `userId`; it means the same.
+  const legacy = parseGiveawayAction('{"action":"remove","userId":"  42 "}');
+  assert(legacy.ok);
+  if (legacy.ok && legacy.action.action === "remove") {
+    assertEquals(legacy.action.target, "42");
   }
 
   // The newer simple actions parse too.
@@ -605,7 +619,8 @@ Deno.test("parseGiveawayAction: valid actions, remove userId, rejects junk", () 
     assertEquals(planBare.action.reseed, false);
   }
 
-  assert(!parseGiveawayAction('{"action":"remove"}').ok); // missing userId
+  assert(!parseGiveawayAction('{"action":"remove"}').ok); // missing target
+  assert(!parseGiveawayAction('{"action":"remove","target":"  "}').ok);
   assert(!parseGiveawayAction('{"action":"bogus"}').ok);
   assert(!parseGiveawayAction("not json").ok);
   assert(!parseGiveawayAction("[]").ok);
@@ -616,7 +631,7 @@ Deno.test("serializeGiveawayAction round-trips through parse", () => {
     { action: "draw" },
     { action: "winners" },
     { action: "campaign-reset" },
-    { action: "remove", userId: "99" },
+    { action: "remove", target: "99" },
   ];
   for (const a of actions) {
     const r = parseGiveawayAction(serializeGiveawayAction(a));
@@ -756,4 +771,108 @@ Deno.test("winners log: JSONL round-trip, corrupt lines skipped, CSV quoting", (
   assert(lines[1].includes('"Ann ""The Ace"", PhD"'));
   assert(lines[1].includes("2023-")); // ISO timestamp
   assert(lines[2].endsWith(",,")); // zero timestamps render empty
+});
+
+Deno.test("findEntrants: userId wins outright, then login, then display name", () => {
+  const pool: GiveawayState = {
+    open: true,
+    nextNumber: 4,
+    entrants: [
+      {
+        userId: "1",
+        login: "nova",
+        displayName: "Nova",
+        enteredAt: 1,
+        number: 1,
+      },
+      {
+        userId: "2",
+        login: "pixel",
+        displayName: "nova",
+        enteredAt: 2,
+        number: 2,
+      },
+      {
+        userId: "nova",
+        login: "third",
+        displayName: "Third",
+        enteredAt: 3,
+        number: 3,
+      },
+    ],
+  };
+  // An exact userId beats the login and the display name that also read "nova".
+  assertEquals(findEntrants(pool, "nova").map((e) => e.userId), ["nova"]);
+  // userId matching is exact — Twitch ids are opaque, so case-folding them
+  // would be wrong. "NOVA" therefore falls through to the login rule (which is
+  // case-insensitive) and finds entrant 1, not the entrant whose id is "nova".
+  assertEquals(findEntrants(pool, "NOVA ").map((e) => e.userId), ["1"]);
+  assertEquals(findEntrants(pool, "pixel").map((e) => e.userId), ["2"]);
+  // Entry numbers, with or without the "#" the list renders.
+  assertEquals(findEntrants(pool, "#2").map((e) => e.userId), ["2"]);
+  assertEquals(findEntrants(pool, "3").map((e) => e.userId), ["nova"]);
+  assertEquals(findEntrants(pool, "nobody"), []);
+  assertEquals(findEntrants(pool, "  "), []);
+});
+
+Deno.test("findEntrants: a duplicated display name returns both candidates", () => {
+  const pool: GiveawayState = {
+    open: true,
+    nextNumber: 3,
+    entrants: [
+      {
+        userId: "1",
+        login: "a1",
+        displayName: "Twin",
+        enteredAt: 1,
+        number: 1,
+      },
+      {
+        userId: "2",
+        login: "b2",
+        displayName: "twin",
+        enteredAt: 2,
+        number: 2,
+      },
+    ],
+  };
+  assertEquals(findEntrants(pool, "Twin").map((e) => e.userId), ["1", "2"]);
+});
+
+Deno.test("removeByNeedle: removes one, refuses a miss or an ambiguous match", () => {
+  const pool: GiveawayState = {
+    open: true,
+    nextNumber: 3,
+    entrants: [
+      {
+        userId: "1",
+        login: "a1",
+        displayName: "Twin",
+        enteredAt: 1,
+        number: 1,
+      },
+      {
+        userId: "2",
+        login: "b2",
+        displayName: "twin",
+        enteredAt: 2,
+        number: 2,
+      },
+    ],
+  };
+
+  const hit = removeByNeedle(pool, "a1");
+  assertEquals(hit.removed?.userId, "1");
+  assertEquals(hit.state.entrants.map((e) => e.userId), ["2"]);
+
+  // Ambiguous and missing both leave the pool exactly as it was.
+  const amb = removeByNeedle(pool, "twin");
+  assertEquals(amb.removed, null);
+  assertEquals(amb.matches.length, 2);
+  assertEquals(amb.state.entrants.length, 2);
+
+  const miss = removeByNeedle(pool, "nobody");
+  assertEquals(miss.removed, null);
+  assertEquals(miss.matches, []);
+  assertEquals(miss.state.entrants.length, 2);
 });

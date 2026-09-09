@@ -16,7 +16,7 @@ fake events for previewing how they render, and driving the giveaway.
 | `GET`  | `/events`               | `text/event-stream` | The live SSE feed of chat events                                                       |
 | `POST` | `/api/youtube-key`      | `text/plain`        | Set the YouTube API key (loopback-only — see below)                                    |
 | `POST` | `/api/fake`             | `text/plain`        | Inject a fake chat event for previewing (loopback-only — see below)                    |
-| `POST` | `/api/giveaway`         | `application/json`  | Drive the giveaway: open/close/draw/reset/remove (loopback-only)                       |
+| `POST` | `/api/giveaway`         | `application/json`  | Drive the giveaway: open/close/draw/reset/remove (loopback, or wider via `controlAccess`) |
 | any    | anything else           | `404`               | Not found                                                                              |
 
 The viewer page also takes `?overlay` and `?alerts` query params (`/?overlay` is
@@ -156,18 +156,32 @@ Drives the giveaway on the running server. Backs the `/giveaway` page's buttons
 and the `multichat giveaway` CLI verb; only present when a giveaway is enabled
 in settings.
 
-- **Loopback-only.** Same guard as the endpoints above — a non-loopback peer
-  gets `403`.
+- **Access.** Loopback-only by default, like the endpoints above. Unlike them it
+  can be widened: `server.controlAccess` (`"lan"` / `"any"`) admits other
+  machines, optionally behind `server.controlToken` — presented as a bearer
+  header, `?token=`, or the cookie `GET /giveaway?token=…` mints. Loopback is
+  never asked for the token. See
+  [configuration](configuration.md#drawing-from-another-machine-controlaccess).
 - **Body.** A JSON object `{ "action": … }`, one of `open`, `close`, `draw`,
   `reset` (clear the pool; keeps campaign progress + winners), `status`, `demo`
   (inject sample entrants — and simulated follower progress — to preview the
   reel), `winners` (fetch the full winners log), `campaign-reset` (zero
   counters + entry numbers, archive the winners log), or
-  `{"action":"remove","userId":"<id>"}`.
+  `{"action":"remove","target":"<who>"}` — drop one entrant. `target` is
+  resolved against the pool in order: exact `userId`, then login, then display
+  name (both case-insensitive), then `#N`/`N` as an entry number. An earlier
+  rule wins outright, so a display name that equals someone else's login cannot
+  drag both in. `{"userId": …}` is still accepted as a synonym for `target` —
+  that is what the `/giveaway` list sends, since it has the entrant and the id
+  is exact.
 - **Response.** JSON `{ "state": GiveawayState }` (or `501` if no giveaway is
   configured). `draw` also carries the picked entrant as `winner` (or `null`
   when the pool is empty) plus `segment` (`"guaranteed"` | `"pool"`); `winners`
-  returns `{ "winners": GiveawayWinner[] }` instead. `GiveawayState` is
+  returns `{ "winners": GiveawayWinner[] }` instead. `remove` also carries
+  `removed` (the entrant dropped, or `null`) and `matches` (whom the target
+  resolved to). A miss or an ambiguous target — two entrants sharing a display
+  name — removes **nothing**: `removed` is `null`, `matches` lists the
+  candidates, and the pool is unchanged. Re-run with the `userId` to pick one. `GiveawayState` is
   `{ open, entrants: [{userId, login, displayName, enteredAt, number}],
   nextNumber, lastWinner?, campaign? }` — `campaign` is a derived summary
   `{ followerCount, milestonesReached, creditsRemaining, guaranteedRemaining,

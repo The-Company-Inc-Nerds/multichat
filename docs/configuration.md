@@ -43,10 +43,12 @@ passed as the first CLI argument. Copy `settings.json.example` to
 
 ## `server`
 
-| Field  | Type   | Default     | Description                                                           |
-| ------ | ------ | ----------- | --------------------------------------------------------------------- |
-| `port` | number | `8080`      | Port the web UI is served on                                          |
-| `host` | string | `127.0.0.1` | Bind address. Defaults to localhost (right for an OBS browser source) |
+| Field           | Type   | Default      | Description                                                           |
+| --------------- | ------ | ------------ | --------------------------------------------------------------------- |
+| `port`          | number | `8080`       | Port the web UI is served on                                          |
+| `host`          | string | `127.0.0.1`  | Bind address. Defaults to localhost (right for an OBS browser source) |
+| `controlAccess` | string | `"loopback"` | Who may press the `/giveaway` buttons — `loopback`, `lan`, or `any`   |
+| `controlToken`  | string | `""`         | Shared secret non-loopback control requests must present              |
 
 > **Exposing to other machines.** To serve on the LAN, set `host` to `0.0.0.0`.
 > The bind address must also be allowed in Deno's `--allow-net` flag —
@@ -54,6 +56,70 @@ passed as the first CLI argument. Copy `settings.json.example` to
 > packaged-binary flags, so the default and `0.0.0.0` both work; a specific LAN
 > IP would need adding there. There is no authentication, so only expose it on a
 > trusted network, and note the server caps concurrent viewers at 50.
+
+### Drawing from another machine (`controlAccess`)
+
+Binding `0.0.0.0` lets anyone on the network *watch* `/giveaway`, but the
+buttons — open, close, draw, reset — POST to `/api/giveaway`, which defaults to
+loopback-only. Press Draw from a phone or a second PC and it answers `403`.
+`server.controlAccess` widens that:
+
+| Value        | Who may drive the draw                                                                                             |
+| ------------ | ------------------------------------------------------------------------------------------------------------------ |
+| `"loopback"` | (default) only the machine running the server                                                                       |
+| `"lan"`      | loopback plus private/link-local peers — `10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `100.64/10`, `fc00::/7`, `fe80::/10` |
+| `"any"`      | no address check at all                                                                                             |
+
+For a box that is only reachable from your own network, `"lan"` is the setting
+you want:
+
+```json
+"server": { "port": 8080, "host": "0.0.0.0", "controlAccess": "lan" }
+```
+
+Understand what it buys, though: `"lan"` is an **address** check, not
+authentication. Every device on that network can draw. That is usually the
+point — whoever is in the room runs the giveaway — but on a shared or guest
+network, set `server.controlToken` as well:
+
+```json
+"server": { "host": "0.0.0.0", "controlAccess": "lan", "controlToken": "pick-something-long" }
+```
+
+A non-loopback caller must then present it as an `Authorization: Bearer …`
+header, a `?token=` query parameter, or the cookie the page mints. Open
+`http://<host>:<port>/giveaway?token=pick-something-long` once on the phone and
+it is remembered for 30 days — bookmark the plain `/giveaway` afterwards.
+Loopback is never asked for the token, so `multichat giveaway draw` on the host
+keeps working unchanged.
+
+Scope: this covers `/api/giveaway` only. `/api/youtube-key` and `/api/fake` stay
+loopback-only whatever `controlAccess` says — one sets a secret, the other forges
+events. And the read-only surfaces (`/`, `/overlay`, `/alerts`, `/giveaway`,
+`/events`) have never had authentication; `controlAccess` gates the buttons, not
+the pages.
+
+## State directory
+
+The entrant pool, the campaign counters, the append-only winners log, the turn
+ledger, the pack reports pushed back by chat-cards, and any committed draw plan
+are all written to disk as they change and reloaded at startup — so a reboot
+mid-giveaway costs you nothing. The directory is resolved in this order:
+
+| Source                 | Used when                                                     |
+| ---------------------- | ------------------------------------------------------------- |
+| `$STATE_DIRECTORY`     | running under systemd (the NixOS module — `/var/lib/multichat`) |
+| `$MULTICHAT_STATE_DIR` | you set it explicitly                                          |
+| `$XDG_STATE_HOME/multichat` | `XDG_STATE_HOME` is set                                  |
+| `$HOME/.local/state/multichat` | otherwise                                             |
+
+Deliberately never the working tree: that is where `git clean` and rebuilds
+happen. If the directory cannot be created the server logs a warning and runs
+with in-memory state — the stream is never held up by a disk problem.
+
+Deno's `--allow-write` is an allow-list, so a state directory outside the paths
+baked into `deno.json` / the packaged wrapper is denied. The defaults above are
+covered; a custom `MULTICHAT_STATE_DIR` needs adding to those flags.
 
 ## `twitch`
 
@@ -308,12 +374,34 @@ otherwise the follow gate and reel still work, but replies log a `401` and are
 skipped. Set `replies: false` to run silently (the `/giveaway` page still shows
 entries and the winner).
 
-**Running it.** Open `/giveaway` (the control view) on the same machine as the
-server — its buttons use the loopback [`/api/giveaway`](api.md#post-apigiveaway)
-endpoint. Or drive it from the terminal: `multichat giveaway
-status|open|close|draw|reset|demo|winners|campaign-reset|remove <userId>`. The
-entrant pool, campaign progress, and winners log are persisted to the state
-directory, so they survive a restart.
+**Running it.** Open `/giveaway` (the control view). Its buttons use the
+[`/api/giveaway`](api.md#post-apigiveaway) endpoint, which is loopback-only
+until [`server.controlAccess`](#drawing-from-another-machine-controlaccess)
+widens it — so out of the box the control view only works on the server's own
+machine. Or drive it from the terminal: `multichat giveaway
+status|open|close|draw|reset|demo|winners|campaign-reset|remove <who>`. The
+entrant pool, campaign progress, and winners log are persisted to the
+[state directory](#state-directory), so they survive a restart.
+
+**Removing an entrant.** Every name in the ENTRANTS list has a `✕` next to it,
+and the box above the list filters by name or `#number` — which is what makes
+one person findable in a pool of a few hundred. Removal asks for confirmation:
+there is no undo, and in campaign mode a re-entry comes back with a new entry
+number.
+
+From the terminal, `multichat giveaway remove <who>` takes whatever you can read
+off the screen — a login, a display name, `#12`, or a raw userId:
+
+```bash
+multichat giveaway remove pixelpanda   # login
+multichat giveaway remove "Nova Byte"  # display name (case-insensitive)
+multichat giveaway remove '#12'        # entry number
+```
+
+It prints who it dropped and how many entrants are left. If nothing matches, or
+if two entrants share the display name you typed, it removes **nothing**, lists
+the candidates, and exits non-zero — so a script notices, and so you never
+silently drop the wrong person mid-stream. Re-run with the userId to pick one.
 
 **On stream (OBS overlay).** Point an OBS browser source at `/giveaway?overlay`
 — a **transparent** version that shows only the reel, stays blank between draws,
@@ -458,7 +546,10 @@ These override their `settings.json` counterparts at startup:
 | `YOUTUBE_API_KEY`      | the startup YouTube key (below a persisted runtime key)  |
 | `TWITCH_CLIENT_SECRET` | `twitch.eventsub.clientSecret`                           |
 | `TWITCH_CLIENT_ID`     | `twitch.eventsub.clientId` (read by `multichat login`)   |
-| `STATE_DIRECTORY`      | directory runtime keys/tokens are persisted in (systemd) |
+| `STATE_DIRECTORY`      | directory all persistent state is written to (systemd)   |
+| `MULTICHAT_STATE_DIR`  | the same, outside systemd (see [State directory](#state-directory)) |
+| `MULTICHAT_CONTROL_ACCESS` | `server.controlAccess` |
+| `MULTICHAT_CONTROL_TOKEN` | `server.controlToken` |
 | `MULTICHAT_CALLBACK_TOKEN` | `integrations.callbackToken` |
 | `MULTICHAT_INTEGRATION_TOKEN_<NAME>` | a subscriber's `token` (see [Integrations](#integrations)) |
 

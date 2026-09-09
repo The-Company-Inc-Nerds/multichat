@@ -5,6 +5,7 @@
 // directly, matching the project's "logic in src/, wiring in main.ts" split.
 
 import type {
+  ControlAccess,
   GiveawayEntrant,
   GiveawayPlan,
   GiveawayState,
@@ -29,7 +30,15 @@ export interface GiveawayHooks {
   open(): GiveawayState;
   close(): GiveawayState;
   reset(): GiveawayState;
-  remove(userId: string): GiveawayState;
+  /** Remove whoever `target` resolves to — a userId, login, display name or
+   *  #entry-number. Reports what happened rather than echoing the state either
+   *  way: `removed` is null on a miss, and `matches` carries the candidates when
+   *  the needle was ambiguous (nothing is removed then). */
+  remove(target: string): {
+    state: GiveawayState;
+    removed: GiveawayEntrant | null;
+    matches: GiveawayEntrant[];
+  };
   draw(): {
     state: GiveawayState;
     winner: GiveawayEntrant | null;
@@ -228,4 +237,127 @@ export function giveawayPlanStatePath(
 ): string | null {
   const dir = (stateDir ?? "").replace(/\/+$/, "");
   return dir ? `${dir}/giveaway-plan` : null;
+}
+
+// ---- Control-plane access policy -----------------------------------------
+
+/** Coerce a settings.json value to a ControlAccess, defaulting to the safe one. */
+export function normalizeControlAccess(raw: unknown): ControlAccess {
+  const v = String(raw ?? "").trim().toLowerCase();
+  return v === "lan" || v === "any" ? v : "loopback";
+}
+
+/**
+ * True when a connection came from an address that cannot be routed in from the
+ * internet — the private and link-local ranges, plus loopback. This is an
+ * address check, not authentication: anyone already on the LAN passes it. That
+ * is the intent (the giveaway console is meant to be shared with whoever is in
+ * the room); pair it with a `controlToken` when the LAN is not trusted.
+ */
+export function isPrivateAddr(addr: Deno.Addr): boolean {
+  if (isLoopbackAddr(addr)) return true;
+  if (addr.transport !== "tcp" && addr.transport !== "udp") return true;
+  // An IPv4 peer on a dual-stack listener arrives as ::ffff:192.168.1.7.
+  const host = addr.hostname.replace(/^::ffff:/i, "").toLowerCase();
+  const v4 = host.split(".");
+  if (v4.length === 4 && v4.every((p) => /^\d{1,3}$/.test(p))) {
+    const [a, b] = v4.map(Number);
+    if ([a, b].some((n) => n > 255)) return false;
+    if (a === 10) return true; // 10/8
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16/12
+    if (a === 192 && b === 168) return true; // 192.168/16
+    if (a === 169 && b === 254) return true; // 169.254/16 link-local
+    if (a === 100 && b >= 64 && b <= 127) return true; // 100.64/10 CGNAT
+    return false;
+  }
+  // IPv6: unique-local (fc00::/7) and link-local (fe80::/10).
+  return /^f[cd]/.test(host) || /^fe[89ab]/.test(host);
+}
+
+/** Why a control request was refused, or `null` when it may proceed. */
+export interface ControlDenial {
+  status: number;
+  message: string;
+}
+
+/**
+ * Decide whether a control request is allowed. Loopback is always allowed (the
+ * CLI and the host's own browser must keep working, and a token there would be
+ * pure friction). Everything else must clear the configured `access` mode and,
+ * when a `token` is configured, present it.
+ *
+ * Returns null to allow, or the denial to render.
+ */
+export function checkControlAccess(opts: {
+  addr: Deno.Addr;
+  access: ControlAccess;
+  /** Configured shared secret; "" (the default) means no token is required. */
+  token: string;
+  /** Token the request presented (bearer header, ?token=, or cookie). */
+  presented: string;
+  /** Endpoint name, for the error text (e.g. "giveaway"). */
+  endpoint: string;
+}): ControlDenial | null {
+  if (isLoopbackAddr(opts.addr)) return null;
+  if (opts.access === "loopback") {
+    return {
+      status: 403,
+      message:
+        `Forbidden: the ${opts.endpoint} endpoint is loopback-only. Set ` +
+        `server.controlAccess to "lan" to allow the local network.`,
+    };
+  }
+  if (opts.access === "lan" && !isPrivateAddr(opts.addr)) {
+    return {
+      status: 403,
+      message: `Forbidden: the ${opts.endpoint} endpoint is limited to the ` +
+        `local network (server.controlAccess = "lan").`,
+    };
+  }
+  if (opts.token && !timingSafeEqual(opts.presented, opts.token)) {
+    return {
+      status: 403,
+      message: `Forbidden: bad or missing control token. Open the page as ` +
+        `/giveaway?token=… once and it is remembered.`,
+    };
+  }
+  return null;
+}
+
+/** Length-independent-ish constant-time compare (mirrors server.ts's safeEqual,
+ *  kept here so the policy is testable without the HTTP layer). */
+export function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+// ---- State directory ------------------------------------------------------
+
+/**
+ * Where persistent state lives, resolved from the environment.
+ *
+ * systemd's `StateDirectory` wins when present (the NixOS service), so a managed
+ * deployment keeps writing to /var/lib/multichat. Outside systemd we no longer
+ * fall back to "nothing": a `deno task start` on a streaming PC should still
+ * keep its entrant pool, winners log and turn ledger across a reboot. The XDG
+ * state dir is the right home for that — not the working tree, which is where
+ * `git clean` and rebuilds happen.
+ *
+ * `env` is injected so this stays pure and testable.
+ */
+export function resolveStateDir(
+  env: (name: string) => string | undefined,
+): string | null {
+  const trim = (v: string | undefined) => (v ?? "").trim().replace(/\/+$/, "");
+  const systemd = trim(env("STATE_DIRECTORY"));
+  if (systemd) return systemd;
+  const explicit = trim(env("MULTICHAT_STATE_DIR"));
+  if (explicit) return explicit;
+  const xdg = trim(env("XDG_STATE_HOME"));
+  if (xdg) return `${xdg}/multichat`;
+  const home = trim(env("HOME"));
+  if (home) return `${home}/.local/state/multichat`;
+  return null; // no writable home — in-memory only, as before
 }

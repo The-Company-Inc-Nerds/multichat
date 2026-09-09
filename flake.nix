@@ -39,10 +39,17 @@
 
             environment.etc."multichat-callback-token".text = "callback-secret";
             environment.etc."packsink-token".text = "outbound-secret";
+            environment.etc."multichat-control-token".text = "control-secret";
 
             services.multichat = {
               enable = true;
               port = 8080;
+              # Bound to every interface and drawable from the LAN behind a token:
+              # the address policy is only observable off-loopback, which a VM with
+              # its own eth0 address can actually exercise.
+              host = "0.0.0.0";
+              controlAccess = "lan";
+              controlTokenFile = "/etc/multichat-control-token";
               twitch.channels = [ "demo" ];
               giveaway = {
                 enable = true;
@@ -108,9 +115,48 @@
                     f"-H 'Content-Type: application/json' -d '{{\"action\": \"{action}\"}}'"
                 )
 
-            # Neither token may appear in the world-readable settings file.
+            # No token may appear in the world-readable settings file.
             machine.fail("grep -rq callback-secret /nix/store/*-multichat-settings.json")
             machine.fail("grep -rq outbound-secret /nix/store/*-multichat-settings.json")
+            machine.fail("grep -rq control-secret /nix/store/*-multichat-settings.json")
+
+            # The control policy, exercised from a non-loopback address (the VM's
+            # own eth0). Loopback never needs the token; the LAN always does.
+            lan = machine.succeed(
+                "ip -4 -o addr show scope global | awk '{print $4}' "
+                "| cut -d/ -f1 | head -n1"
+            ).strip()
+            assert lan and not lan.startswith("127."), lan
+
+            def code(cmd):
+                return machine.succeed(cmd + " -s -o /dev/null -w '%{http_code}'").strip()
+
+            draw_body = "-H 'Content-Type: application/json' -d '{\"action\": \"status\"}'"
+            assert code(
+                f"curl -X POST http://{lan}:8080/api/giveaway {draw_body}"
+            ) == "403", "a LAN caller with no token must be refused"
+            assert code(
+                f"curl -X POST http://{lan}:8080/api/giveaway {draw_body} "
+                "-H 'Authorization: Bearer control-secret'"
+            ) == "200", "a LAN caller with the token must be allowed"
+            assert code(
+                f"curl -X POST http://127.0.0.1:8080/api/giveaway {draw_body}"
+            ) == "200", "loopback must never be asked for the token"
+
+            # Opening the page with the token mints the cookie the buttons ride on.
+            machine.succeed(
+                f"curl -s -D- -o /dev/null 'http://{lan}:8080/giveaway?token=control-secret'"
+                " | grep -qi 'set-cookie: *mc_control='"
+            )
+            machine.succeed(
+                f"curl -s -D- -o /dev/null 'http://{lan}:8080/giveaway?token=wrong'"
+                " | grep -qiv 'set-cookie'"
+            )
+
+            # The other control endpoints stay loopback-only regardless.
+            assert code(
+                f"curl -X POST http://{lan}:8080/api/fake -d 'follow'"
+            ) == "403", "/api/fake must not follow controlAccess"
 
             # The gates the module emits conditionally: present and switched on,
             # with the operator's own values rather than the app's defaults.
@@ -120,7 +166,7 @@
             assert settings["timezone"] == "America/Denver", settings
             assert settings["terms"] == {
                 "required": True,
-                "command": "accept",
+                "command": "terms",
                 "version": "3",
                 "url": "https://example.test/terms",
             }, settings

@@ -11,7 +11,9 @@ import type {
   Settings,
 } from "./types.ts";
 import {
+  checkControlAccess,
   isLoopbackAddr,
+  normalizeControlAccess,
   parseYouTubeKeyBody,
   type ServerHooks,
 } from "./control.ts";
@@ -205,7 +207,14 @@ const HTML = `<!DOCTYPE html>
 
     .text {
       color: #d8d8e0;
-      flex: 1;
+      /* flex-basis 60% (not the 0 that a bare "flex: 1" implies) so the message
+         drops onto its own full-width line once the badges + username take past
+         ~40% of the row, instead of being crushed into the leftover sliver and
+         wrapping one letter per line — the failure a narrow, large-font OBS
+         overlay hits. When there's room it still sits inline after the name and
+         grows to fill the rest; min-width:0 stays so a long token can still
+         break once the text is on its own line. */
+      flex: 1 1 60%;
       min-width: 0;
       line-height: 1.55;
       word-break: break-word;
@@ -300,6 +309,19 @@ const HTML = `<!DOCTYPE html>
       mask-image: linear-gradient(to bottom, transparent 0, #000 56px);
     }
     body.overlay .chan { display: none; }   /* the T/YT badge already shows source */
+    /* The base .user is flex-shrink:0 with no width cap, so a long single-token
+       name at a large overlay font would spill past the pill (clipped by #chat's
+       overflow:hidden). In overlay, let it shrink and — only when a single token
+       is still wider than the row — break, instead of overflowing: flex-shrink:1
+       + min-width:0 let the box shrink below the name's intrinsic width, and
+       overflow-wrap:anywhere then supplies the in-word break so the glyphs
+       reflow inside the narrowed box. Shrink only fires when the line actually
+       overflows, so ordinary names render untouched. */
+    body.overlay .user {
+      flex-shrink: 1;
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
     /* Each row gets its own translucent dark pill so the near-white text stays
        legible over any video — or a plain browser tab — while the page itself
        stays see-through for OBS. text-shadow adds extra bite at the glyph edges. */
@@ -949,7 +971,14 @@ const GIVEAWAY_HTML = `<!DOCTYPE html>
     #list { list-style: none; display: flex; flex-wrap: wrap; gap: 4px; justify-content: center; }
     #list li { display: flex; align-items: center; gap: 7px; padding: 4px 8px; background: #161618; border-radius: 5px; font-size: 12px; }
     #list li .sw { width: 9px; height: 9px; border-radius: 2px; flex-shrink: 0; }
-    #list li button { padding: 0 5px; font-size: 11px; font-weight: 500; }
+    #list li button { padding: 2px 7px; font-size: 12px; font-weight: 500; }
+    #filter {
+      display: block; width: 100%; margin-bottom: 8px; padding: 7px 10px;
+      background: #0e0e10; color: #efeff1; border: 1px solid #2a2a31;
+      border-radius: 5px; font-size: 12px; font-family: inherit;
+    }
+    #filter:focus { outline: none; border-color: #4b4b57; }
+    #fnote { font-size: 11px; color: #6c6c78; text-align: center; margin-bottom: 8px; min-height: 14px; }
     #empty { color: #5a5a64; font-style: italic; font-size: 12px; }
     #disabled { display: none; padding: 20px; text-align: center; color: #ff8a84; }
     body.off #stage, body.off #panel { display: none; } body.off #disabled { display: block; }
@@ -1008,7 +1037,13 @@ const GIVEAWAY_HTML = `<!DOCTYPE html>
     </div>
     <div id="state"></div>
     <div id="winsWrap"><h2>WINNERS</h2><ul id="winsList"></ul></div>
-    <div id="listWrap"><h2 id="rtitle">ENTRANTS</h2><ul id="list"></ul></div>
+    <div id="listWrap">
+      <h2 id="rtitle">ENTRANTS</h2>
+      <input id="filter" type="search" placeholder="Filter entrants — name or #number"
+        autocomplete="off" oninput="renderList()">
+      <div id="fnote"></div>
+      <ul id="list"></ul>
+    </div>
   </div>
   <script>
     var cfg = window.MULTICHAT_GIVEAWAY || {};
@@ -1032,6 +1067,8 @@ const GIVEAWAY_HTML = `<!DOCTYPE html>
     var ctxt = document.getElementById('ctxt');
     var stateEl = document.getElementById('state');
     var listEl = document.getElementById('list');
+    var filterEl = document.getElementById('filter');
+    var fnote = document.getElementById('fnote');
     var rtitle = document.getElementById('rtitle');
     var spinBtn = document.getElementById('spinBtn');
     var hintEl = document.getElementById('hint');
@@ -1130,23 +1167,59 @@ const GIVEAWAY_HTML = `<!DOCTYPE html>
       var wb = document.getElementById('winsBtn');
       if (wb && c) wb.textContent = 'Winners (' + c.winnersTotal + ')';
       renderProgress(c);
+      renderList();
+    }
+
+    // The entrant list, narrowed by the filter box. Kept separate from
+    // renderPanel so typing re-renders only the list — a pool of a few hundred
+    // names is a wall to scan otherwise, and the ✕ next to the wrong one is not
+    // an undoable mistake.
+    function renderList() {
       if (!listEl) return;
+      var q = (filterEl && filterEl.value || '').trim().toLowerCase();
+      var num = q.replace(/^#/, '');
+      var shown = pool.entrants.filter(function (e) {
+        if (!q) return true;
+        if ((e.login || '').toLowerCase().indexOf(q) >= 0) return true;
+        if ((e.displayName || '').toLowerCase().indexOf(q) >= 0) return true;
+        // "#12"/"12" matches the entry number exactly — a substring match there
+        // would surface 12, 120 and 512 for the same keystroke.
+        return num !== '' && String(e.number || '') === num;
+      });
+      if (fnote) {
+        fnote.textContent = q
+          ? shown.length + ' of ' + pool.entrants.length + ' shown'
+          : '';
+      }
       listEl.textContent = '';
-      if (!n) {
+      if (!pool.entrants.length) {
         var li = document.createElement('li'); li.id = 'empty';
         li.textContent = 'No one has entered yet.'; listEl.appendChild(li); return;
       }
-      pool.entrants.forEach(function (e, i) {
+      if (!shown.length) {
+        var none = document.createElement('li'); none.id = 'empty';
+        none.textContent = 'No entrant matches "' + q + '".'; listEl.appendChild(none); return;
+      }
+      shown.forEach(function (e, i) {
         var el = document.createElement('li');
         var sw = document.createElement('span'); sw.className = 'sw';
         sw.style.background = color(e.userId, i); el.appendChild(sw);
         var nm = document.createElement('span');
         nm.textContent = (e.number ? '#' + e.number + ' ' : '') + nameOf(e);
         el.appendChild(nm);
-        var rm = document.createElement('button'); rm.textContent = '✕'; rm.title = 'Remove';
-        rm.onclick = function () { act('remove', { userId: e.userId }); }; el.appendChild(rm);
+        var rm = document.createElement('button'); rm.textContent = '✕';
+        rm.title = 'Remove ' + nameOf(e) + ' from the pool';
+        rm.onclick = function () { confirmRemove(e); }; el.appendChild(rm);
         listEl.appendChild(el);
       });
+    }
+
+    // Confirm before dropping someone: the pool is the whole giveaway, and there
+    // is no undo — a re-entry needs the viewer to type the command again, and in
+    // campaign mode they would come back with a new entry number.
+    function confirmRemove(e) {
+      if (!confirm('Remove ' + nameOf(e) + ' from the pool?')) return;
+      act('remove', { target: e.userId });
     }
 
     // Follower-milestone progress: the control-view bar and the overlay pill.
@@ -1362,6 +1435,22 @@ function requestToken(req: Request): string {
   return new URL(req.url).searchParams.get("token") ?? "";
 }
 
+/** Cookie the /giveaway page remembers `?token=` in, so the operator pastes the
+ *  URL once on their phone and every later Draw carries the secret. HttpOnly, so
+ *  the page never has to touch it — same-origin fetch sends it automatically. */
+const CONTROL_COOKIE = "mc_control";
+
+/** Read one cookie off a request. Returns "" when absent. */
+function cookieValue(req: Request, name: string): string {
+  for (const part of (req.headers.get("cookie") ?? "").split(";")) {
+    const eq = part.indexOf("=");
+    if (eq < 0) continue;
+    if (part.slice(0, eq).trim() !== name) continue;
+    return decodeURIComponent(part.slice(eq + 1).trim());
+  }
+  return "";
+}
+
 /** Stable derived color for an author name (used when the platform gives none). */
 export function colorFor(name: string): string {
   let h = 0;
@@ -1417,6 +1506,10 @@ export function createServer(
 
   // Bearer required on POST /api/turn-report (else that endpoint is loopback-only).
   const callbackToken = settings.integrations?.callbackToken ?? "";
+  // Who may drive POST /api/giveaway, and the optional shared secret non-loopback
+  // callers must present. See src/control.ts.
+  const controlAccess = normalizeControlAccess(settings.server.controlAccess);
+  const controlToken = (settings.server.controlToken ?? "").trim();
 
   // Seed one status entry per configured channel, all "connecting" until a client reports in.
   const statuses = new Map<string, ChannelStatus>();
@@ -1561,7 +1654,10 @@ export function createServer(
       }
 
       // Operator control-plane for the giveaway (open/close/draw/reset/remove/
-      // status). Loopback-only like the endpoints above — the /giveaway page and
+      // status). Unlike the two endpoints above this one is *shareable*: running
+      // a giveaway means whoever is at the desk (or holding a phone) presses
+      // Draw, so server.controlAccess can widen it from loopback to the local
+      // network, optionally behind server.controlToken. The /giveaway page and
       // `multichat giveaway` both drive it. Mutating actions broadcast the new
       // pool to every connected page from inside the engine (see main.ts).
       if (pathname === "/api/giveaway") {
@@ -1574,12 +1670,14 @@ export function createServer(
             },
           });
         if (req.method !== "POST") return ctl("Method Not Allowed\n", 405);
-        if (!isLoopbackAddr(info.remoteAddr)) {
-          return ctl(
-            "Forbidden: the giveaway endpoint is loopback-only\n",
-            403,
-          );
-        }
+        const denied = checkControlAccess({
+          addr: info.remoteAddr,
+          access: controlAccess,
+          token: controlToken,
+          presented: requestToken(req) || cookieValue(req, CONTROL_COOKIE),
+          endpoint: "giveaway",
+        });
+        if (denied) return ctl(denied.message + "\n", denied.status);
         if (!hooks.giveaway) {
           return ctl("Giveaway is not enabled\n", 501);
         }
@@ -1603,9 +1701,15 @@ export function createServer(
           case "demo":
             payload = { state: gh.demo() };
             break;
-          case "remove":
-            payload = { state: gh.remove(a.userId) };
+          case "remove": {
+            const r = gh.remove(a.target);
+            payload = {
+              state: r.state,
+              removed: r.removed,
+              matches: r.matches,
+            };
             break;
+          }
           case "draw": {
             const r = gh.draw();
             payload = { state: r.state, winner: r.winner, segment: r.segment };
@@ -1679,9 +1783,21 @@ export function createServer(
       }
 
       if (pathname === "/giveaway") {
-        return new Response(giveawayHtml, {
-          headers: { "Content-Type": "text/html; charset=utf-8" },
+        const headers = new Headers({
+          "Content-Type": "text/html; charset=utf-8",
         });
+        // Opening the page with a matching ?token= mints the cookie the control
+        // POSTs ride on. The page itself stays readable without one — it is a
+        // display surface (and an OBS overlay); only the buttons are gated.
+        const supplied = new URL(req.url).searchParams.get("token") ?? "";
+        if (controlToken && safeEqual(supplied, controlToken)) {
+          headers.append(
+            "Set-Cookie",
+            `${CONTROL_COOKIE}=${encodeURIComponent(controlToken)}; Path=/; ` +
+              `HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 30}`,
+          );
+        }
+        return new Response(giveawayHtml, { headers });
       }
 
       if (pathname === "/events") {

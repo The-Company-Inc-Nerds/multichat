@@ -1,7 +1,9 @@
 {
   "server": {
     "port": 8088,
-    "host": "0.0.0.0"
+    "host": "0.0.0.0",
+    "controlAccess": "lan",
+    "controlToken": ""
   },
   "twitch": {
     "channels": ["TheCompanyInc"]

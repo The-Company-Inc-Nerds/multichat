@@ -49,6 +49,8 @@ let
     ++ map
       (ch: "twitch-refresh-${ch.broadcasterId}:${toString ch.refreshTokenFile}")
       esTokenFiles
+    ++ lib.optional (cfg.controlTokenFile != null)
+      "control-token:${toString cfg.controlTokenFile}"
     ++ lib.optional (intCfg.callbackTokenFile != null)
       "integration-callback-token:${toString intCfg.callbackTokenFile}"
     ++ map
@@ -66,7 +68,14 @@ let
   # Settings without secrets — the YouTube key comes from YOUTUBE_API_KEY and the
   # Twitch client secret from TWITCH_CLIENT_SECRET at runtime.
   settingsFile = pkgs.writeText "multichat-settings.json" (builtins.toJSON {
-    server = { port = cfg.port; host = cfg.host; };
+    server = {
+      port = cfg.port;
+      host = cfg.host;
+      controlAccess = cfg.controlAccess;
+      # File-sourced like the other secrets: blanked here, exported from the unit.
+      controlToken =
+        if cfg.controlTokenFile != null then "" else cfg.controlToken;
+    };
     twitch = {
       channels = cfg.twitch.channels;
       eventsub = {
@@ -165,6 +174,58 @@ in
       type = lib.types.bool;
       default = false;
       description = "Open the configured port in the firewall.";
+    };
+
+    controlAccess = lib.mkOption {
+      type = lib.types.enum [ "loopback" "lan" "any" ];
+      default = "loopback";
+      example = "lan";
+      description = ''
+        Who may drive the giveaway control endpoint (`POST /api/giveaway`) —
+        the open/close/draw/reset buttons on `/giveaway`, and `multichat
+        giveaway <verb>`.
+
+        - "loopback" (default): only the machine running the service. A browser
+          on another PC or a phone gets 403 when it presses Draw.
+        - "lan": also accepts private and link-local peers (RFC1918, CGNAT,
+          169.254/16, fc00::/7, fe80::/10), so anyone on the home network can
+          run the draw. Public addresses are still refused, so this stays safe
+          on a box whose port is only reachable from the LAN — but note it is an
+          address check, not authentication: every device on that network can
+          draw. Add controlTokenFile if the network is shared.
+        - "any": no address check. Only sensible together with a control token
+          or an authenticating reverse proxy.
+
+        Read-only surfaces (`/`, `/overlay`, `/alerts`, `/giveaway`, `/events`)
+        are unauthenticated regardless — this option gates the buttons, not the
+        pages. The other two control endpoints (`/api/youtube-key`, `/api/fake`)
+        stay loopback-only: they set a secret and forge events.
+      '';
+    };
+
+    controlToken = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      description = ''
+        Shared secret a non-loopback control request must present, as a bearer
+        header, `?token=`, or the cookie `/giveaway?token=…` sets. Empty (the
+        default) means controlAccess alone decides. Loopback is never asked for
+        it, so the local CLI keeps working.
+
+        Ends up in the Nix store and in `systemctl show multichat` — use
+        controlTokenFile for a real secret.
+      '';
+    };
+
+    controlTokenFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      example = "/run/secrets/multichat-control-token";
+      description = ''
+        Path to a file containing the raw control token. Staged via systemd
+        LoadCredential and exported as MULTICHAT_CONTROL_TOKEN, so it never
+        enters the Nix store. Takes precedence over controlToken.
+      '';
     };
 
     twitch.channels = lib.mkOption {
@@ -756,6 +817,18 @@ in
         ("services.multichat.giveaway.terms.enable is on with no terms.url and no custom "
           + "`terms` message — the built-in reply renders \"see the panel\" where the link "
           + "should be. Set terms.url, or write the terms into messages.terms.")
+      ++ lib.optional (cfg.controlTokenFile == null && cfg.controlToken != "")
+        ("services.multichat.controlToken is written into the Nix store and shown by "
+          + "`systemctl show multichat`. Use controlTokenFile for real secrets.")
+      ++ lib.optional
+        (cfg.controlAccess == "any" && cfg.controlTokenFile == null && cfg.controlToken == "")
+        ("services.multichat.controlAccess = \"any\" with no control token: anyone who can "
+          + "reach the port can open, draw and reset the giveaway. Set controlTokenFile, or "
+          + "use \"lan\" if you only meant the local network.")
+      ++ lib.optional (cfg.controlAccess != "loopback" && cfg.host == "127.0.0.1")
+        ("services.multichat.controlAccess is widened but host is \"127.0.0.1\", so nothing "
+          + "off-box can reach the server at all. Set host = \"0.0.0.0\" (and openFirewall) "
+          + "to actually let another machine draw.")
       ++ lib.optional (intCfg.callbackTokenFile == null && intCfg.callbackToken != "")
         ("services.multichat.integrations.callbackToken is written into the Nix store and shown by "
           + "`systemctl show multichat`. Use callbackTokenFile for real secrets.")
@@ -794,6 +867,9 @@ in
         ''}
         ${lib.optionalString (esCfg.clientSecretFile != null) ''
           export TWITCH_CLIENT_SECRET="$(cat "$CREDENTIALS_DIRECTORY/twitch-client-secret")"
+        ''}
+        ${lib.optionalString (cfg.controlTokenFile != null) ''
+          export MULTICHAT_CONTROL_TOKEN="$(cat "$CREDENTIALS_DIRECTORY/control-token")"
         ''}
         ${lib.optionalString (intCfg.callbackTokenFile != null) ''
           export MULTICHAT_CALLBACK_TOKEN="$(cat "$CREDENTIALS_DIRECTORY/integration-callback-token")"

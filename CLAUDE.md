@@ -36,10 +36,18 @@ deno run --allow-net --allow-read --allow-write=/var/lib/multichat,/var/lib/priv
 
 `config-path` defaults to `./settings.json`. Env vars `PORT` and `HOST` override
 their settings.json counterparts; the YouTube key is resolved as persisted
-runtime key → `YOUTUBE_API_KEY` → `youtube.apiKey`. `--allow-write` /
-`STATE_DIRECTORY` exist only so a runtime-set key can be persisted to
-`$STATE_DIRECTORY/youtube-api-key` (systemd `StateDirectory`); with no state dir
-the key is in-memory only.
+runtime key → `YOUTUBE_API_KEY` → `youtube.apiKey`.
+
+`--allow-write` exists so state can be persisted: the runtime YouTube key, the
+rotated Twitch refresh tokens, and the whole giveaway (entrant pool, campaign
+counters, append-only winners log, turn ledger, chat-cards pack reports,
+committed draw plan). `resolveStateDir` in `src/control.ts` picks the directory —
+`$STATE_DIRECTORY` (systemd) → `$MULTICHAT_STATE_DIR` → `$XDG_STATE_HOME/multichat`
+→ `$HOME/.local/state/multichat`, never the working tree — and `ensureStateDir`
+in main.ts creates it 0700. Everything degrades to in-memory (with a warning) if
+it can't be created; persistence must never cost someone their stream. Deno's
+`--allow-write` is an allow-list, so those default paths are in `deno.json` and
+`build.nix`; a custom `MULTICHAT_STATE_DIR` outside them is denied by Deno.
 
 The same binary is also a small CLI client:
 
@@ -61,7 +69,9 @@ The same binary is also a small CLI client:
   server via its loopback `POST /api/giveaway` endpoint (`status` / `open` /
   `close` / `draw` / `reset` / `demo` / `winners [--csv]` / `packs` / `turns` /
   `report [--csv]` / `plan [N] [--reseed] [--csv]` / `plan-clear` /
-  `campaign-reset --yes` / `remove <userId>`; `demo` injects sample entrants +
+  `campaign-reset --yes` / `remove <who>` (a login, display name, `#entry-number`
+  or userId — resolved server-side, refusing a miss or an ambiguous name rather
+  than dropping the wrong person); `demo` injects sample entrants +
   follower progress to preview the reel, `winners` prints the recorded mailing
   list, `packs` the pack reports pushed back by chat-cards, `turns` the turn
   ledger + disposition totals, `report` the compiled per-user list (turn-start
@@ -76,6 +86,17 @@ The same binary is also a small CLI client:
 Copy `settings.json.example` to `settings.json` and edit:
 
 - `server.port` / `server.host` — where the web UI is served
+- `server.controlAccess` — who may drive `POST /api/giveaway` (the `/giveaway`
+  buttons and `multichat giveaway <verb>`): `"loopback"` (default, host only),
+  `"lan"` (also private/link-local peers — the setting for "anyone in the room
+  can press Draw"), `"any"` (no address check). `server.controlToken` optionally
+  requires a shared secret of non-loopback callers, presented as a bearer header,
+  `?token=`, or the cookie `GET /giveaway?token=…` mints. Loopback is never asked
+  for the token, so the CLI keeps working. Scoped to `/api/giveaway` — the
+  youtube-key and fake-event endpoints stay loopback-only, and the read-only
+  pages have no auth either way. Both are env-overridable
+  (`MULTICHAT_CONTROL_ACCESS`, `MULTICHAT_CONTROL_TOKEN`) so the NixOS module can
+  carry the token via `LoadCredential`. See `src/control.ts`
 - `twitch.channels` — list of Twitch channel names (lowercase)
 - `twitch.eventsub` — optional `{clientId, clientSecret, channels}` for follow/
   cheer/sub/raid **alerts** via Twitch EventSub (chat alone works without it)
@@ -173,7 +194,8 @@ src/server.ts    Deno.serve HTTP server: GET / + GET /overlay + GET /alerts + GE
                  ?direction=up|down flips the
                  message flow on any chat-rendering page), GET /events (SSE, replays the
                  giveaway pool on connect), POST /api/youtube-key + POST /api/fake +
-                 POST /api/giveaway (loopback-only control) + POST /api/turn-report (the inbound
+                 POST /api/giveaway (operator control; loopback-only unless server.controlAccess
+                 widens it — see checkControlAccess) + POST /api/turn-report (the inbound
                  integration callback: chat-cards pushes back pack/card summaries; bearer
                  integrations.callbackToken, else loopback-only); createServer returns
                  { emitter, broadcastGiveaway }
@@ -182,7 +204,9 @@ src/alerts.ts    pure alerts-theme helpers: normalizeAlertsConfig (validates the
                  injected into the page as window.MULTICHAT_ALERTS for the overlay to apply
 src/giveaway.ts  pure giveaway helpers: normalizeGiveawayConfig (incl. terms/disposition/
                  timezone sub-configs), matchGiveawayCommand, the entrant-pool reducers (add w/
-                 permanent entry numbers, remove, draw + drawSegmented guaranteed-queue-then-pool
+                 permanent entry numbers, remove, findEntrants/removeByNeedle — resolve a
+                 typed login/display-name/#number to one entrant, refusing ties —
+                 draw + drawSegmented guaranteed-queue-then-pool
                  w/ an optional forcedUserId for a committed plan, open/close/reset) +
                  normalizePoolState (migrates number-less files), campaign reducers
                  (recordFollower dedupe + milestone crossing, winnerTier, campaignSummary), the
@@ -200,8 +224,10 @@ src/integrations.ts  pure integration-bus helpers: normalizeIntegrationsConfig, 
                  normalizePackReports behind POST /api/turn-report), plus applyIntegrationEnv /
                  subscriberTokenEnvVar (env overrides for both tokens; the env-var naming rule
                  is mirrored in module.nix and must stay in sync). The fetch wiring is in main.ts
-src/control.ts   pure control-plane helpers (loopback check, key-body parse, startup-key
-                 resolution, state paths incl. Twitch token/broadcaster-id + giveaway
+src/control.ts   pure control-plane helpers (loopback + private-range checks, the
+                 controlAccess/controlToken policy behind POST /api/giveaway, key-body parse,
+                 startup-key resolution, resolveStateDir + the state paths under it incl.
+                 Twitch token/broadcaster-id + giveaway
                  pool/campaign/winners-log/packs/turns/terms/plan) + the ServerHooks
                  (setYouTubeKey + giveaway) / GiveawayHooks (draw/turnReport/packs/turns/report/
                  plan/…) / KeyUpdateResult types

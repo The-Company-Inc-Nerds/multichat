@@ -7,6 +7,11 @@ The viewer has no authentication, so `host` defaults to `127.0.0.1`. Only set
 `0.0.0.0` + `openFirewall` on a trusted network, or front it with an
 authenticating reverse proxy. The server caps concurrent viewers at 50.
 
+Exposing the port lets other machines *watch* `/giveaway`; it does not let them
+draw. The buttons POST to a control endpoint that is loopback-only until
+`controlAccess` says otherwise — see [Running the draw from another
+machine](#running-the-draw-from-another-machine).
+
 `host` must be `"127.0.0.1"` or `"0.0.0.0"` — the packaged `deno` wrapper
 restricts `--allow-net` to those bind addresses, so any other value is rejected
 at build time (see [Validation](#validation)).
@@ -81,6 +86,39 @@ The module is also importable without the flake —
 `imports = [ (import ./module.nix) ];` — and the package builds standalone from
 `build.nix`.
 
+## Running the draw from another machine
+
+The `/giveaway` page is a display surface and a control panel at once. Anyone who
+can reach the port sees the reel; only callers cleared by `controlAccess` can
+open, close, draw or reset.
+
+```nix
+services.multichat = {
+  enable = true;
+  host = "0.0.0.0";
+  openFirewall = true;
+  controlAccess = "lan";              # loopback + private/link-local peers
+  # controlTokenFile = "/run/secrets/multichat-control-token";  # if the LAN is shared
+};
+```
+
+- `"loopback"` (default) — only the machine running the service.
+- `"lan"` — also `10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `100.64/10`,
+  `fc00::/7`, `fe80::/10`. Public addresses are still refused, which is what
+  makes it safe to leave on for a box only reachable from your own network. It
+  is an address check, not authentication: **every device on that network can
+  draw.** Add `controlTokenFile` where that is not acceptable.
+- `"any"` — no address check. Pair it with a token or a reverse proxy; the module
+  warns if you do not.
+
+With a token set, a non-loopback caller presents it as `Authorization: Bearer …`,
+`?token=…`, or the cookie that `GET /giveaway?token=…` mints (30 days, HttpOnly)
+— open that URL once on the phone and the buttons work thereafter. Loopback is
+never asked for it, so `multichat giveaway draw` on the host is unaffected.
+
+`controlAccess` covers `POST /api/giveaway` only. `/api/youtube-key` and
+`/api/fake` stay loopback-only regardless.
+
 ## Supplying the YouTube key at runtime
 
 The YouTube key is **optional at build time**. You can omit both
@@ -108,6 +146,9 @@ waits for the key. The control endpoint is loopback-only (see
 | `port`                             | port                                                    | `8080`                 | Web interface port                                                                             |
 | `host`                             | string                                                  | `"127.0.0.1"`          | Bind address — must be `"127.0.0.1"` or `"0.0.0.0"`                                            |
 | `openFirewall`                     | bool                                                    | `false`                | Open `port` in the firewall                                                                    |
+| `controlAccess`                    | `"loopback"` \| `"lan"` \| `"any"`                      | `"loopback"`           | Who may drive the giveaway draw (see below)                                                    |
+| `controlToken`                     | string                                                  | `""`                   | Control token inline (Nix store — prefer `controlTokenFile`)                                   |
+| `controlTokenFile`                 | path                                                    | `null`                 | File with the raw control token; staged via `LoadCredential`                                   |
 | `twitch.channels`                  | `[string]`                                              | `[]`                   | Twitch channel names (chat, anonymous)                                                         |
 | `twitch.eventsub.clientId`         | string                                                  | `""`                   | Twitch app Client ID for alerts (not secret)                                                   |
 | `twitch.eventsub.clientSecret`     | string                                                  | `""`                   | Client Secret inline (Nix store — prefer `clientSecretFile`)                                   |
@@ -292,7 +333,10 @@ The module **fails the build** (assertion) when:
 - `giveaway.enable` is set without a `giveaway.channel`.
 
 It emits a build-time **warning** when the insecure inline `youtube.apiKey`,
-`twitch.eventsub.clientSecret`, or a channel's inline `refreshToken` is used;
+`twitch.eventsub.clientSecret`, `controlToken`, or a channel's inline
+`refreshToken` is used; when `controlAccess = "any"` is set with no control token
+(anyone who can reach the port could draw); when `controlAccess` is widened while
+`host` is still `"127.0.0.1"` (nothing off-box can reach the server at all);
 when both `twitch.channels` and `youtube.channels` are empty (the viewer would
 show no chat); when `youtube.channels` is set but no build-time key is given (a
 reminder that the key can be supplied at runtime — not an error); when

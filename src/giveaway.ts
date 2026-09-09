@@ -258,6 +258,81 @@ export function removeEntrant(
   };
 }
 
+/**
+ * Resolve what an operator typed to entrants in the pool.
+ *
+ * The `/giveaway` list can pass an exact `userId` (it has the entrant object),
+ * but nobody types a numeric Twitch id from a terminal or a phone — they type
+ * the name they can see on stream. So a needle matches, in this order:
+ *
+ *   1. an exact `userId`            — unambiguous by construction, wins outright
+ *   2. an exact login               — case-insensitive; Twitch logins are unique
+ *   3. an exact display name        — case-insensitive; NOT unique in principle
+ *   4. `#N` / `N`, an entry number  — what the list actually shows next to a name
+ *
+ * Earlier rules win outright rather than merging: a display name that happens to
+ * equal someone else's login must not drag both in. Within a rule every match is
+ * returned, so the caller can refuse an ambiguous removal instead of guessing —
+ * removing the wrong person from a live giveaway is not recoverable from the UI.
+ */
+export function findEntrants(
+  state: GiveawayState,
+  needle: string,
+): GiveawayEntrant[] {
+  const raw = (needle ?? "").trim();
+  if (!raw) return [];
+  const lower = raw.toLowerCase();
+
+  const byId = state.entrants.filter((e) => e.userId === raw);
+  if (byId.length) return byId;
+
+  const byLogin = state.entrants.filter((e) =>
+    (e.login ?? "").toLowerCase() === lower
+  );
+  if (byLogin.length) return byLogin;
+
+  const byName = state.entrants.filter((e) =>
+    (e.displayName ?? "").toLowerCase() === lower
+  );
+  if (byName.length) return byName;
+
+  // "#12" and "12" both mean entry number 12. Only when the pool actually
+  // numbers its entrants (campaign mode); a number-less pool simply won't match.
+  const n = Number(raw.replace(/^#/, ""));
+  if (Number.isInteger(n) && n > 0) {
+    return state.entrants.filter((e) => e.number === n);
+  }
+  return [];
+}
+
+/** Outcome of a removal, so the caller can say what happened rather than echo
+ *  the state either way. `matches` carries the candidates when the needle was
+ *  ambiguous (nothing is removed in that case). */
+export interface RemoveResult {
+  state: GiveawayState;
+  removed: GiveawayEntrant | null;
+  matches: GiveawayEntrant[];
+}
+
+/**
+ * Remove whoever `needle` resolves to. Refuses on no match and on an ambiguous
+ * match (two people with the same display name), leaving the pool untouched —
+ * an operator removing an entrant mid-stream needs to be told they missed, not
+ * handed a success that silently did nothing.
+ */
+export function removeByNeedle(
+  state: GiveawayState,
+  needle: string,
+): RemoveResult {
+  const matches = findEntrants(state, needle);
+  if (matches.length !== 1) return { state, removed: null, matches };
+  return {
+    state: removeEntrant(state, matches[0].userId),
+    removed: matches[0],
+    matches,
+  };
+}
+
 /** Pick a winner, remove them from the pool, and record them as `lastWinner`.
  *  `rnd` is injectable so tests are deterministic. Empty pool → `winner: null`
  *  (never throws). */
@@ -787,7 +862,7 @@ export type GiveawayAction =
   | { action: "report" }
   | { action: "plan-clear" }
   | { action: "campaign-reset" }
-  | { action: "remove"; userId: string }
+  | { action: "remove"; target: string }
   | { action: "plan"; count: number; reseed: boolean };
 
 export type GiveawayParseResult =
@@ -829,9 +904,22 @@ export function parseGiveawayAction(raw: string): GiveawayParseResult {
   if (!isObj(body)) return { ok: false, message: "body must be a JSON object" };
   const action = body.action;
   if (action === "remove") {
-    const userId = typeof body.userId === "string" ? body.userId.trim() : "";
-    if (!userId) return { ok: false, message: "remove requires a userId" };
-    return { ok: true, action: { action: "remove", userId } };
+    // `target` is a userId, login, display name or #entry-number. `userId` is
+    // still accepted: the /giveaway list has the entrant object and sends the id
+    // outright, and a hand-written curl from before this field existed should
+    // keep working.
+    const target = typeof body.target === "string"
+      ? body.target.trim()
+      : typeof body.userId === "string"
+      ? body.userId.trim()
+      : "";
+    if (!target) {
+      return {
+        ok: false,
+        message: "remove requires a target (userId, login, name or #number)",
+      };
+    }
+    return { ok: true, action: { action: "remove", target } };
   }
   if (action === "plan") {
     const count = nonneg(body.count, 0); // 0 = show/return the current plan
@@ -858,7 +946,7 @@ export function parseGiveawayAction(raw: string): GiveawayParseResult {
 export function describeGiveawayAction(a: GiveawayAction): string {
   switch (a.action) {
     case "remove":
-      return `remove entrant ${a.userId}`;
+      return `remove entrant ${a.target}`;
     default:
       return a.action;
   }
