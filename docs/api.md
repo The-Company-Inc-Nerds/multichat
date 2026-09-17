@@ -366,7 +366,9 @@ are optional.
 | `badges`      | Badge[]?                | Role chips: `{id,label}`                                                                                          |
 | `kind`        | MessageKind?            | `chat` (default), `action`, `cheer`, `sub`, `raid`, `follow`, `superchat`, `supersticker`, `membership`, `system` |
 | `amount`      | string?                 | e.g. `"500 bits"`, `"$5.00"`                                                                                      |
+| `quantity`    | number?                 | Numeric twin of `amount` where themed cards need it (cheer bits, raid viewers)                                    |
 | `accentColor` | string?                 | Highlight color for event rows / tiers                                                                            |
 | `eventText`   | string?                 | Notice line for event rows, e.g. "X subscribed for 3 months"                                                      |
+| `sub`         | object?                 | Structured detail for `kind: "sub"`: `{tier?: 1\|2\|3, variant: "new"\|"resub"\|"gift", count?}` (alert themes key off it; `tier` absent = unknown) |
 
 See [Chat Features](features.md) for how these fields are rendered.

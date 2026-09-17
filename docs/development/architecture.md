@@ -136,9 +136,9 @@ Tuned for unattended multi-hour streams:
 
 ## Nix file layout
 
-| File         | Role                                                                |
-| ------------ | ------------------------------------------------------------------- |
-| `flake.nix`  | Thin orchestration — wires the three files below into flake outputs |
-| `build.nix`  | The package derivation (standalone-buildable)                       |
-| `shell.nix`  | Dev shell + `runserver` / `runchecks` / `gcommit` helper scripts    |
-| `module.nix` | The NixOS service module (portable; importable without the flake)   |
+| File         | Role                                                                            |
+| ------------ | ------------------------------------------------------------------------------- |
+| `flake.nix`  | Thin orchestration — wires the three files below into flake outputs             |
+| `build.nix`  | The package derivation (standalone-buildable)                                   |
+| `shell.nix`  | Dev shell + `runserver` / `runchecks` / `demoalerts` / `gcommit` helper scripts |
+| `module.nix` | The NixOS service module (portable; importable without the flake)               |

@@ -105,8 +105,16 @@ on the `/alerts` URL overrides the selection per OBS source.
 The built-in **`company-memo`** style ("The Company, Inc") renders the alert as
 an office memo — `THE COMPANY, INC` over `"[Name] just followed!"` — then, right
 before it vanishes, **redacts one of those three words** with a black bar (a
-"confidential document" gag). It's typically scoped to Twitch `follow` events.
-See [Configuration → Alert themes](configuration.md#alert-themes).
+"confidential document" gag). Three kinds get their own stamped documents
+instead of the memo: a **sub** is **hiring paperwork** — Tier 1/2/3 map to the
+job titles `INTERN`/`ASSOCIATE`/`EXECUTIVE` (a resub is a `CONTRACT RENEWAL`,
+a gift a `REFERRAL PROGRAM` crediting the gifter with N referrals); a **raid**
+is an **FBI search warrant** (`"[Name] stormed the premises with 250
+agents!"`) under a strobing red/blue police-light glow; a **cheer** is a
+**petty-cash receipt** stamped `OFF THE BOOKS`. Each card's red verdict stamp
+slams onto the paper shortly after it lands. The style is typically scoped to
+Twitch `follow`, `sub`, `raid` and `cheer` events. See
+[Configuration → Alert themes](configuration.md#alert-themes).
 
 ## Deletions
 

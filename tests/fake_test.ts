@@ -124,6 +124,55 @@ Deno.test("parseFakeAction: valid message with defaults filled", () => {
   assert(r.action.data.id.length > 0);
 });
 
+Deno.test("parseFakeAction: keeps a valid sub detail; count is optional", () => {
+  const r = parseFakeAction(
+    JSON.stringify({
+      action: "message",
+      data: {
+        platform: "twitch",
+        channel: "c",
+        author: "A",
+        kind: "sub",
+        sub: { tier: 3, variant: "gift", count: 5 },
+      },
+    }),
+  );
+  assert(r.ok && r.action.action === "message");
+  assertEquals(r.action.data.sub, { tier: 3, variant: "gift", count: 5 });
+
+  // count is optional — absent stays absent (the client defaults it to 1).
+  const noCount = parseFakeAction(
+    JSON.stringify({
+      action: "message",
+      data: {
+        platform: "twitch",
+        channel: "c",
+        author: "A",
+        kind: "sub",
+        sub: { tier: 2, variant: "new" },
+      },
+    }),
+  );
+  assert(noCount.ok && noCount.action.action === "message");
+  assertEquals(noCount.action.data.sub, { tier: 2, variant: "new" });
+
+  // tier is optional too — absent means honestly unknown (renderers hedge).
+  const noTier = parseFakeAction(
+    JSON.stringify({
+      action: "message",
+      data: {
+        platform: "twitch",
+        channel: "c",
+        author: "A",
+        kind: "sub",
+        sub: { variant: "resub" },
+      },
+    }),
+  );
+  assert(noTier.ok && noTier.action.action === "message");
+  assertEquals(noTier.action.data.sub, { variant: "resub" });
+});
+
 Deno.test("parseFakeAction: delete keeps exactly one targeting field", () => {
   const byId = parseFakeAction(
     JSON.stringify({
@@ -199,6 +248,46 @@ Deno.test("parseFakeAction: rejects malformed bodies with a matching reason", ()
       "message: bad kind",
       M({ platform: "twitch", channel: "c", author: "A", kind: "nope" }),
       "kind",
+    ],
+    [
+      "message: non-object sub",
+      M({ platform: "twitch", channel: "c", author: "A", sub: 5 }),
+      "sub",
+    ],
+    [
+      "message: bad quantity",
+      M({ platform: "twitch", channel: "c", author: "A", quantity: "many" }),
+      "quantity",
+    ],
+    [
+      "message: bad sub tier",
+      M({
+        platform: "twitch",
+        channel: "c",
+        author: "A",
+        sub: { tier: 4, variant: "new" },
+      }),
+      "sub.tier",
+    ],
+    [
+      "message: bad sub variant",
+      M({
+        platform: "twitch",
+        channel: "c",
+        author: "A",
+        sub: { tier: 1, variant: "fired" },
+      }),
+      "sub.variant",
+    ],
+    [
+      "message: bad sub count",
+      M({
+        platform: "twitch",
+        channel: "c",
+        author: "A",
+        sub: { tier: 1, variant: "gift", count: 0 },
+      }),
+      "sub.count",
     ],
     // delete
     ["delete: non-object data", D(42), "object"],

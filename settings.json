@@ -21,7 +21,7 @@
       {
         "name": "The Company, Inc",
         "style": "company-memo",
-        "events": ["follow"]
+        "events": ["follow", "sub", "raid", "cheer"]
       }
     ]
   }

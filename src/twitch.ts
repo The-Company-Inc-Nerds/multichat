@@ -3,6 +3,7 @@ import type {
   Emitter,
   MessageKind,
   Segment,
+  SubDetail,
   TwitchConfig,
 } from "./types.ts";
 
@@ -161,6 +162,19 @@ const CHEER_TIERS: Array<{ min: number; color: string }> = [
 export function cheerColor(bits: number): string {
   for (const t of CHEER_TIERS) if (bits >= t.min) return t.color;
   return "#9c9c9c";
+}
+
+/** Sub plan → tier number 1|2|3. Both IRC's `msg-param-sub-plan` and EventSub's
+ *  `tier` encode tiers as "1000"/"2000"/"3000"; IRC's "Prime" counts as 1. */
+export function subPlanTier(plan: unknown): number {
+  switch (String(plan ?? "1000")) {
+    case "3000":
+      return 3;
+    case "2000":
+      return 2;
+    default:
+      return 1;
+  }
 }
 
 const ANNOUNCE_COLORS: Record<string, string> = {
@@ -328,6 +342,7 @@ export function handlePrivmsg(
 
   const bits = Number(msg.tags["bits"]);
   let amount: string | undefined;
+  let quantity: number | undefined;
   let accentColor: string | undefined;
   let eventText: string | undefined;
   // A cheer is a normal PRIVMSG with a `bits` tag and a message body. When EventSub
@@ -336,6 +351,7 @@ export function handlePrivmsg(
   if (Number.isFinite(bits) && bits > 0 && !isCovered?.(channel)) {
     kind = "cheer";
     amount = `${bits} bits`;
+    quantity = bits;
     accentColor = cheerColor(bits);
     eventText = `${author} cheered ${bits} bits`;
   }
@@ -351,6 +367,7 @@ export function handlePrivmsg(
     badges: badges.length ? badges : undefined,
     kind,
     amount,
+    quantity,
     accentColor,
     eventText,
     timestamp: Date.now(),
@@ -383,6 +400,8 @@ export function handleUsernotice(
   let kind: MessageKind = "system";
   let accentColor = "#9147ff";
   let amount: string | undefined;
+  let quantity: number | undefined;
+  let sub: SubDetail | undefined;
 
   if (
     msgId === "sub" || msgId === "resub" || msgId === "subgift" ||
@@ -391,11 +410,40 @@ export function handleUsernotice(
   ) {
     kind = "sub";
     accentColor = "#9147ff";
+    // A mystery-gift bomb is announced once (submysterygift); its N
+    // per-recipient subgift children carry the bomb's community-gift-id. Drop
+    // the children so one bomb doesn't notice N+1 times — mirrors the EventSub
+    // path, which skips per-recipient channel.subscribe events via is_gift.
+    if (
+      (msgId === "subgift" || msgId === "anonsubgift") &&
+      msg.tags["msg-param-community-gift-id"]
+    ) {
+      return;
+    }
+    const tier = subPlanTier(msg.tags["msg-param-sub-plan"]);
+    if (msgId === "sub") {
+      sub = { tier, variant: "new" };
+    } else if (msgId === "resub") {
+      sub = { tier, variant: "resub" };
+    } else if (msgId === "subgift" || msgId === "anonsubgift") {
+      sub = { tier, variant: "gift", count: 1 };
+    } else if (msgId === "submysterygift") {
+      const n = Number(msg.tags["msg-param-mass-gift-count"]);
+      sub = { tier, variant: "gift", count: n > 0 ? n : 1 };
+    } else {
+      // (anon)giftpaidupgrade — a gifted sub staying on. These notices carry
+      // no sub-plan tag, so the tier is honestly unknown: omit it rather than
+      // fabricate Tier 1.
+      sub = { variant: "resub" };
+    }
   } else if (msgId === "raid") {
     kind = "raid";
     accentColor = "#00b173";
-    const viewers = msg.tags["msg-param-viewerCount"];
-    if (viewers) amount = `${viewers} viewers`;
+    const viewers = Number(msg.tags["msg-param-viewerCount"]);
+    if (Number.isFinite(viewers) && viewers > 0) {
+      amount = `${viewers} viewers`;
+      quantity = viewers;
+    }
   } else if (msgId === "announcement") {
     const c = msg.tags["msg-param-color"];
     accentColor = ANNOUNCE_COLORS[c] ?? "#9147ff";
@@ -422,8 +470,10 @@ export function handleUsernotice(
     badges: badges.length ? badges : undefined,
     kind,
     amount,
+    quantity,
     accentColor,
     eventText: systemMsg || author,
+    sub,
     timestamp: Date.now(),
   });
 }

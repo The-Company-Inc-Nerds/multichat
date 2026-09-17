@@ -18,7 +18,7 @@ import type {
   EventSubFrame,
   EventSubFrameKind,
 } from "./types.ts";
-import { cheerColor } from "./twitch.ts";
+import { cheerColor, subPlanTier } from "./twitch.ts";
 import {
   buildCreateSubscriptionRequest,
   parseCreateSubscriptionResponse,
@@ -38,14 +38,7 @@ const num = (
 
 /** "1000"/"2000"/"3000" → "Tier 1/2/3" (EventSub encodes tiers this way). */
 export function subTierLabel(tier: unknown): string {
-  switch (String(tier ?? "1000")) {
-    case "3000":
-      return "Tier 3";
-    case "2000":
-      return "Tier 2";
-    default:
-      return "Tier 1";
-  }
+  return `Tier ${subPlanTier(tier)}`;
 }
 
 // ---- pure notification → ChatMessage mappers ------------------------------
@@ -91,6 +84,7 @@ export function mapCheer(e: Event, channel: string, id: string): ChatMessage {
     ...base(id, channel, author),
     kind: "cheer",
     amount: `${bits} bits`,
+    quantity: bits,
     accentColor: cheerColor(bits),
     eventText: `${author} cheered ${bits} bits`,
   };
@@ -111,6 +105,7 @@ export function mapSubscribe(
     kind: "sub",
     accentColor: SUB_COLOR,
     eventText: `${author} subscribed (${tier})`,
+    sub: { tier: subPlanTier(e.tier), variant: "new" },
   };
 }
 
@@ -119,7 +114,10 @@ export function mapSubGift(e: Event, channel: string, id: string): ChatMessage {
     ? "Anonymous"
     : (str(e.user_name) || "Anonymous");
   const total = num(e.total) || 1;
-  const tier = subTierLabel(e.sub_tier);
+  // The channel.subscription.gift payload calls the field `tier`, like the
+  // other sub events (`sub_tier` only exists in channel.chat.notification,
+  // which this server doesn't subscribe to).
+  const tier = subTierLabel(e.tier);
   const plural = total === 1 ? "sub" : "subs";
   return {
     ...base(id, channel, author),
@@ -127,6 +125,7 @@ export function mapSubGift(e: Event, channel: string, id: string): ChatMessage {
     amount: `${total} ${plural}`,
     accentColor: SUB_COLOR,
     eventText: `${author} gifted ${total} ${tier} ${plural}`,
+    sub: { tier: subPlanTier(e.tier), variant: "gift", count: total },
   };
 }
 
@@ -147,6 +146,7 @@ export function mapSubMessage(
     eventText: months > 0
       ? `${author} resubscribed for ${months} months (${tier})`
       : `${author} resubscribed (${tier})`,
+    sub: { tier: subPlanTier(e.tier), variant: "resub" },
   };
 }
 
@@ -157,6 +157,7 @@ export function mapRaid(e: Event, channel: string, id: string): ChatMessage {
     ...base(id, channel, from),
     kind: "raid",
     amount: `${viewers} viewers`,
+    quantity: viewers,
     accentColor: RAID_COLOR,
     eventText: `${from} is raiding with ${viewers} viewers`,
   };

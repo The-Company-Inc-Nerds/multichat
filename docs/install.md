@@ -18,11 +18,12 @@ direnv allow       # or auto-activate via .envrc if direnv is installed
 
 The dev shell adds a few helper commands on top of `deno`:
 
-| Command     | Equivalent                                                   | Purpose                                    |
-| ----------- | ------------------------------------------------------------ | ------------------------------------------ |
-| `runserver` | `deno task start`                                            | Run the server against `./settings.json`   |
-| `runchecks` | `deno fmt --check && deno lint && deno check … && deno test` | Full pre-commit gate                       |
-| `gcommit`   | `git commit -S -F GIT_COMMIT_MSG`                            | Review `GIT_COMMIT_MSG` and sign-commit it |
+| Command             | Equivalent                                                   | Purpose                                              |
+| ------------------- | ------------------------------------------------------------ | ---------------------------------------------------- |
+| `runserver`         | `deno task start`                                            | Run the server against `./settings.json`             |
+| `runchecks`         | `deno fmt --check && deno lint && deno check … && deno test` | Full pre-commit gate                                 |
+| `demoalerts [PORT]` | throwaway server + looping `fake` showcase                   | Browser demo of the `/alerts` themes (default :8090) |
+| `gcommit`           | `git commit -S -F GIT_COMMIT_MSG`                            | Review `GIT_COMMIT_MSG` and sign-commit it           |
 
 ## Running the Server
 

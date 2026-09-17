@@ -20,6 +20,7 @@ import type {
   MessageKind,
   Platform,
   Segment,
+  SubDetail,
 } from "./types.ts";
 import { cheerColor } from "./twitch.ts";
 import { tierColor } from "./youtube.ts";
@@ -138,8 +139,20 @@ export function demoActions(now = 0): FakeAction[] {
       kind: "cheer",
       content: "take my bits!",
       amount: "1000 bits",
+      quantity: 1000,
       accentColor: cheerColor(1000),
       eventText: "BitLord cheered 1000 bits",
+    }),
+    // Three sub variants so the tiered alert looks (e.g. the company-memo
+    // hiring paperwork) can all be previewed. First one is what `fake sub` picks.
+    message({
+      platform: "twitch",
+      channel: TW,
+      author: "FreshHire",
+      kind: "sub",
+      accentColor: "#9147ff",
+      eventText: "FreshHire subscribed (Tier 1)",
+      sub: { tier: 1, variant: "new" },
     }),
     message({
       platform: "twitch",
@@ -148,7 +161,18 @@ export function demoActions(now = 0): FakeAction[] {
       kind: "sub",
       content: "happy to keep supporting!",
       accentColor: "#9147ff",
-      eventText: "LoyalFan subscribed for 6 months",
+      eventText: "LoyalFan resubscribed for 6 months (Tier 3)",
+      sub: { tier: 3, variant: "resub" },
+    }),
+    message({
+      platform: "twitch",
+      channel: TW,
+      author: "GenerousGwen",
+      kind: "sub",
+      amount: "5 subs",
+      accentColor: "#9147ff",
+      eventText: "GenerousGwen gifted 5 Tier 1 subs",
+      sub: { tier: 1, variant: "gift", count: 5 },
     }),
     message({
       platform: "twitch",
@@ -157,6 +181,7 @@ export function demoActions(now = 0): FakeAction[] {
       kind: "raid",
       accentColor: "#00b173",
       amount: "250 viewers",
+      quantity: 250,
       eventText: "BigStreamer is raiding with a party of 250",
     }),
     {
@@ -301,6 +326,35 @@ function parseSegments(x: unknown): Segment[] | undefined {
   return out.length ? out : undefined;
 }
 
+/** Validate an optional structured sub detail. Returns the clean detail, an
+ *  operator-facing error string, or undefined when absent. */
+function parseSub(x: unknown): SubDetail | string | undefined {
+  if (x == null) return undefined;
+  if (!isObj(x)) return "message.sub must be an object";
+  const { variant } = x;
+  if (variant !== "new" && variant !== "resub" && variant !== "gift") {
+    return "message.sub.variant must be new, resub, or gift";
+  }
+  // tier is optional: absent = honestly unknown (renderers hedge).
+  let tier: 1 | 2 | 3 | undefined;
+  if (x.tier != null) {
+    if (x.tier !== 1 && x.tier !== 2 && x.tier !== 3) {
+      return "message.sub.tier must be 1, 2, or 3";
+    }
+    tier = x.tier;
+  }
+  const sub: SubDetail = tier != null ? { tier, variant } : { variant };
+  if (x.count != null) {
+    if (
+      typeof x.count !== "number" || !Number.isInteger(x.count) || x.count < 1
+    ) {
+      return "message.sub.count must be a positive integer";
+    }
+    sub.count = x.count;
+  }
+  return sub;
+}
+
 function parseMessage(d: unknown): FakeParseResult {
   if (!isObj(d)) return err("message data must be an object");
   const platform = d.platform;
@@ -330,8 +384,20 @@ function parseMessage(d: unknown): FakeParseResult {
     msg.kind = d.kind as MessageKind;
   }
   if (typeof d.amount === "string") msg.amount = d.amount;
+  if (d.quantity != null) {
+    if (
+      typeof d.quantity !== "number" || !Number.isFinite(d.quantity) ||
+      d.quantity <= 0
+    ) {
+      return err("message.quantity must be a positive number");
+    }
+    msg.quantity = d.quantity;
+  }
   if (typeof d.accentColor === "string") msg.accentColor = d.accentColor;
   if (typeof d.eventText === "string") msg.eventText = d.eventText;
+  const sub = parseSub(d.sub);
+  if (typeof sub === "string") return err(sub);
+  if (sub) msg.sub = sub;
   const badges = parseBadges(d.badges);
   if (badges) msg.badges = badges;
   const segments = parseSegments(d.segments);

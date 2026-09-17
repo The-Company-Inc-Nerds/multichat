@@ -51,8 +51,9 @@ reconnect.
 You don't need a live stream to see how each message kind renders. With the
 server running, `multichat fake` plays a fixed, curated showcase — a plain chat
 message, a colored name, role badges, an image emote, a `/me` action, a follow,
-a cheer, a sub, a raid, a Super Chat, a Super Sticker, a membership, a system
-row, and a live deletion — into the SSE feed, one event at a time:
+a cheer, three subs (new / resub / gift), a raid, a Super Chat, a Super
+Sticker, a membership, a system row, and a live deletion — into the SSE feed,
+one event at a time:
 
 ```bash
 deno task start                 # (terminal 1) against any settings.json
@@ -65,11 +66,21 @@ multichat fake --port 8080      # non-default port / host, like set-youtube-key
 multichat fake --gap 0          # fire the events back-to-back (default gap: 450ms)
 ```
 
+In the dev shell, `demoalerts [PORT]` wraps all of this into one command: it
+boots a throwaway server on its own port (default 8090, loopback only, no
+platform connections — your real server keeps running untouched), opens
+`/alerts` in the browser, and replays the showcase on a loop until Ctrl-C. It
+reuses the `alerts` block from `./settings.json` when one is configured, so it
+previews *your* theme (else the flagship company-memo look).
+
 `multichat fake <kind>` injects a single representative event instead of the
 full sequence — handy for previewing one alert (e.g. `fake follow` to see an
 [alerts theme](../configuration.md#alert-themes) without waiting through the
 showcase). `kind` is one of: `chat`, `action`, `cheer`, `sub`, `raid`, `follow`,
-`superchat`, `supersticker`, `membership`, `system`.
+`superchat`, `supersticker`, `membership`, `system`. The showcase plays three
+`sub` variants — a new Tier 1 sub, a Tier 3 resub, and a 5-sub gift — so the
+company-memo hiring paperwork (title / renewal / referrals) can all be
+previewed; `fake sub` injects just the first (the new Tier 1 sub).
 
 Open the viewer (`/`), the OBS chat overlay (`/overlay`), or the alerts overlay
 (`/alerts`) first so you can watch the events arrive — `/alerts` plays the

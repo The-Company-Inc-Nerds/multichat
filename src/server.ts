@@ -457,6 +457,68 @@ const HTML = `<!DOCTYPE html>
       border: 2px solid #b5322b; border-radius: 4px; padding: 2px 9px;
       font-size: 0.3em; letter-spacing: 0.2em; transform: rotate(-6deg); opacity: 0.85;
     }
+
+    /* ---- company-memo: the stamped document cards ----
+       Subs, raids and cheers render as Company paperwork instead of the
+       generic memo: a sub is hiring paperwork (Tier 1/2/3 = INTERN/ASSOCIATE/
+       EXECUTIVE, a gift a referral bonus), a raid is an FBI search warrant,
+       a cheer a petty-cash receipt. Each card's verdict stamp slams on
+       shortly after it lands, and the paper recoils under the hit. */
+    .hire-title { border-bottom: 2px solid currentColor; padding: 0 3px; white-space: nowrap; }
+    .doc-stamp {
+      margin-top: 14px; display: inline-block; color: #b5322b;
+      border: 3px solid #b5322b; border-radius: 6px; padding: 3px 12px;
+      font-size: 0.5em; font-weight: 700; letter-spacing: 0.26em;
+      opacity: 0; transform: rotate(-8deg) scale(2.6);
+    }
+    .alert-card.memo.show .doc-stamp {
+      animation: stamp-slam 0.35s cubic-bezier(.3,0,.6,1) 0.55s forwards;
+    }
+    /* Hold the stamped state while the card fades out (the slam animation only
+       applies under .show, so without this the stamp would blink off). */
+    .alert-card.memo.exit .doc-stamp { opacity: 0.9; transform: rotate(-8deg) scale(1); }
+    @keyframes stamp-slam {
+      from { opacity: 0; transform: rotate(-8deg) scale(2.6); }
+      60%  { opacity: 1; transform: rotate(-8deg) scale(0.94); }
+      to   { opacity: 0.9; transform: rotate(-8deg) scale(1); }
+    }
+    /* Timed so the recoil lands with the slam's impact (~0.2s into it). */
+    .alert-card.memo.hire.show,
+    .alert-card.memo.receipt.show { animation: stamp-thud 0.3s ease-out 0.72s; }
+    @keyframes stamp-thud {
+      from { transform: scale(1) rotate(-1.6deg); }
+      35%  { transform: scale(0.985) rotate(-1deg) translateY(3px); }
+      to   { transform: scale(1) rotate(-1.6deg); }
+    }
+
+    /* The FBI warrant: federal blue-grey paper, and the room strobes with
+       police lights (an alternating red/blue glow) while it's up. The
+       animation list must repeat stamp-thud — a bare .fbi.show rule would
+       override the shared one above, not add to it. */
+    .alert-card.memo.fbi {
+      background: #eef1f6;
+      border-top-color: #1a2a5e;
+      /* box-shadow joins the transition so the police glow hands off smoothly
+         and fades with the card, instead of snapping off the moment .show
+         (and with it the strobe animation) is removed for the exit. */
+      transition: transform 0.4s cubic-bezier(.2,1.3,.35,1), opacity 0.4s ease,
+                  box-shadow 0.4s ease;
+    }
+    .alert-card.memo.fbi .memo-head { color: #1a2a5e; }
+    .alert-card.memo.fbi .memo-sub { color: #66708c; border-bottom-color: #c6cddd; }
+    .alert-card.memo.fbi.show {
+      animation: stamp-thud 0.3s ease-out 0.72s,
+                 police-lights 0.9s step-end infinite;
+    }
+    @keyframes police-lights {
+      0%, 100% { box-shadow: 0 14px 34px rgba(0,0,0,0.55), 0 0 42px rgba(235,4,0,0.55); }
+      50%      { box-shadow: 0 14px 34px rgba(0,0,0,0.55), 0 0 42px rgba(29,141,240,0.6); }
+    }
+
+    /* The petty-cash receipt: ledger-mint paper. */
+    .alert-card.memo.receipt { background: #eff3e8; border-top-color: #9fb383; }
+    .alert-card.memo.receipt .memo-head { color: #55663d; }
+    .alert-card.memo.receipt .memo-sub { color: #85936e; border-bottom-color: #cdd7bc; }
   </style>
   <!--ALERTS-->
 </head>
@@ -747,9 +809,11 @@ const HTML = `<!DOCTYPE html>
 
     // Word used in the memo line, per event kind. Kept to a single word so the
     // "three words" redaction gag ([name] / just / [action]) stays intact.
+    // No sub/raid/cheer entries: those kinds get their own document cards
+    // (buildCompanyHire / buildCompanyRaid / buildCompanyReceipt).
     var COMPANY_ACTION = {
-      follow: 'followed', sub: 'subscribed', membership: 'joined',
-      cheer: 'cheered', raid: 'raided', superchat: 'donated', supersticker: 'donated'
+      follow: 'followed', membership: 'joined',
+      superchat: 'donated', supersticker: 'donated'
     };
 
     // "The Company, Inc" — an office memo that redacts one of its three words
@@ -765,7 +829,7 @@ const HTML = `<!DOCTYPE html>
       var line = make('div', 'memo-line');
       var wName = make('span', 'memo-w', m.author);
       var wJust = make('span', 'memo-w', 'just');
-      var wAct  = make('span', 'memo-w', COMPANY_ACTION[m.kind] || 'subscribed');
+      var wAct  = make('span', 'memo-w', COMPANY_ACTION[m.kind] || 'joined');
       line.appendChild(wName);
       line.appendChild(document.createTextNode(' '));
       line.appendChild(wJust);
@@ -786,6 +850,92 @@ const HTML = `<!DOCTYPE html>
       return { el: card, holdMs: hold, exitMs: ALERT_ANIM_MS, beforeExit: beforeExit };
     }
 
+    // Shared skeleton for the Company document cards (hire / warrant /
+    // receipt): letterhead + sub-heading + a one-line body + a verdict stamp
+    // that slams on after the card lands (CSS .doc-stamp). Callers fill in
+    // the returned line element.
+    function companyDoc(theme, cls, head, subHead, stampText) {
+      var opts = theme.options || {};
+      var card = make('div', 'alert-card memo ' + cls);
+      if (opts.paper) card.style.background = opts.paper;
+      if (opts.ink) card.style.color = opts.ink;
+      card.appendChild(make('div', 'memo-head', head));
+      card.appendChild(make('div', 'memo-sub', subHead));
+      var line = make('div', 'memo-line');
+      card.appendChild(line);
+      card.appendChild(make('div', 'doc-stamp', stampText));
+      var hold = typeof opts.hold === 'number' ? opts.hold : 4500;
+      return { line: line, alert: { el: card, holdMs: hold, exitMs: ALERT_ANIM_MS } };
+    }
+
+    // Sub tiers as Company job titles (the structured detail comes from
+    // ChatMessage.sub; a missing/unknown tier hedges to a titleless line
+    // rather than inventing INTERN — e.g. IRC gift-continuation notices
+    // carry no sub-plan tag).
+    var HIRE_TITLES = { 1: 'INTERN', 2: 'ASSOCIATE', 3: 'EXECUTIVE' };
+
+    // "The Company, Inc" hiring paperwork — the sub flavor of the memo theme.
+    // A new sub is hired at their tier's title, a resub renews their contract,
+    // a gifter files referrals.
+    function buildCompanyHire(m, theme) {
+      var sub = m.sub || { variant: 'new' };
+      var title = HIRE_TITLES[sub.tier];  // undefined = tier unknown
+      var heading, stampText;
+      if (sub.variant === 'gift') {
+        heading = 'REFERRAL PROGRAM';
+        stampText = 'APPROVED';
+      } else if (sub.variant === 'resub') {
+        heading = 'CONTRACT RENEWAL';
+        stampText = 'RENEWED';
+      } else {
+        heading = 'NOTICE OF EMPLOYMENT';
+        stampText = 'HIRED';
+      }
+      var doc = companyDoc(theme, 'hire', 'THE COMPANY, INC', heading, stampText);
+      doc.line.appendChild(make('span', 'memo-w', m.author));
+      if (sub.variant === 'gift') {
+        var n = sub.count || 1;
+        doc.line.appendChild(document.createTextNode(
+          ' referred ' + (n === 1 ? 'a new hire' : n + ' new hires') + '!'));
+      } else if (title) {
+        doc.line.appendChild(document.createTextNode(
+          sub.variant === 'resub' ? ' stays on as ' : ' joins us as '));
+        doc.line.appendChild(make('span', 'hire-title', title));
+        doc.line.appendChild(document.createTextNode('!'));
+      } else {
+        doc.line.appendChild(document.createTextNode(
+          sub.variant === 'resub' ? ' renewed their contract!' : ' joins the team!'));
+      }
+      return doc.alert;
+    }
+
+    // Raids are an FBI raid: a search warrant with the raider's viewers as the
+    // agents storming the premises, under alternating police lights (CSS .fbi).
+    function buildCompanyRaid(m, theme) {
+      var doc = companyDoc(
+        theme, 'fbi', 'FEDERAL BUREAU OF INVESTIGATION', 'SEARCH WARRANT', 'EXECUTED');
+      var n = m.quantity;
+      doc.line.appendChild(make('span', 'memo-w', m.author));
+      doc.line.appendChild(document.createTextNode(
+        ' stormed the premises with ' +
+        (n ? (n === 1 ? '1 agent' : n + ' agents') : 'a strike team') + '!'));
+      return doc.alert;
+    }
+
+    // Bits are Company accounting: a petty-cash receipt for the deposited
+    // bits, stamped the only way the Company knows how.
+    function buildCompanyReceipt(m, theme) {
+      var doc = companyDoc(
+        theme, 'receipt', 'THE COMPANY, INC', 'PETTY CASH RECEIPT', 'OFF THE BOOKS');
+      var n = m.quantity;
+      doc.line.appendChild(make('span', 'memo-w', m.author));
+      doc.line.appendChild(document.createTextNode(
+        n
+          ? ' deposited ' + (n === 1 ? '1 bit' : n + ' bits') + '!'
+          : ' made a deposit!'));
+      return doc.alert;
+    }
+
     function buildDefaultAlert(m) {
       var card = addEventRow(m);        // reuse the event-row builder
       card.classList.add('alert-card');
@@ -796,7 +946,12 @@ const HTML = `<!DOCTYPE html>
     // else the default card. New styles slot in here.
     function buildAlert(m) {
       var theme = themeForKind(m.kind);
-      if (theme && theme.style === 'company-memo') return buildCompanyMemo(m, theme);
+      if (theme && theme.style === 'company-memo') {
+        if (m.kind === 'sub') return buildCompanyHire(m, theme);
+        if (m.kind === 'raid') return buildCompanyRaid(m, theme);
+        if (m.kind === 'cheer') return buildCompanyReceipt(m, theme);
+        return buildCompanyMemo(m, theme);
+      }
       return buildDefaultAlert(m);
     }
 

@@ -74,7 +74,7 @@ services.multichat = {
   alerts = {
     activeTheme = "The Company, Inc";
     themes = [
-      { name = "The Company, Inc"; style = "company-memo"; events = [ "follow" ]; }
+      { name = "The Company, Inc"; style = "company-memo"; events = [ "follow" "sub" "raid" "cheer" ]; }
     ];
   };
 
@@ -303,16 +303,18 @@ outbound calls fail.
 `alerts.themes` is a registry of named looks for the `/alerts` OBS overlay, and
 `alerts.activeTheme` selects the one in effect (empty = the default card). Each
 theme sets a built-in `style` (`default`, or `company-memo` — an office memo
-that redacts one of its three words before it disappears), an optional `events`
-list limiting which shoutout kinds it restyles (empty = all; others fall back to
-the default card), and an `options` attrset of style knobs. Example — the
-flagship memo on Twitch follows only:
+that redacts one of its three words before it disappears; subs render as
+hiring paperwork with tier job titles, raids as an FBI search warrant under
+police lights, and cheers as a petty-cash receipt, each with a stamped
+verdict), an optional `events` list limiting which shoutout kinds it restyles
+(empty = all; others fall back to the default card), and an `options` attrset
+of style knobs. Example — the flagship memo on its Twitch shoutouts:
 
 ```nix
 services.multichat.alerts = {
   activeTheme = "The Company, Inc";
   themes = [
-    { name = "The Company, Inc"; style = "company-memo"; events = [ "follow" ]; }
+    { name = "The Company, Inc"; style = "company-memo"; events = [ "follow" "sub" "raid" "cheer" ]; }
   ];
 };
 ```

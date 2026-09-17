@@ -29,6 +29,20 @@ export type MessageKind =
   | "membership"
   | "system";
 
+/** Structured detail for `kind: "sub"` events — how the sub arrived and at
+ *  what tier — so alert themes can render tier-specific looks (e.g. the
+ *  company-memo hiring paperwork) without parsing `eventText`. */
+export interface SubDetail {
+  /** Twitch tier as a small number: 1 | 2 | 3 (Prime counts as 1). Absent =
+   *  honestly unknown — e.g. an IRC gift-continuation notice, which carries no
+   *  sub-plan tag — so renderers should hedge rather than assume Tier 1. */
+  tier?: number;
+  /** A first-time sub, a resub, or a gift (attributed to the gifter). */
+  variant: "new" | "resub" | "gift";
+  /** How many subs were gifted (variant "gift"; defaults to 1). */
+  count?: number;
+}
+
 export interface ChatMessage {
   id: string;
   platform: Platform;
@@ -43,10 +57,15 @@ export interface ChatMessage {
   kind?: MessageKind;
   /** Monetary/quantity label, e.g. "500 bits" or "$5.00". */
   amount?: string;
+  /** Numeric twin of `amount` for kinds whose themed alert cards need the
+   *  number (cheer bits, raid viewers) without parsing the label. */
+  quantity?: number;
   /** Highlight color for event rows / Super Chat tiers / cheer tiers. */
   accentColor?: string;
   /** Notice line for event rows, e.g. "X subscribed for 3 months". */
   eventText?: string;
+  /** Structured sub detail (tier + new/resub/gift) for `kind: "sub"` rows. */
+  sub?: SubDetail;
   timestamp: number;
 }
 

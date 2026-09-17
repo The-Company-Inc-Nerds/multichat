@@ -31,6 +31,7 @@ Deno.test("mapCheer: amount + tier accent, anonymous fallback", () => {
   const m = mapCheer({ user_name: "Bob", bits: 1000 }, "chan", "id");
   assertEquals(m.kind, "cheer");
   assertEquals(m.amount, "1000 bits");
+  assertEquals(m.quantity, 1000);
   assertEquals(m.accentColor, "#00b173"); // 1000-bit tier (matches IRC cheerColor)
   assertEquals(m.eventText, "Bob cheered 1000 bits");
 
@@ -48,6 +49,7 @@ Deno.test("mapSubscribe: new sub with tier; gifted sub emits nothing", () => {
   assert(m !== null);
   assertEquals(m!.kind, "sub");
   assertEquals(m!.eventText, "Cara subscribed (Tier 2)");
+  assertEquals(m!.sub, { tier: 2, variant: "new" });
 
   // A gifted channel.subscribe is covered by channel.subscription.gift → skip.
   assertEquals(
@@ -57,30 +59,34 @@ Deno.test("mapSubscribe: new sub with tier; gifted sub emits nothing", () => {
 });
 
 Deno.test("mapSubGift: pluralized total + tier, anonymous gifter", () => {
+  // channel.subscription.gift calls its tier field `tier`, not `sub_tier`.
   const m = mapSubGift(
-    { user_name: "Eve", total: 5, sub_tier: "1000" },
+    { user_name: "Eve", total: 5, tier: "1000" },
     "c",
     "i",
   );
   assertEquals(m.kind, "sub");
   assertEquals(m.amount, "5 subs");
   assertEquals(m.eventText, "Eve gifted 5 Tier 1 subs");
+  assertEquals(m.sub, { tier: 1, variant: "gift", count: 5 });
 
   const one = mapSubGift(
-    { user_name: "Eve", total: 1, sub_tier: "1000" },
+    { user_name: "Eve", total: 1, tier: "2000" },
     "c",
     "i",
   );
   assertEquals(one.amount, "1 sub");
-  assertEquals(one.eventText, "Eve gifted 1 Tier 1 sub");
+  assertEquals(one.eventText, "Eve gifted 1 Tier 2 sub");
+  assertEquals(one.sub, { tier: 2, variant: "gift", count: 1 });
 
   const anon = mapSubGift(
-    { is_anonymous: true, total: 2, sub_tier: "3000" },
+    { is_anonymous: true, total: 2, tier: "3000" },
     "c",
     "i",
   );
   assertEquals(anon.author, "Anonymous");
   assertEquals(anon.eventText, "Anonymous gifted 2 Tier 3 subs");
+  assertEquals(anon.sub, { tier: 3, variant: "gift", count: 2 });
 });
 
 Deno.test("mapSubMessage: resub carries months + the user's message", () => {
@@ -97,6 +103,7 @@ Deno.test("mapSubMessage: resub carries months + the user's message", () => {
   assertEquals(m.kind, "sub");
   assertEquals(m.eventText, "Finn resubscribed for 12 months (Tier 1)");
   assertEquals(m.content, "love it");
+  assertEquals(m.sub, { tier: 1, variant: "resub" });
 });
 
 Deno.test("mapRaid: from-broadcaster + viewer count", () => {
@@ -107,6 +114,7 @@ Deno.test("mapRaid: from-broadcaster + viewer count", () => {
   );
   assertEquals(m.kind, "raid");
   assertEquals(m.amount, "250 viewers");
+  assertEquals(m.quantity, 250);
   assertEquals(m.eventText, "BigStreamer is raiding with 250 viewers");
 });
 

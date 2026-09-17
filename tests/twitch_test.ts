@@ -5,6 +5,7 @@ import {
   parseEmoteTag,
   parseIRC,
   parseTags,
+  subPlanTier,
   type TwitchChatMessage,
   unescapeTag,
 } from "../src/twitch.ts";
@@ -162,6 +163,7 @@ Deno.test("handleCommand: bits make a cheer with amount and accent", () => {
   const m = e.captured.messages[0];
   assertEquals(m.kind, "cheer");
   assertEquals(m.amount, "1000 bits");
+  assertEquals(m.quantity, 1000);
   assertEquals(m.accentColor, "#00b173"); // 1000-bit tier
   assert(m.eventText?.includes("1000 bits") ?? false);
 });
@@ -176,6 +178,88 @@ Deno.test("handleCommand: USERNOTICE resub becomes a sub event", () => {
   assertEquals(m.kind, "sub");
   assertEquals(m.eventText, "Foo subscribed for 3 months!");
   assertEquals(m.content, "love the stream");
+  assertEquals(m.sub, { tier: 1, variant: "resub" }); // no sub-plan tag → Tier 1
+});
+
+Deno.test("handleCommand: USERNOTICE subs carry structured tier/variant detail", () => {
+  const e = fakeEmitter();
+  handleCommand(
+    parseIRC(
+      "@msg-id=sub;display-name=Foo;msg-param-sub-plan=2000;system-msg=Foo\\ssubscribed! USERNOTICE #chan",
+    )!,
+    e,
+  );
+  handleCommand(
+    parseIRC(
+      "@msg-id=resub;display-name=Bar;msg-param-sub-plan=Prime;system-msg=x USERNOTICE #chan :hi",
+    )!,
+    e,
+  );
+  handleCommand(
+    parseIRC(
+      "@msg-id=submysterygift;display-name=Gwen;msg-param-sub-plan=1000;msg-param-mass-gift-count=5;system-msg=x USERNOTICE #chan",
+    )!,
+    e,
+  );
+  handleCommand(
+    parseIRC(
+      "@msg-id=subgift;display-name=Solo;msg-param-sub-plan=3000;system-msg=x USERNOTICE #chan",
+    )!,
+    e,
+  );
+  const [fresh, prime, bomb, single] = e.captured.messages;
+  assertEquals(fresh.sub, { tier: 2, variant: "new" });
+  assertEquals(prime.sub, { tier: 1, variant: "resub" }); // Prime counts as Tier 1
+  assertEquals(bomb.sub, { tier: 1, variant: "gift", count: 5 });
+  assertEquals(single.sub, { tier: 3, variant: "gift", count: 1 });
+});
+
+Deno.test("handleCommand: USERNOTICE drops a gift bomb's per-recipient children", () => {
+  const e = fakeEmitter();
+  // The child carries the bomb's community-gift-id → suppressed (the
+  // submysterygift notice already announced the whole bomb).
+  handleCommand(
+    parseIRC(
+      "@msg-id=subgift;display-name=Gwen;msg-param-sub-plan=1000;msg-param-community-gift-id=12345;system-msg=x USERNOTICE #chan",
+    )!,
+    e,
+  );
+  assertEquals(e.captured.messages.length, 0);
+
+  // A direct gift (no community-gift-id) still notices.
+  handleCommand(
+    parseIRC(
+      "@msg-id=subgift;display-name=Gwen;msg-param-sub-plan=1000;system-msg=x USERNOTICE #chan",
+    )!,
+    e,
+  );
+  assertEquals(e.captured.messages.length, 1);
+  assertEquals(e.captured.messages[0].sub, {
+    tier: 1,
+    variant: "gift",
+    count: 1,
+  });
+});
+
+Deno.test("handleCommand: USERNOTICE giftpaidupgrade omits the unknowable tier", () => {
+  const e = fakeEmitter();
+  // These notices carry no msg-param-sub-plan, so no tier is claimed.
+  handleCommand(
+    parseIRC(
+      "@msg-id=giftpaidupgrade;display-name=Kim;system-msg=Kim\\sis\\scontinuing\\sthe\\sGift\\sSub! USERNOTICE #chan",
+    )!,
+    e,
+  );
+  assertEquals(e.captured.messages[0].kind, "sub");
+  assertEquals(e.captured.messages[0].sub, { variant: "resub" });
+});
+
+Deno.test("subPlanTier: 1000/2000/3000 → 1/2/3; Prime and absent → 1", () => {
+  assertEquals(subPlanTier("1000"), 1);
+  assertEquals(subPlanTier("2000"), 2);
+  assertEquals(subPlanTier("3000"), 3);
+  assertEquals(subPlanTier("Prime"), 1);
+  assertEquals(subPlanTier(undefined), 1);
 });
 
 Deno.test("handleCommand: USERNOTICE raid carries viewer count", () => {
@@ -187,6 +271,7 @@ Deno.test("handleCommand: USERNOTICE raid carries viewer count", () => {
   const m = e.captured.messages[0];
   assertEquals(m.kind, "raid");
   assertEquals(m.amount, "50 viewers");
+  assertEquals(m.quantity, 50);
 });
 
 Deno.test("handleCommand: covered channel keeps a cheer as plain chat text", () => {

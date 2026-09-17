@@ -34,7 +34,7 @@ passed as the first CLI argument. Copy `settings.json.example` to
       {
         "name": "The Company, Inc",
         "style": "company-memo",
-        "events": ["follow"]
+        "events": ["follow", "sub", "raid", "cheer"]
       }
     ]
   }
@@ -284,7 +284,7 @@ It's a registry of named themes plus a selector; with no `alerts` block (or no
 "alerts": {
   "activeTheme": "The Company, Inc",
   "themes": [
-    { "name": "The Company, Inc", "style": "company-memo", "events": ["follow"] }
+    { "name": "The Company, Inc", "style": "company-memo", "events": ["follow", "sub", "raid", "cheer"] }
   ]
 }
 ```
@@ -308,8 +308,33 @@ memo — a `THE COMPANY, INC` letterhead over `"[Name] just followed!"` — and,
 just before it disappears, draws a black **redaction** bar across one of the
 three words at random (name / "just" / action). `options`: `paper` / `ink`
 (colors), `hold` (ms on screen, default 4500), `redact` (`false` to disable the
-bar). With `events: ["follow"]` it fires on Twitch follows only (YouTube has no
-follow event); other shoutouts keep the default card.
+bar). With `events: ["follow", "sub", "raid", "cheer"]` it fires on those
+Twitch shoutouts only; kinds not listed keep the default card.
+
+Three kinds get their own **stamped Company documents** instead of the memo —
+each with a red verdict stamp that slams onto the paper shortly after the card
+lands:
+
+- A **sub** is **hiring paperwork**: the tier maps to a job title — Tier 1 is
+  hired as `INTERN`, Tier 2 as `ASSOCIATE`, Tier 3 as `EXECUTIVE` (a
+  `NOTICE OF EMPLOYMENT`, stamped `HIRED`), a resub renews their contract
+  (`CONTRACT RENEWAL` / `RENEWED`), and a gifter files referrals — `"[Name]
+  referred 5 new hires!"` (`REFERRAL PROGRAM` / `APPROVED`). Tier and
+  gift-count come from EventSub when the channel is configured there, or from
+  IRC `USERNOTICE` tags otherwise (Prime counts as Tier 1; a notice that
+  doesn't state a plan — e.g. a viewer continuing a gifted sub — renders a
+  titleless line rather than guessing, and a gift bomb's per-recipient notices
+  are folded into the one referral card).
+- A **raid** is an **FBI raid**: a `FEDERAL BUREAU OF INVESTIGATION` search
+  warrant — `"[Name] stormed the premises with 250 agents!"` (the raiding
+  party as agents), stamped `EXECUTED`, while an alternating red/blue
+  police-light glow strobes around the card.
+- A **cheer** is a **petty-cash receipt**: `"[Name] deposited 1000 bits!"`,
+  stamped the only way the Company knows how — `OFF THE BOOKS`.
+
+`paper` / `ink` / `hold` apply to these cards too (`redact` does not — the
+stamp is their gag; note `paper`/`ink` recolor all the documents, including
+the warrant and receipt).
 
 **Per-source override.** Append `?theme=NAME` to the overlay URL
 (`/alerts?theme=The%20Company,%20Inc`) to override `activeTheme` for that OBS

@@ -104,7 +104,14 @@ Copy `settings.json.example` to `settings.json` and edit:
 - `youtube.channels` — list of `{handle, channelId, videoId}` objects; supply at
   least one field per entry
 - `alerts` — optional `{activeTheme, themes}` registry that skins the `/alerts`
-  overlay (built-in styles `default` / `company-memo`); unset = default look
+  overlay (built-in styles `default` / `company-memo`); unset = default look.
+  Under `company-memo`, three kinds get stamped Company documents: subs =
+  hiring paperwork (tier → job title, Tier 1/2/3 = INTERN/ASSOCIATE/EXECUTIVE;
+  resub = contract renewal; gift = referrals) driven by the structured
+  `ChatMessage.sub` detail (`{tier?, variant, count?}`), raids = an FBI search
+  warrant (viewers as agents, police-light glow), cheers = a petty-cash
+  receipt ("OFF THE BOOKS") — the latter two driven by `ChatMessage.quantity`
+  (the numeric twin of `amount`)
 - `giveaway` — optional Twitch-only `!enter` prize draw
   `{enabled, channel,
   prefix, command, requireFollow, replies, firstN, followerStep, milestoneDraws,
@@ -165,7 +172,7 @@ main.ts          entry point — loads settings, wires the emitter to server + c
                  winners JSONL; the turn lifecycle: per-draw turns, winner-only
                  mail/donate/destroy/pass disposition, seeded draw plan; driving the /giveaway page)
                  + the integration dispatcher (fires giveaway.turn.* events to configured subscribers)
-src/types.ts     shared TypeScript interfaces (Settings, ChatMessage, ServerEvent, Emitter,
+src/types.ts     shared TypeScript interfaces (Settings, ChatMessage w/ SubDetail, ServerEvent, Emitter,
                  TwitchEventSubConfig, EventSub frames, GiveawayConfig/State/Entrant/
                  CampaignState/CampaignSummary/Winner/Draw/Turn/Disposition/Plan, TermsAcceptance,
                  TurnAggregates, IntegrationsConfig/Subscriber, PackReport)
@@ -270,7 +277,7 @@ the convention in CalamooseLabs/OpenReturn and QuorumCall):
 ```
 flake.nix    wires the three files below into flake outputs (x86_64-linux)
 build.nix    the package derivation — { pkgs }: → mkDerivation (standalone-buildable)
-shell.nix    dev shell + runserver / runchecks / gcommit helper scripts
+shell.nix    dev shell + runserver / runchecks / demoalerts / gcommit helper scripts
 module.nix   the NixOS service module (portable — importable without the flake)
 ```
 
@@ -318,7 +325,9 @@ direnv allow       # auto-activates via .envrc if direnv is installed
 ```
 
 Helper scripts (defined in `shell.nix`): `runserver` (= `deno task start`),
-`runchecks` (fmt-check + lint + check + test), and `gcommit`. Commits are
+`runchecks` (fmt-check + lint + check + test), `demoalerts [PORT]` (throwaway
+`/alerts` demo server on its own port, looping the fake showcase — previews the
+configured theme without touching a running server), and `gcommit`. Commits are
 GPG-signed: write the message to `GIT_COMMIT_MSG`, then run `gcommit` (prints
 it, prompts, runs `git commit -S -F GIT_COMMIT_MSG`). Both `GIT_COMMIT_MSG` and
 `gcommit` are gitignored.

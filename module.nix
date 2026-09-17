@@ -376,13 +376,16 @@ in
             default = "default";
             description = ''
               Built-in visual engine: "default" (the standard card) or
-              "company-memo" (an office memo that redacts a word before it leaves).
+              "company-memo" (an office memo that redacts a word before it
+              leaves; subs render as hiring paperwork with tier job titles,
+              raids as an FBI search warrant, cheers as a petty-cash receipt —
+              each with a stamped verdict — instead of the memo).
             '';
           };
           events = lib.mkOption {
             type = lib.types.listOf lib.types.str;
             default = [ ];
-            example = [ "follow" ];
+            example = [ "follow" "sub" "raid" "cheer" ];
             description = ''
               Shoutout kinds this theme restyles (cheer, sub, raid, follow,
               superchat, supersticker, membership). Empty = all of them; kinds not
@@ -403,7 +406,7 @@ in
       });
       default = [ ];
       example = lib.literalExpression ''
-        [ { name = "The Company, Inc"; style = "company-memo"; events = [ "follow" ]; } ]
+        [ { name = "The Company, Inc"; style = "company-memo"; events = [ "follow" "sub" "raid" "cheer" ]; } ]
       '';
       description = "Named alert themes for the /alerts overlay; select one with alerts.activeTheme.";
     };
