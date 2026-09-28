@@ -116,8 +116,8 @@ With a token set, a non-loopback caller presents it as `Authorization: Bearer �
 — open that URL once on the phone and the buttons work thereafter. Loopback is
 never asked for it, so `multichat giveaway draw` on the host is unaffected.
 
-`controlAccess` covers `POST /api/giveaway` only. `/api/youtube-key` and
-`/api/fake` stay loopback-only regardless.
+`controlAccess` covers `POST /api/giveaway` only. `/api/youtube-key`,
+`/api/fake` and `/api/rewards` stay loopback-only regardless.
 
 ## Supplying the YouTube key at runtime
 
@@ -179,6 +179,14 @@ waits for the key. The control endpoint is loopback-only (see
 | `integrations.callbackToken`       | string                                                  | `""`                   | Callback bearer inline (Nix store — prefer `callbackTokenFile`)                                |
 | `integrations.callbackTokenFile`   | path                                                    | `null`                 | File with the raw callback bearer; staged via `LoadCredential`                                 |
 | `integrations.subscribers`         | `[{name,adapter,baseUrl,events,enabled,token,tokenFile,packSize}]` | `[]`        | External tools to push giveaway events to (see below)                                          |
+| `channelPoints.enable`             | bool                                                    | `false`                | Channel-point chaos: managed Twitch rewards → cobblemon-overlay effects (see below)            |
+| `channelPoints.channel`            | string                                                  | `""`                   | Twitch login the rewards live on (must be in `twitch.eventsub.channels`)                       |
+| `channelPoints.overlayUrl`         | string                                                  | `"http://127.0.0.1:8082"` | The cobblemon-overlay's base URL; its host joins `--allow-net`                              |
+| `channelPoints.overlayTokenFile`   | path                                                    | `null`                 | File with the overlay's effects bearer; staged via `LoadCredential`                            |
+| `channelPoints.ttlSec`             | int (30–3600)                                           | `600`                  | How long a redemption may wait to run before it is refunded                                    |
+| `channelPoints.autoPause`          | bool                                                    | `true`                 | Pause the rewards on Twitch while the game isn't taking effects                                |
+| `channelPoints.announce`           | bool                                                    | `true`                 | A highlighted system chat row per redemption                                                   |
+| `channelPoints.rewards`            | `null` or `[{key,title,cost,prompt,effect,params,cooldownSec,maxPerStream,maxPerUserPerStream,color,enabled}]` | `null` | The catalogue; `null` = the built-in 14 rewards               |
 
 See [Giveaway mode](configuration.md#giveaway-mode) for the full behavior
 (including the campaign mode the 500/100/10 example configures). Three gotchas
@@ -239,6 +247,17 @@ channel once and never re-login on an upgrade. The refresh token in Nix
 (`refreshTokenFile` / `refreshToken`) is only the first-run seed; after that the
 persisted, rotated token wins and the seed is ignored.
 
+**Re-login for a new scope.** The flip side: when a release needs a scope the
+current token lacks (`user:write:chat` for giveaway replies,
+`channel:manage:redemptions` for channel points), a fresh `multichat login` is
+ignored until the persisted token goes. In order: run `multichat login` as the
+broadcaster; put the new refresh token into the `refreshTokenFile` secret (the
+password-manager item — Proton Pass, agenix, sops — that feeds it); then
+`sudo rm /var/lib/private/multichat/twitch-refresh-<broadcasterId>` (the unit
+re-installs the seed only when that file is missing, so it must already be the
+new one) and `systemctl restart multichat`. Full walk-through:
+[Adding a scope later](configuration.md#4-adding-a-scope-later-re-login).
+
 ## Integrations (chat-cards)
 
 `integrations.subscribers` pushes giveaway-lifecycle events to external tools,
@@ -297,6 +316,55 @@ on a host that isn't on it would have every delivery denied. The default
 `build.nix`'s `extraNetHosts`, so configuring a subscriber is enough. **Override
 `package` and you take that over** — build it with `extraNetHosts` yourself, or
 outbound calls fail.
+
+## Channel points (cobblemon-overlay)
+
+`channelPoints` turns Twitch channel-point redemptions into game effects: the
+module's service creates and owns the rewards, queues each redemption on the
+cobblemon-overlay running on the same host, and fulfils or refunds it on Twitch
+from the outcome. Behaviour, the catalogue and the CLI are in
+[Channel points](configuration.md#channel-points).
+
+```nix
+services.multichat = {
+  enable = true;
+  port = 8081;
+  twitch.channels = [ "thecompanyinc" ];
+  twitch.eventsub = {
+    clientId = "your-twitch-app-client-id";
+    clientSecretFile = "/run/secrets/twitch-client-secret";
+    channels = [{
+      login = "thecompanyinc";
+      broadcasterId = "12345678";
+      refreshTokenFile = "/run/secrets/twitch-refresh-thecompanyinc";
+    }];
+  };
+  channelPoints = {
+    enable = true;
+    channel = "thecompanyinc";
+    overlayUrl = "http://127.0.0.1:8082";   # the overlay on the same host
+    # overlayTokenFile = "/run/secrets/cobblemon-overlay-effects-token";
+    # rewards = null;                       # the built-in catalogue
+  };
+};
+```
+
+- **The overlay first.** Deploy the cobblemon-overlay with its effect routes
+  before enabling this — an overlay without them answers `404`, which counts as
+  a refusal, so every redemption would be refunded. Then multichat, then the
+  mod.
+- **Token.** `overlayTokenFile` is staged via `LoadCredential` and exported as
+  `MULTICHAT_EFFECTS_TOKEN`; the settings file carries `overlayToken = ""`. Set
+  it to the same secret as the overlay's `effects.tokenFile`. Without one the
+  overlay's loopback check is the only gate — fine for a same-host overlay.
+- **Scope.** The channel's token must carry `channel:manage:redemptions`. A
+  token minted before this release doesn't — follow the re-login above; the
+  service logs a loud warning naming the exact state file until it's done.
+- **Control.**
+  `multichat rewards status|sync|pause|resume|pending|refund|simulate` talks to
+  the loopback-only `POST /api/rewards`; `controlAccess` never widens it.
+- **`--allow-net`.** A remote `overlayUrl` host is added to the wrapper's
+  allow-list by the default `package`, like an integration subscriber.
 
 ## Alert themes
 
@@ -360,6 +428,17 @@ env var — `"chat-cards"` and `"chat cards"` both become
 token. Inline `integrations.callbackToken` / subscriber `token` warn like the
 other in-store secrets, and configuring subscribers with `giveaway.enable = false`
 warns too: the bus only carries giveaway events, so nothing would ever be sent.
+
+Channel points add three assertions — `channelPoints.enable` without a
+`channelPoints.channel`, a reward title outside 1–45 characters or a prompt over
+200 (Twitch rejects them), and duplicate reward keys or titles (titles compared
+case-insensitively) — on top of the option types themselves (`cooldownSec`
+60–604800, `ttlSec` 30–3600, `color` as `#RRGGBB`). It warns when the
+channel-points channel isn't in `twitch.eventsub.channels` (nothing can reach
+Twitch; only `rewards simulate` works), and always reminds you that the
+channel's token needs `channel:manage:redemptions` — naming the persisted token
+file to delete for the re-login. The subscribers-without-a-giveaway warning now
+also says that channel-point redemptions don't ride the integration bus.
 
 The terms gate warns in two more cases: with `replies` off (the "you must accept
 first" prompt is a chat reply, so entrants would be refused in silence), and with

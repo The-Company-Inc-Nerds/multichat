@@ -6,6 +6,7 @@ let
   cfg = config.services.multichat;
   esCfg = cfg.twitch.eventsub;
   intCfg = cfg.integrations;
+  cpCfg = cfg.channelPoints;
 
   # Subscribers whose outbound bearer token is staged from a file.
   intTokenFiles = builtins.filter (s: s.tokenFile != null) intCfg.subscribers;
@@ -34,6 +35,19 @@ let
 
   subscriberHosts = lib.unique (map (s: urlHost s.baseUrl) intCfg.subscribers);
 
+  # Every host the app fetches from on the config's behalf: the integration
+  # subscribers plus the channel-points overlay (the default 127.0.0.1 is already
+  # in build.nix's base list; a remote overlay needs adding like a subscriber).
+  extraHosts = lib.unique (subscriberHosts
+    ++ lib.optional cpCfg.enable (urlHost cpCfg.overlayUrl));
+
+  # The persisted rotated refresh token of the channel-points channel — the file
+  # a re-login for a new scope has to delete (it wins over any seed).
+  cpEsChannel = lib.findFirst (ch: ch.login == cpCfg.channel) null esCfg.channels;
+  cpTokenState = "/var/lib/private/multichat/twitch-refresh-"
+    + (if cpEsChannel != null && cpEsChannel.broadcasterId != ""
+       then cpEsChannel.broadcasterId else "<broadcasterId>");
+
   # EventSub channels whose seed refresh token is staged from a file (needs the
   # broadcasterId to name the persisted state file).
   esTokenFiles = builtins.filter
@@ -55,7 +69,9 @@ let
       "integration-callback-token:${toString intCfg.callbackTokenFile}"
     ++ map
       (s: "${intTokenCred s.name}:${toString s.tokenFile}")
-      intTokenFiles;
+      intTokenFiles
+    ++ lib.optional (cpCfg.enable && cpCfg.overlayTokenFile != null)
+      "effects-token:${toString cpCfg.overlayTokenFile}";
 
   # Inline (non-file) secrets passed as env. These land in the Nix store /
   # `systemctl show` — the *File options are preferred for real secrets.
@@ -67,7 +83,7 @@ let
 
   # Settings without secrets — the YouTube key comes from YOUTUBE_API_KEY and the
   # Twitch client secret from TWITCH_CLIENT_SECRET at runtime.
-  settingsFile = pkgs.writeText "multichat-settings.json" (builtins.toJSON {
+  settingsFile = pkgs.writeText "multichat-settings.json" (builtins.toJSON ({
     server = {
       port = cfg.port;
       host = cfg.host;
@@ -130,7 +146,17 @@ let
         })
         intCfg.subscribers;
     };
-  });
+  }
+  # Emitted only when enabled, like terms/disposition: the app reads a present
+  # block as configured on purpose. The overlay token never lands here — it is
+  # exported as MULTICHAT_EFFECTS_TOKEN from its credential (see the script).
+  // lib.optionalAttrs cpCfg.enable {
+    channelPoints = {
+      enabled = true;
+      inherit (cpCfg) channel overlayUrl ttlSec autoPause announce rewards;
+      overlayToken = "";
+    };
+  }));
 in
 {
   options.services.multichat = {
@@ -140,15 +166,16 @@ in
       type = lib.types.package;
       default = import ./build.nix {
         inherit pkgs;
-        extraNetHosts = subscriberHosts;
+        extraNetHosts = extraHosts;
       };
       defaultText = lib.literalExpression
-        "import ./build.nix { inherit pkgs; extraNetHosts = <integration subscriber hosts>; }";
+        "import ./build.nix { inherit pkgs; extraNetHosts = <integration subscriber + channel-points overlay hosts>; }";
       description = ''
         The multichat package to use. The default is built with each
-        {option}`integrations.subscribers` host added to the deno wrapper's
-        --allow-net allow-list, so the outbound integration bus can reach them.
-        Override it and you must widen that list yourself (build.nix takes an
+        {option}`integrations.subscribers` host (and the
+        {option}`channelPoints.overlayUrl` host) added to the deno wrapper's
+        --allow-net allow-list, so the outbound calls can reach them. Override
+        it and you must widen that list yourself (build.nix takes an
         `extraNetHosts` argument) or every outbound call is denied by Deno.
       '';
     };
@@ -198,8 +225,9 @@ in
 
         Read-only surfaces (`/`, `/overlay`, `/alerts`, `/giveaway`, `/events`)
         are unauthenticated regardless — this option gates the buttons, not the
-        pages. The other two control endpoints (`/api/youtube-key`, `/api/fake`)
-        stay loopback-only: they set a secret and forge events.
+        pages. The other control endpoints (`/api/youtube-key`, `/api/fake`,
+        `/api/rewards`) stay loopback-only: they set a secret, forge events,
+        and move viewers' channel points.
       '';
     };
 
@@ -713,6 +741,172 @@ in
         hard-blocked.
       '';
     };
+
+    channelPoints.enable = lib.mkEnableOption ''
+      channel-point chaos: Twitch custom rewards (created and managed by
+      multichat) whose redemptions become game effects queued on the
+      cobblemon-overlay for the mod to run. The outcome fulfils the redemption,
+      or refunds it when the effect was refused, expired or never delivered.
+      Needs the channel in twitch.eventsub.channels with a token carrying
+      channel:manage:redemptions (see docs/configuration.md for the re-login)
+    '';
+
+    channelPoints.channel = lib.mkOption {
+      type = lib.types.str;
+      default = "";
+      example = "thecompanyinc";
+      description = ''
+        The Twitch channel (login, lowercase) the rewards live on. Must also be
+        in twitch.eventsub.channels: every reward call and the redemption
+        events use that channel's broadcaster token. Only this channel
+        subscribes to the redemption events.
+      '';
+    };
+
+    channelPoints.overlayUrl = lib.mkOption {
+      type = lib.types.str;
+      default = "http://127.0.0.1:8082";
+      description = ''
+        Base URL of the cobblemon-overlay's effect API (`/effects…` is
+        appended). Loopback when both services share the broadcast host — the
+        overlay's multichat-facing routes accept loopback peers only. Its host
+        joins the deno wrapper's --allow-net list via the default `package`.
+      '';
+    };
+
+    channelPoints.overlayTokenFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      example = "/run/secrets/cobblemon-overlay-effects-token";
+      description = ''
+        File holding the bearer the overlay's effect routes require (its
+        `effects.tokenFile`). Staged via systemd LoadCredential and exported as
+        MULTICHAT_EFFECTS_TOKEN, so it never enters the Nix store. Null = no
+        token (the overlay's loopback check alone).
+      '';
+    };
+
+    channelPoints.ttlSec = lib.mkOption {
+      type = lib.types.ints.between 30 3600;
+      default = 600;
+      description = ''
+        How long a redemption may wait to run before it is given up on and
+        refunded (counted from when the viewer redeemed). Passed to the overlay
+        as the effect's deadline; multichat allows two more minutes for a result
+        before refunding.
+      '';
+    };
+
+    channelPoints.autoPause = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Pause the managed rewards on Twitch while the overlay reports the game
+        isn't taking effects (checked every 15s), and unpause them when it is —
+        so viewers can't spend points into a game that isn't running. A manual
+        `multichat rewards pause` always wins.
+      '';
+    };
+
+    channelPoints.announce = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Add a highlighted system row to the chat views for each redemption
+        ("Nova redeemed Budget Cuts"). System rows don't pop on /alerts.
+      '';
+    };
+
+    channelPoints.rewards = lib.mkOption {
+      type = lib.types.nullOr (lib.types.listOf (lib.types.submodule {
+        options = {
+          key = lib.mkOption {
+            type = lib.types.strMatching "[a-z0-9][a-z0-9_-]{0,63}";
+            example = "budget_cuts";
+            description = ''
+              Stable identity of the reward (persisted key → Twitch reward id).
+              Rename the title freely; change the key and it becomes a new
+              reward while the old one is disabled (never deleted).
+            '';
+          };
+          title = lib.mkOption {
+            type = lib.types.str;
+            example = "Budget Cuts";
+            description = "What viewers see. At most 45 characters, unique on the channel.";
+          };
+          cost = lib.mkOption {
+            type = lib.types.ints.positive;
+            example = 750;
+            description = "Price in channel points.";
+          };
+          prompt = lib.mkOption {
+            type = lib.types.str;
+            default = "";
+            description = "Reward description shown to viewers (at most 200 characters).";
+          };
+          effect = lib.mkOption {
+            type = lib.types.strMatching "[a-z][a-z0-9_]{0,63}";
+            example = "potion";
+            description = ''
+              Game effect id the mod runs (drop_held_item, force_jump,
+              about_face, hotbar_shuffle, potion, sprint_lock, spawn_mob,
+              pokemon_status, magikarp_mandate, forfeit_turns). An id the mod
+              doesn't know is refused — and refunded — on every redemption.
+            '';
+          };
+          params = lib.mkOption {
+            type = lib.types.attrsOf (lib.types.oneOf [
+              lib.types.str
+              lib.types.int
+              lib.types.bool
+            ]);
+            default = { };
+            example = lib.literalExpression ''{ effect = "slowness"; amplifier = 1; seconds = 45; }'';
+            description = "Effect parameters, passed to the mod unchanged.";
+          };
+          cooldownSec = lib.mkOption {
+            type = lib.types.ints.between 60 604800;
+            example = 180;
+            description = ''
+              Global cooldown. Required, and at least 60: Twitch allows
+              redeeming a reward while the channel is offline only when it has
+              no cooldown.
+            '';
+          };
+          maxPerStream = lib.mkOption {
+            type = lib.types.ints.unsigned;
+            default = 0;
+            description = "Redemptions allowed per stream (0 = unlimited).";
+          };
+          maxPerUserPerStream = lib.mkOption {
+            type = lib.types.ints.unsigned;
+            default = 0;
+            description = "Redemptions allowed per viewer per stream (0 = unlimited).";
+          };
+          color = lib.mkOption {
+            type = lib.types.strMatching "#[0-9A-Fa-f]{6}";
+            default = "#9AA5B1";
+            description = "Reward tile background color.";
+          };
+          enabled = lib.mkOption {
+            type = lib.types.bool;
+            default = true;
+            description = "false keeps the reward on Twitch but disabled.";
+          };
+        };
+      }));
+      default = null;
+      example = lib.literalExpression ''
+        [ { key = "budget_cuts"; title = "Budget Cuts"; cost = 750; effect = "potion";
+            params = { effect = "slowness"; amplifier = 1; seconds = 45; }; cooldownSec = 180; } ]
+      '';
+      description = ''
+        The reward catalogue. null (the default) uses the built-in 14-reward
+        catalogue (DEFAULT_CATALOG in src/channelpoints.ts); a list replaces it
+        wholesale. Rewards are always created without user input and never
+        skip the request queue (only unfulfilled redemptions can be refunded).
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -757,6 +951,27 @@ in
           let named = map (s: s.name) (builtins.filter (s: s.name != "") intCfg.subscribers);
           in lib.length (lib.unique (map intTokenEnv named)) == lib.length named;
         message = "services.multichat.integrations.subscribers: names must be unique after uppercasing and collapsing punctuation (e.g. \"chat-cards\" and \"chat cards\" collide).";
+      }
+      {
+        assertion = !cpCfg.enable || cpCfg.channel != "";
+        message = "services.multichat.channelPoints.enable requires channelPoints.channel (the Twitch login the rewards live on).";
+      }
+      {
+        # Twitch 400s a title over 45 or a prompt over 200 characters, and
+        # rejects duplicate titles; the app would drop such rewards at startup.
+        assertion = cpCfg.rewards == null || lib.all
+          (r: lib.stringLength r.title >= 1 && lib.stringLength r.title <= 45
+            && lib.stringLength r.prompt <= 200)
+          cpCfg.rewards;
+        message = "services.multichat.channelPoints.rewards: every title must be 1-45 characters and every prompt at most 200 (Twitch's limits).";
+      }
+      {
+        assertion = cpCfg.rewards == null
+          || (let keys = map (r: r.key) cpCfg.rewards;
+                  titles = map (r: lib.toLower r.title) cpCfg.rewards;
+              in lib.length (lib.unique keys) == lib.length keys
+                && lib.length (lib.unique titles) == lib.length titles);
+        message = "services.multichat.channelPoints.rewards: keys and titles (case-insensitively) must be unique.";
       }
     ];
 
@@ -842,7 +1057,21 @@ in
         (intCfg.subscribers != [ ] && !cfg.giveaway.enable)
         ("services.multichat.integrations.subscribers is set but giveaway.enable is false — the bus "
           + "only carries giveaway-lifecycle events, so nothing will ever be delivered and "
-          + "POST /api/turn-report answers 501.");
+          + "POST /api/turn-report answers 501. (Channel-point redemptions don't ride the bus: "
+          + "they reach the overlay through channelPoints.overlayUrl.)")
+      ++ lib.optional
+        (cpCfg.enable && cpCfg.channel != ""
+          && !(lib.any (ch: ch.login == cpCfg.channel) esCfg.channels))
+        ("services.multichat.channelPoints.channel = \"" + cpCfg.channel
+          + "\" is not in twitch.eventsub.channels — without its broadcaster token multichat can't "
+          + "create the rewards, receive redemptions or fulfil/refund them; only "
+          + "`multichat rewards simulate` works. Add it (via `multichat login`).")
+      ++ lib.optional cpCfg.enable
+        ("services.multichat.channelPoints needs the channel:manage:redemptions scope on \""
+          + cpCfg.channel + "\"'s token. A token minted before this release lacks it: re-run "
+          + "`multichat login`, replace the refreshTokenFile secret with the new token, and delete "
+          + cpTokenState + " (the persisted rotated token wins over the seed) before restarting. "
+          + "The service logs a loud warning while it is missing.");
 
     # Make the `multichat` CLI available so an operator can run
     # `multichat set-youtube-key <KEY>` against the running service.
@@ -880,6 +1109,9 @@ in
         ${lib.concatMapStringsSep "\n" (s: ''
           export ${intTokenEnv s.name}="$(cat "$CREDENTIALS_DIRECTORY/${intTokenCred s.name}")"
         '') intTokenFiles}
+        ${lib.optionalString (cpCfg.enable && cpCfg.overlayTokenFile != null) ''
+          export MULTICHAT_EFFECTS_TOKEN="$(cat "$CREDENTIALS_DIRECTORY/effects-token")"
+        ''}
         ${lib.concatMapStringsSep "\n" (ch: ''
           # Seed the refresh token once; never overwrite the rotated token the app persists.
           if [ ! -e "$STATE_DIRECTORY/twitch-refresh-${ch.broadcasterId}" ]; then
@@ -946,7 +1178,8 @@ in
       }
       // lib.optionalAttrs (loadCreds != [ ]) {
         # Every file-based secret (YouTube key, Twitch client secret, per-channel
-        # refresh-token seeds), staged into a private tmpfs at $CREDENTIALS_DIRECTORY.
+        # refresh-token seeds, control/integration tokens, the overlay effects
+        # token), staged into a private tmpfs at $CREDENTIALS_DIRECTORY.
         LoadCredential = loadCreds;
       }
       // lib.optionalAttrs (envList != [ ]) {

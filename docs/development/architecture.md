@@ -5,18 +5,19 @@ broadcaster, which pushes events to connected browsers over Server-Sent Events.
 
 ## Module layout
 
-| File                | Responsibility                                                                                                                                  |
-| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| `main.ts`           | Entry point — loads settings, creates the server, starts the platform clients, owns the runtime-key + EventSub managers and the CLI subcommands |
-| `src/types.ts`      | Shared interfaces: `Settings`, `ChatMessage`, `ServerEvent`, `Emitter`, `ChannelStatus`, `TwitchEventSubConfig`, EventSub frames                |
-| `src/twitch.ts`     | Twitch IRC over WebSocket (`wss://irc-ws.chat.twitch.tv`), with reconnect; suppresses events for EventSub-covered channels                      |
-| `src/eventsub.ts`   | Twitch EventSub over WebSocket (`wss://eventsub.wss.twitch.tv`) — follow/cheer/sub/raid; pure mappers + socket client                           |
-| `src/twitchauth.ts` | Pure Twitch OAuth + EventSub request builders / response parsers + the `SUBSCRIPTIONS` table                                                    |
-| `src/youtube.ts`    | YouTube Data API v3 polling — resolves channel → live video → live chat                                                                         |
-| `src/server.ts`     | `Deno.serve` HTTP server + the embedded viewer HTML/CSS/JS (`/`, `/overlay`, `/alerts`)                                                         |
-| `src/control.ts`    | Pure control-plane helpers (loopback check, key-body parse, startup-key resolution, state paths)                                                |
-| `src/fake.ts`       | Fake-event demo sequence + wire (de)serialization/validation behind `POST /api/fake`                                                            |
-| `src/alerts.ts`     | Pure `/alerts` theme-registry validation (`normalizeAlertsConfig`), injected into the page as `window.MULTICHAT_ALERTS`                         |
+| File                   | Responsibility                                                                                                                                                                                     |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `main.ts`              | Entry point — loads settings, creates the server, starts the platform clients, owns the runtime-key + EventSub managers and the CLI subcommands                                                    |
+| `src/types.ts`         | Shared interfaces: `Settings`, `ChatMessage`, `ServerEvent`, `Emitter`, `ChannelStatus`, `TwitchEventSubConfig`, EventSub frames                                                                   |
+| `src/twitch.ts`        | Twitch IRC over WebSocket (`wss://irc-ws.chat.twitch.tv`), with reconnect; suppresses events for EventSub-covered channels                                                                         |
+| `src/eventsub.ts`      | Twitch EventSub over WebSocket (`wss://eventsub.wss.twitch.tv`) — follow/cheer/sub/raid; pure mappers + socket client                                                                              |
+| `src/twitchauth.ts`    | Pure Twitch OAuth + EventSub request builders / response parsers + the `SUBSCRIPTIONS` table                                                                                                       |
+| `src/youtube.ts`       | YouTube Data API v3 polling — resolves channel → live video → live chat                                                                                                                            |
+| `src/server.ts`        | `Deno.serve` HTTP server + the embedded viewer HTML/CSS/JS (`/`, `/overlay`, `/alerts`)                                                                                                            |
+| `src/control.ts`       | Pure control-plane helpers (loopback check, key-body parse, startup-key resolution, state paths)                                                                                                   |
+| `src/fake.ts`          | Fake-event demo sequence + wire (de)serialization/validation behind `POST /api/fake`                                                                                                               |
+| `src/alerts.ts`        | Pure `/alerts` theme-registry validation (`normalizeAlertsConfig`), injected into the page as `window.MULTICHAT_ALERTS`                                                                            |
+| `src/channelpoints.ts` | Pure channel-points logic: config + `DEFAULT_CATALOG`, the reward sync diff, the redemption-ledger reducers, the cobblemon-overlay effect-API wire; the engine that drives them lives in `main.ts` |
 
 ## Data flow
 

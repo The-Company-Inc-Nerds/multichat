@@ -22,24 +22,27 @@
       nixosModules.default = import ./module.nix;
 
       checks.${system} = {
-        # Drives the integration bus end to end against a stand-in for chat-cards.
-        # Three things can only break here, not in the unit tests: deno's
-        # --allow-net allow-list (an unlisted subscriber host is denied), its
-        # --allow-env allow-list (the token env vars must be readable), and the
-        # LoadCredential path that keeps both tokens out of the Nix store.
+        # Drives the integration bus end to end against a stand-in for chat-cards,
+        # and the channel-points overlay leg against a stand-in for the
+        # cobblemon-overlay's effect API. Three things can only break here, not in
+        # the unit tests: deno's --allow-net allow-list (an unlisted subscriber or
+        # overlay host is denied), its --allow-env allow-list (the token env vars
+        # must be readable), and the LoadCredential path that keeps the tokens
+        # out of the Nix store.
         integrations = pkgs.testers.runNixOSTest {
           name = "multichat-integrations";
           nodes.machine = { pkgs, ... }: {
             imports = [ (import ./module.nix) ];
 
-            # A hostname, not 127.0.0.1: the wrapper's allow-net list is baked at
+            # Hostnames, not 127.0.0.1: the wrapper's allow-net list is baked at
             # build time, so this passes only if module.nix really did derive the
-            # host from baseUrl and hand it to build.nix.
-            networking.hosts."127.0.0.1" = [ "packsink" ];
+            # hosts from baseUrl / overlayUrl and hand them to build.nix.
+            networking.hosts."127.0.0.1" = [ "packsink" "fxsink" ];
 
             environment.etc."multichat-callback-token".text = "callback-secret";
             environment.etc."packsink-token".text = "outbound-secret";
             environment.etc."multichat-control-token".text = "control-secret";
+            environment.etc."multichat-effects-token".text = "effects-secret";
 
             services.multichat = {
               enable = true;
@@ -70,6 +73,66 @@
                   packSize = 5;
                 }];
               };
+              # No EventSub in the VM, so only `rewards simulate` can drive it —
+              # which is exactly the overlay leg under test.
+              channelPoints = {
+                enable = true;
+                channel = "demo";
+                overlayUrl = "http://fxsink:8082";
+                overlayTokenFile = "/etc/multichat-effects-token";
+              };
+            };
+
+            # Stands in for the cobblemon-overlay effect API: records every POST
+            # (enqueue / cancel), reports every effect it is asked about as
+            # applied, and is always accepting.
+            systemd.services.fxsink = {
+              description = "cobblemon-overlay effects stand-in";
+              wantedBy = [ "multi-user.target" ];
+              before = [ "multichat.service" ];
+              serviceConfig.ExecStart = "${pkgs.python3}/bin/python3 ${
+                pkgs.writeText "fxsink.py" ''
+                  import http.server, json
+                  from urllib.parse import urlparse, parse_qs
+
+                  class Fx(http.server.BaseHTTPRequestHandler):
+                      def reply(self, code, obj):
+                          body = json.dumps(obj).encode()
+                          self.send_response(code)
+                          self.send_header("content-type", "application/json")
+                          self.send_header("content-length", str(len(body)))
+                          self.end_headers()
+                          self.wfile.write(body)
+
+                      def do_GET(self):
+                          url = urlparse(self.path)
+                          if url.path == "/effects/health":
+                              return self.reply(200, {"ok": True, "enabled": True,
+                                  "accepting": True, "lastPollAgoMs": 0,
+                                  "ready": True, "open": 0, "pending": 0})
+                          if url.path == "/effects":
+                              ids = parse_qs(url.query).get("ids", [""])[0].split(",")
+                              return self.reply(200, {"ok": True, "effects": [
+                                  {"id": i, "status": "applied", "detail": "stand-in",
+                                   "updatedAt": 0} for i in ids if i]})
+                          self.reply(404, {"ok": False})
+
+                      def do_POST(self):
+                          n = int(self.headers.get("content-length") or 0)
+                          body = json.loads(self.rfile.read(n) or b"null")
+                          with open("/var/log/effects.jsonl", "a") as fh:
+                              fh.write(json.dumps({
+                                  "path": self.path,
+                                  "auth": self.headers.get("authorization"),
+                                  "body": body,
+                              }) + "\n")
+                          if self.path == "/effects":
+                              return self.reply(202, {"ok": True, "status": "pending"})
+                          self.reply(200, {"ok": True, "status": "canceled"})
+
+                  http.server.HTTPServer(("0.0.0.0", 8082), Fx).serve_forever()
+                ''
+              }";
             };
 
             # Stands in for chat-cards: records every POST /api/pack it receives.
@@ -105,9 +168,11 @@
             import json
 
             machine.wait_for_unit("packsink.service")
+            machine.wait_for_unit("fxsink.service")
             machine.wait_for_unit("multichat.service")
             machine.wait_for_open_port(8080)
             machine.wait_for_open_port(8787)
+            machine.wait_for_open_port(8082)
 
             def giveaway(action):
                 return machine.succeed(
@@ -119,6 +184,7 @@
             machine.fail("grep -rq callback-secret /nix/store/*-multichat-settings.json")
             machine.fail("grep -rq outbound-secret /nix/store/*-multichat-settings.json")
             machine.fail("grep -rq control-secret /nix/store/*-multichat-settings.json")
+            machine.fail("grep -rq effects-secret /nix/store/*-multichat-settings.json")
 
             # The control policy, exercised from a non-loopback address (the VM's
             # own eth0). Loopback never needs the token; the LAN always does.
@@ -144,14 +210,19 @@
             ) == "200", "loopback must never be asked for the token"
 
             # Opening the page with the token mints the cookie the buttons ride on.
-            machine.succeed(
-                f"curl -s -D- -o /dev/null 'http://{lan}:8080/giveaway?token=control-secret'"
-                " | grep -qi 'set-cookie: *mc_control='"
-            )
-            machine.succeed(
-                f"curl -s -D- -o /dev/null 'http://{lan}:8080/giveaway?token=wrong'"
-                " | grep -qiv 'set-cookie'"
-            )
+            # Headers are checked here rather than piped into `grep -q`, which
+            # exits on its first match and can fail curl's write (exit 23).
+            def headers(path):
+                return machine.succeed(
+                    f"curl -s -D- -o /dev/null 'http://{lan}:8080{path}'"
+                ).lower()
+
+            assert "set-cookie: mc_control=" in headers(
+                "/giveaway?token=control-secret"
+            ), "the right ?token= must mint the control cookie"
+            assert "set-cookie" not in headers(
+                "/giveaway?token=wrong"
+            ), "a wrong ?token= must not mint a cookie"
 
             # The other control endpoints stay loopback-only regardless.
             assert code(
@@ -204,6 +275,47 @@
                 "curl -sf -X POST http://127.0.0.1:8080/api/turn-report "
                 "-H 'Authorization: Bearer callback-secret' "
                 f"-d '{report}' | grep -q '\"ok\": *true'"
+            )
+
+            # Channel points: the block is emitted (enabled, catalogue left to
+            # the built-in default) with the token blanked — it comes from the
+            # credential instead.
+            cp = json.loads(
+                machine.succeed("cat /nix/store/*-multichat-settings.json")
+            )["channelPoints"]
+            assert cp["enabled"] is True, cp
+            assert cp["overlayToken"] == "" and cp["rewards"] is None, cp
+
+            # /api/rewards refunds points and fires effects in the streamer's
+            # game: loopback-only, whatever controlAccess and the token say.
+            assert code(
+                f"curl -X POST http://{lan}:8080/api/rewards "
+                "-d '{\"action\": \"status\"}' -H 'Authorization: Bearer control-secret'"
+            ) == "403", "/api/rewards must stay loopback-only"
+
+            # A simulated redemption runs the whole overlay leg: the effect is
+            # delivered with the credential-staged bearer, and the stand-in's
+            # "applied" result resolves the ledger entry.
+            sim = json.loads(machine.succeed(
+                "curl -sf -X POST http://127.0.0.1:8080/api/rewards "
+                "-d '{\"action\": \"simulate\", \"key\": \"butterfingers\", \"user\": \"Nova\"}'"
+            ))
+            assert sim["ok"] and sim["entry"]["id"].startswith("sim-"), sim
+            machine.wait_until_succeeds("grep -q '\"/effects\"' /var/log/effects.jsonl")
+            fx = next(
+                rec for rec in map(
+                    json.loads,
+                    machine.succeed("cat /var/log/effects.jsonl").splitlines(),
+                )
+                if rec["path"] == "/effects"
+            )
+            assert fx["auth"] == "Bearer effects-secret", fx
+            assert fx["body"]["id"] == sim["entry"]["id"], fx
+            assert fx["body"]["effect"] == "drop_held_item", fx
+            assert fx["body"]["viewer"] == "Nova", fx
+            machine.wait_until_succeeds(
+                "curl -sf -X POST http://127.0.0.1:8080/api/rewards "
+                "-d '{\"action\": \"status\"}' | grep -q '\"resolved\": *1'"
             )
           '';
         };

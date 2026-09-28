@@ -2,7 +2,9 @@
 // cheer / sub / raid shoutouts (IRC only carries chat text for covered channels;
 // see the `isCovered` predicate in twitch.ts). YouTube shoutouts still come from
 // the API poller. Mapped events flow through the very same `Emitter` as chat, so
-// SSE / rendering / the /alerts overlay are all identical downstream.
+// SSE / rendering / the /alerts overlay are all identical downstream. On the
+// channel-points channel it also carries reward redemptions, which render
+// nothing here and go only to the channel-points engine (see onRedemption).
 //
 // Convention mirrors twitch.ts: the pure notification→ChatMessage mappers and the
 // pure frame classifiers are `export`ed and unit-tested with a fake Emitter; the
@@ -22,7 +24,8 @@ import { cheerColor, subPlanTier } from "./twitch.ts";
 import {
   buildCreateSubscriptionRequest,
   parseCreateSubscriptionResponse,
-  SUBSCRIPTIONS,
+  type SubscriptionFeature,
+  subscriptionsFor,
 } from "./twitchauth.ts";
 
 const WS_URL = "wss://eventsub.wss.twitch.tv/ws";
@@ -177,9 +180,63 @@ export interface FollowEvent {
  *  with the render path. Absent = nothing observes (behavior unchanged). */
 export type FollowHandler = (f: FollowEvent) => void;
 
+/** A channel-point redemption surfaced to an observer (the channel-points
+ *  engine). `redemptionId` is the end-to-end idempotency key — EventSub is
+ *  at-least-once, so the observer must dedupe on it. Nothing is rendered here:
+ *  only the engine knows which rewards it manages, so it emits the chat row. */
+export interface RedemptionEvent {
+  channel: string;
+  /** "add" = a new redemption; "update" = its status changed (fulfilled or
+   *  canceled — by the streamer in the rewards queue, or echoing our own PATCH). */
+  kind: "add" | "update";
+  redemptionId: string;
+  rewardId: string;
+  rewardTitle: string;
+  cost: number;
+  userId: string;
+  login: string;
+  displayName: string;
+  /** EventSub's lowercase status: unfulfilled | fulfilled | canceled | unknown. */
+  status: string;
+  /** Epoch ms of redeemed_at (0 when absent/unparseable). */
+  redeemedAt: number;
+}
+
+/** Optional observer for channel-point redemption notifications. */
+export type RedemptionHandler = (r: RedemptionEvent) => void;
+
+/** Map a redemption `.add`/`.update` payload to a RedemptionEvent, or null when
+ *  it lacks the redemption or reward id (it could be neither deduped nor
+ *  fulfilled, so it is dropped). */
+export function mapRedemption(
+  e: Event,
+  channel: string,
+  kind: "add" | "update",
+): RedemptionEvent | null {
+  const reward = (e.reward ?? {}) as Event;
+  const redemptionId = str(e.id);
+  const rewardId = str(reward.id);
+  if (!redemptionId || !rewardId) return null;
+  const at = Date.parse(str(e.redeemed_at));
+  return {
+    channel,
+    kind,
+    redemptionId,
+    rewardId,
+    rewardTitle: str(reward.title),
+    cost: num(reward.cost),
+    userId: str(e.user_id),
+    login: str(e.user_login),
+    displayName: str(e.user_name) || str(e.user_login) || "Someone",
+    status: str(e.status).toLowerCase(),
+    redeemedAt: Number.isFinite(at) ? at : 0,
+  };
+}
+
 /** Route one notification to the emitter. Returns true if the type was handled
  *  (even when the mapper deliberately emits nothing). Mirrors twitch.ts's
- *  handleCommand "return true if handled" contract. */
+ *  handleCommand "return true if handled" contract. Redemptions render nothing
+ *  here; they only reach `onRedemption`. */
 export function handleNotification(
   type: string,
   event: Event,
@@ -187,6 +244,7 @@ export function handleNotification(
   id: string,
   emitter: Emitter,
   onFollow?: FollowHandler,
+  onRedemption?: RedemptionHandler,
 ): boolean {
   let msg: ChatMessage | null;
   switch (type) {
@@ -221,6 +279,17 @@ export function handleNotification(
     case "channel.raid":
       msg = mapRaid(event, channel, id);
       break;
+    case "channel.channel_points_custom_reward_redemption.add":
+    case "channel.channel_points_custom_reward_redemption.update": {
+      const r = mapRedemption(
+        event,
+        channel,
+        type.endsWith(".add") ? "add" : "update",
+      );
+      if (r) onRedemption?.(r);
+      msg = null;
+      break;
+    }
     default:
       return false;
   }
@@ -282,6 +351,16 @@ export interface EventSubChannelContext {
   getToken(force?: boolean): Promise<string | null>;
   /** Optional follow observer (see FollowHandler) — the giveaway counter. */
   onFollow?: FollowHandler;
+  /** Opt-in subscription groups for this channel (see subscriptionsFor) —
+   *  "channelPoints" adds the redemption subscriptions. Absent = none. */
+  features?: readonly SubscriptionFeature[];
+  /** Optional redemption observer (see RedemptionHandler) — the channel-points
+   *  engine. Only the channel-points channel carries one. */
+  onRedemption?: RedemptionHandler;
+  /** Called once a session is live: after its subscriptions were created, or
+   *  straight away on a reconnect handoff. EventSub never replays what was
+   *  missed while disconnected, so the channel-points engine reconciles here. */
+  onSessionReady?: () => void;
 }
 
 const DEFAULT_KEEPALIVE_MS = 10_000;
@@ -301,13 +380,15 @@ const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
 // Create all subscriptions for a session (must happen within 10s of welcome).
 // Fires them in parallel; a per-sub failure (e.g. a missing-scope 403) is logged
 // but never tears down the socket. If every create 401s, the token is stale, so
-// refresh once and retry.
+// refresh once and retry. Feature-gated specs (the redemption pair) are only
+// created for channels that opted in, so other channels don't 403 on them.
 async function createSubscriptions(
   ctx: EventSubChannelContext,
   sessionId: string,
 ): Promise<void> {
+  const specs = subscriptionsFor(ctx.features ?? []);
   const attempt = async (token: string) =>
-    await Promise.all(SUBSCRIPTIONS.map(async (spec) => {
+    await Promise.all(specs.map(async (spec) => {
       const req = buildCreateSubscriptionRequest(
         spec,
         ctx.broadcasterId,
@@ -439,9 +520,13 @@ function connectOnce(
           if (!sessionId) return fail(new Error("welcome without session id"));
           // On a reconnect handoff the old subscriptions carry over — don't recreate.
           if (resubscribe) {
-            createSubscriptions(ctx, sessionId).catch((e) =>
-              console.error(`[EventSub] ${ctx.channelLabel}: subscribe: ${e}`)
-            );
+            createSubscriptions(ctx, sessionId)
+              .then(() => ctx.onSessionReady?.())
+              .catch((e) =>
+                console.error(`[EventSub] ${ctx.channelLabel}: subscribe: ${e}`)
+              );
+          } else {
+            ctx.onSessionReady?.();
           }
           break;
         }
@@ -455,6 +540,7 @@ function connectOnce(
               n.id,
               ctx.emitter,
               ctx.onFollow,
+              ctx.onRedemption,
             );
           }
           break;

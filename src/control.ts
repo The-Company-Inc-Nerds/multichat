@@ -12,9 +12,16 @@ import type {
   GiveawayTurn,
   GiveawayWinner,
   PackReport,
+  RedemptionEntry,
   TurnAggregates,
 } from "./types.ts";
 import type { ReportRow } from "./turns.ts";
+import type {
+  ChannelPointsStatus,
+  RewardsPauseResult,
+  RewardsResult,
+  RewardSyncReport,
+} from "./channelpoints.ts";
 
 /** Result of an attempt to set the runtime YouTube key (returned to the CLI client). */
 export interface KeyUpdateResult {
@@ -72,12 +79,36 @@ export interface GiveawayHooks {
   planClear(): GiveawayPlan | null;
 }
 
+/** Operations the loopback POST /api/rewards route dispatches to. Implemented by
+ *  the channel-points engine in main.ts; most reach Twitch or the overlay, so
+ *  they are async. */
+export interface ChannelPointsHooks {
+  /** Catalogue ↔ reward ids, pause state, overlay health, ledger counts. */
+  status(): ChannelPointsStatus;
+  /** Create/patch/disable the managed rewards on Twitch to match the catalogue. */
+  sync(): Promise<RewardSyncReport>;
+  /** Manually pause every managed reward (persisted; wins over auto-pause). */
+  pause(): Promise<RewardsPauseResult>;
+  /** Clear the manual pause (auto-pause may still hold them paused). */
+  resume(): Promise<RewardsPauseResult>;
+  /** Open ledger entries: unresolved, or resolved but not yet on Twitch. */
+  pending(): RedemptionEntry[];
+  /** Resolve an open redemption as a refund ("manual") and withdraw its effect. */
+  refund(id: string): Promise<RewardsResult>;
+  /** Inject a synthetic `sim-<uuid>` redemption of catalogue `key` through the
+   *  whole pipeline (never PATCHed on Twitch). */
+  simulate(key: string, user?: string): Promise<RewardsResult>;
+}
+
 /** Hooks createServer calls back into. Kept optional so tests can omit them. */
 export interface ServerHooks {
   /** Invoked with a validated key when a loopback POST /api/youtube-key arrives. */
   setYouTubeKey?: (key: string) => Promise<KeyUpdateResult>;
   /** Present when a giveaway is enabled; drives the loopback POST /api/giveaway. */
   giveaway?: GiveawayHooks;
+  /** Present when channel points are enabled; drives the loopback
+   *  POST /api/rewards. */
+  channelPoints?: ChannelPointsHooks;
 }
 
 /**
@@ -237,6 +268,89 @@ export function giveawayPlanStatePath(
 ): string | null {
   const dir = (stateDir ?? "").replace(/\/+$/, "");
   return dir ? `${dir}/giveaway-plan` : null;
+}
+
+/** Where the channel-points redemption ledger is persisted (a JSON array keyed
+ *  by redemption id) — the only record of points still held, so it must survive
+ *  a restart. Returns null with no state dir (in-memory only). */
+export function channelPointsLedgerPath(
+  stateDir: string | null | undefined,
+): string | null {
+  const dir = (stateDir ?? "").replace(/\/+$/, "");
+  return dir ? `${dir}/channelpoints-ledger.json` : null;
+}
+
+/** Where the catalogue key → Twitch reward id map is persisted, so a restart
+ *  keeps recognising (and managing) the rewards it created. Null with no state
+ *  dir. */
+export function channelPointsRewardsPath(
+  stateDir: string | null | undefined,
+): string | null {
+  const dir = (stateDir ?? "").replace(/\/+$/, "");
+  return dir ? `${dir}/channelpoints-rewards.json` : null;
+}
+
+/** Where the operator's manual pause is persisted. Null with no state dir. */
+export function channelPointsControlPath(
+  stateDir: string | null | undefined,
+): string | null {
+  const dir = (stateDir ?? "").replace(/\/+$/, "");
+  return dir ? `${dir}/channelpoints-control.json` : null;
+}
+
+/** Suffix every atomic-write temp file ends with (see stateTmpPath). */
+export const STATE_TMP_SUFFIX = ".tmp";
+
+/**
+ * The temp file an atomic write of `path` goes through before its rename. The
+ * name is unique per write (`unique` — the caller's pid + counter + random), so
+ * two overlapping writes can never share, truncate or rename away each other's
+ * file. Same directory as `path`, so the rename is atomic.
+ */
+export function stateTmpPath(path: string, unique: string): string {
+  return `${path}.${unique.replace(/[^A-Za-z0-9_-]/g, "")}${STATE_TMP_SUFFIX}`;
+}
+
+/** True when `name` (a bare file name) is a temp file left behind by an
+ *  interrupted atomic write of the file named `base`. */
+export function isStaleStateTmp(name: string, base: string): boolean {
+  return name.startsWith(`${base}.`) && name.endsWith(STATE_TMP_SUFFIX) &&
+    name.length > base.length + 1 + STATE_TMP_SUFFIX.length;
+}
+
+/** Where a state file that failed to parse is moved aside, so it is kept for
+ *  inspection instead of being overwritten by the next (empty) write. */
+export function quarantinePath(path: string, now: number): string {
+  const stamp = new Date(now).toISOString().replace(/[:.]/g, "-");
+  return `${path}.corrupt-${stamp}`;
+}
+
+// ---- Browser-origin hardening ---------------------------------------------
+
+/**
+ * Why a request looks like it came from a web page rather than the CLI, or
+ * null when it doesn't. A loopback peer check alone can't tell the operator's
+ * `multichat` CLI from a page in a browser on the same host — any site can
+ * fire a cross-site "simple" POST at 127.0.0.1. Browsers always stamp such a
+ * request with `Origin` (and `Sec-Fetch-Site: cross-site`/`same-site`); Deno's
+ * fetch, curl and the CLI send neither. So an endpoint that moves viewers'
+ * points or fires effects refuses any `Origin` and any `Sec-Fetch-Site` other
+ * than `none` (typed/bookmarked) or `same-origin` (contract §5.5).
+ */
+export function browserRequestDenied(headers: Headers): string | null {
+  if (headers.has("origin")) {
+    return "requests from a web page (Origin header) are refused";
+  }
+  const site = headers.get("sec-fetch-site");
+  if (site !== null) {
+    const v = site.trim().toLowerCase();
+    if (v !== "none" && v !== "same-origin") {
+      return `cross-site requests (Sec-Fetch-Site: ${
+        v.slice(0, 32)
+      }) are refused`;
+    }
+  }
+  return null;
 }
 
 // ---- Control-plane access policy -----------------------------------------

@@ -1,4 +1,5 @@
 import type {
+  ChannelPointsConfig,
   Emitter,
   GiveawayCampaignState,
   GiveawayConfig,
@@ -12,6 +13,8 @@ import type {
   GiveawayWinner,
   IntegrationsConfig,
   PackReport,
+  RedemptionEntry,
+  RedemptionOutcome,
   Settings,
   TurnAggregates,
   TwitchConfig,
@@ -27,22 +30,100 @@ import {
   type EventSubChannelContext,
   type FollowEvent,
   type FollowHandler,
+  type RedemptionEvent,
+  type RedemptionHandler,
   startTwitchEventSub,
 } from "./src/eventsub.ts";
 import {
   buildAuthCodeRequest,
   buildAuthorizeUrl,
   buildCheckFollowRequest,
+  buildCreateCustomRewardRequest,
+  buildGetCustomRewardsRequest,
+  buildGetRedemptionsRequest,
   buildRefreshRequest,
   buildSendChatMessageRequest,
+  buildUpdateCustomRewardRequest,
+  buildUpdateRedemptionStatusRequest,
   buildUsersRequest,
   CHAT_WRITE_SCOPE,
+  type HelixResult,
+  type HttpRequest,
   LOGIN_SCOPES,
+  parseCustomRewardsResponse,
   parseFollowersResponse,
+  parseHelixResponse,
+  parseRedemptionsResponse,
   parseTokenResponse,
   parseUsersResponse,
+  REDEMPTIONS_MANAGE_SCOPE,
+  type SubscriptionFeature,
 } from "./src/twitchauth.ts";
 import {
+  admitRedemption,
+  applyChannelPointsEnv,
+  buildEffectCancelRequest,
+  buildEffectEnqueueRequest,
+  buildEffectsHealthRequest,
+  buildEffectsLookupRequest,
+  cancelAcknowledged,
+  type ChannelPointsControl,
+  channelPointsScopeWarning,
+  channelPointsSetupProblems,
+  type ChannelPointsStatus,
+  dueCancels,
+  dueSyncBatches,
+  effectOutcome,
+  emptyManagedRewards,
+  healthGood,
+  initialAutoPauseGate,
+  interpretEnqueueResponse,
+  judgeSyncBatch,
+  ledgerCounts,
+  type ManagedRewards,
+  markAttempt,
+  markCancelDone,
+  markCancelFailed,
+  markQueued,
+  markSynced,
+  markSyncFailed,
+  MAX_LOOKUP_IDS,
+  normalizeChannelPointsConfig,
+  normalizeChannelPointsControl,
+  normalizeLedger,
+  normalizeManagedRewards,
+  openEntries,
+  overlayCancelReason,
+  type OverlayRequest,
+  oweCancel,
+  parseEffectsHealth,
+  parseEffectsLookup,
+  planRewardSync,
+  pruneLedger,
+  queuedTimedOut,
+  redemptionChatMessage,
+  type RedemptionInput,
+  requeueEntry,
+  resolveEntry,
+  rewardFields,
+  rewardKeyById,
+  type RewardsAction,
+  type RewardsPauseResult,
+  type RewardsResult,
+  rewardStatusRows,
+  type RewardSyncReport,
+  serializeLedger,
+  serializeRewardsAction,
+  simulatedRedemption,
+  stepAutoPause,
+  type SyncBatch,
+  TIER_COLORS,
+} from "./src/channelpoints.ts";
+import {
+  channelPointsControlPath,
+  type ChannelPointsHooks,
+  channelPointsLedgerPath,
+  channelPointsRewardsPath,
   giveawayCampaignStatePath,
   type GiveawayHooks,
   giveawayPacksStatePath,
@@ -50,11 +131,14 @@ import {
   giveawayPoolStatePath,
   giveawayTurnsStatePath,
   giveawayWinnersLogPath,
+  isStaleStateTmp,
   keyStatePath,
   type KeyUpdateResult,
   normalizeControlAccess,
+  quarantinePath,
   resolveStartupKey,
   resolveStateDir,
+  stateTmpPath,
   twitchBroadcasterStatePath,
   twitchTokenStatePath,
 } from "./src/control.ts";
@@ -177,6 +261,16 @@ async function loadSettings(path: string): Promise<Settings> {
       normalizeIntegrationsConfig(raw.integrations),
       readEnv,
     ),
+    // The overlay token may come from MULTICHAT_EFFECTS_TOKEN (a LoadCredential
+    // file under NixOS) instead of the file. Dropped/adjusted catalogue entries
+    // are logged so a bad line is visible rather than silently missing.
+    channelPoints: applyChannelPointsEnv(
+      normalizeChannelPointsConfig(
+        raw.channelPoints,
+        (m) => console.error(`[ChannelPoints] ${m}`),
+      ),
+      readEnv,
+    ),
   };
 }
 
@@ -223,6 +317,43 @@ async function persistState(path: string, value: string): Promise<void> {
     await Deno.writeTextFile(path, value, { mode: 0o600 });
   } catch (e) {
     console.error(`[Control] Could not persist ${path}: ${e}`);
+  }
+}
+
+let atomicWriteSeq = 0;
+
+/**
+ * Crash-safe variant of persistState for state that must never come back torn
+ * (the channel-points ledger holds the only record of viewers' points in
+ * flight): write a uniquely named temp file beside `path`, fsync it, then
+ * rename it over `path` — a reader, or the next boot after a SIGKILL or power
+ * loss mid-write, sees the old file or the new one, never half of one. Never
+ * throws; a failure is logged and the temp file removed.
+ */
+async function persistStateAtomic(path: string, value: string): Promise<void> {
+  const tmp = stateTmpPath(
+    path,
+    `${Deno.pid}-${++atomicWriteSeq}-${crypto.randomUUID().slice(0, 8)}`,
+  );
+  try {
+    const f = await Deno.open(tmp, {
+      write: true,
+      create: true,
+      truncate: true,
+      mode: 0o600,
+    });
+    try {
+      const bytes = new TextEncoder().encode(value);
+      let off = 0;
+      while (off < bytes.length) off += await f.write(bytes.subarray(off));
+      await f.syncData();
+    } finally {
+      f.close();
+    }
+    await Deno.rename(tmp, path);
+  } catch (e) {
+    console.error(`[Control] Could not persist ${path}: ${e}`);
+    await Deno.remove(tmp).catch(() => {});
   }
 }
 
@@ -313,6 +444,28 @@ export interface ChannelAuth {
   getToken: (force?: boolean) => Promise<string | null>;
 }
 
+/** What the channel-points engine hangs off its channel's EventSub socket: the
+ *  redemption observer, a one-shot "this channel's token is usable" callback
+ *  (with the scopes the token carries, null when unknown), and a per-session
+ *  "subscriptions are live" callback that drives the reconcile pass. */
+interface ChannelPointsWiring {
+  channel: string;
+  onRedemption: RedemptionHandler;
+  onAuthReady: (auth: ChannelAuth, scopes: readonly string[] | null) => void;
+  onSessionReady: () => void;
+}
+
+/** Back-off between attempts to get a channel's first token / broadcaster id
+ *  (the last step repeats). */
+const CHANNEL_START_RETRY_MS = [
+  5_000,
+  15_000,
+  30_000,
+  60_000,
+  120_000,
+  300_000,
+];
+
 function createTwitchEventSubManager(opts: {
   getEmitter: () => Emitter;
   config: TwitchEventSubConfig;
@@ -320,6 +473,9 @@ function createTwitchEventSubManager(opts: {
   /** Optional follow observer, forwarded to every channel's EventSub socket
    *  (the giveaway milestone counter). */
   onFollow?: FollowHandler;
+  /** Optional channel-points engine: only its channel subscribes to the
+   *  redemption events (others would 403 on every reconnect without the scope). */
+  channelPoints?: ChannelPointsWiring;
 }) {
   const { clientId, clientSecret } = opts.config;
 
@@ -337,6 +493,9 @@ function createTwitchEventSubManager(opts: {
     let expiresAt = 0;
     let inflight: Promise<string | null> | null = null;
     let tokenPath: string | null = null;
+    // The scopes the current token carries, per the last refresh response
+    // (null until one reports them) — how a pre-redemptions token is caught.
+    let grantedScopes: string[] | null = null;
 
     // If the broadcaster id is known up front (config or cache), we can key the
     // persisted (rotated) refresh token by it and prefer that over settings.
@@ -364,6 +523,9 @@ function createTwitchEventSubManager(opts: {
           method: req.method,
           headers: req.headers,
           body: req.body,
+          // Bounded: a hung refresh would wedge the single-flight `inflight`
+          // (and every Helix call behind it) for good.
+          signal: AbortSignal.timeout(15_000),
         });
         json = await res.json();
       } catch (e) {
@@ -382,6 +544,7 @@ function createTwitchEventSubManager(opts: {
       refreshToken = parsed.refreshToken;
       if (tokenPath) await persistState(tokenPath, refreshToken);
       accessToken = parsed.accessToken;
+      if (parsed.scopes) grantedScopes = parsed.scopes;
       // Refresh a minute early to avoid using a token that expires mid-request.
       expiresAt = Date.now() + Math.max(0, parsed.expiresIn - 60) * 1000;
       return accessToken;
@@ -411,41 +574,69 @@ function createTwitchEventSubManager(opts: {
       return inflight;
     }
 
-    const token = await getToken();
-    if (!token) {
+    // Only a configuration problem skips a channel outright; nothing at runtime
+    // can supply a refresh token or a login.
+    if (!refreshToken) {
       console.error(
-        `[EventSub] ${label}: no usable token — skipping this channel`,
+        `[EventSub] ${label}: no refresh token — run: multichat twitch-login ` +
+          `(skipping this channel)`,
+      );
+      return;
+    }
+    if (!broadcasterId && !login) {
+      console.error(
+        "[EventSub] a channel needs a login or broadcasterId — skipping",
       );
       return;
     }
 
-    if (!broadcasterId) {
-      if (!login) {
-        console.error(
-          "[EventSub] a channel needs a login or broadcasterId — skipping",
-        );
-        return;
+    const cp = opts.channelPoints && login &&
+        login === opts.channelPoints.channel
+      ? opts.channelPoints
+      : undefined;
+
+    // The token and the broadcaster id are retried with back-off rather than
+    // given up on: a network blip or an id.twitch.tv hiccup at boot used to
+    // strand the channel until a restart — and for the channel-points channel
+    // that means rewards left live on Twitch with nothing syncing, pausing,
+    // fulfilling or refunding them.
+    for (let attempt = 0;; attempt++) {
+      const token = await getToken();
+      if (token && !broadcasterId) {
+        const req = buildUsersRequest(login, clientId, token);
+        try {
+          const res = await fetch(req.url, {
+            method: req.method,
+            headers: req.headers,
+            signal: AbortSignal.timeout(15_000),
+          });
+          broadcasterId = parseUsersResponse(await res.json())?.id ?? "";
+        } catch (e) {
+          console.error(`[EventSub] ${label}: broadcaster lookup failed: ${e}`);
+        }
+        if (broadcasterId) {
+          // Cache the id and (re)point the token file at it, persisting the
+          // current token.
+          if (bidCachePath) await persistState(bidCachePath, broadcasterId);
+          tokenPath = twitchTokenStatePath(opts.stateDir, broadcasterId);
+          if (tokenPath) await persistState(tokenPath, refreshToken);
+        }
       }
-      const req = buildUsersRequest(login, clientId, token);
-      try {
-        const res = await fetch(req.url, {
-          method: req.method,
-          headers: req.headers,
-        });
-        broadcasterId = parseUsersResponse(await res.json())?.id ?? "";
-      } catch (e) {
-        console.error(`[EventSub] ${label}: broadcaster lookup failed: ${e}`);
-      }
-      if (!broadcasterId) {
-        console.error(
-          `[EventSub] ${label}: could not resolve broadcaster id — skipping`,
-        );
-        return;
-      }
-      // Cache the id and (re)point the token file at it, persisting the current token.
-      if (bidCachePath) await persistState(bidCachePath, broadcasterId);
-      tokenPath = twitchTokenStatePath(opts.stateDir, broadcasterId);
-      if (tokenPath) await persistState(tokenPath, refreshToken);
+      if (token && broadcasterId) break;
+      const delay = CHANNEL_START_RETRY_MS[
+        Math.min(attempt, CHANNEL_START_RETRY_MS.length - 1)
+      ];
+      console.error(
+        `[EventSub] ${label}: ${
+          token ? "could not resolve broadcaster id" : "no usable token"
+        } — retrying in ${delay / 1000}s${
+          cp
+            ? " (channel points are stalled until then: no reward sync, " +
+              "auto-pause, fulfil or refund)"
+            : ""
+        }`,
+      );
+      await new Promise((r) => setTimeout(r, delay));
     }
 
     // Now that the broadcaster id + token are usable, publish this channel's auth
@@ -454,6 +645,21 @@ function createTwitchEventSubManager(opts: {
     if (login) channelAuth.set(login, auth);
     channelAuth.set(broadcasterId, auth);
 
+    // The channel-points channel gets the redemption subscriptions + observers.
+    // Its token must carry channel:manage:redemptions; a token minted before
+    // that scope was requested is the classic re-login trap (the persisted
+    // rotated token beats any new seed), so say exactly what to do, loudly.
+    const features: SubscriptionFeature[] = cp ? ["channelPoints"] : [];
+    if (cp) {
+      const warning = channelPointsScopeWarning(
+        login,
+        grantedScopes,
+        tokenPath,
+      );
+      if (warning) console.error(warning);
+      cp.onAuthReady(auth, grantedScopes);
+    }
+
     const ctx: EventSubChannelContext = {
       clientId,
       broadcasterId,
@@ -461,6 +667,9 @@ function createTwitchEventSubManager(opts: {
       emitter: opts.getEmitter(),
       getToken,
       onFollow: opts.onFollow,
+      features,
+      onRedemption: cp?.onRedemption,
+      onSessionReady: cp?.onSessionReady,
     };
     startTwitchEventSub(ctx);
   }
@@ -1219,6 +1428,1191 @@ function warnGiveawaySetup(config: GiveawayConfig, twitch: TwitchConfig): void {
   }
 }
 
+// Channel-points engine cadence. The pump moves redemptions along (overlay
+// delivery, result polling, Twitch fulfil/refund); health drives auto-pause;
+// reconcile recovers redemptions EventSub dropped (it never replays them).
+const CP_PUMP_MS = 2_000;
+const CP_HEALTH_MS = 15_000;
+const CP_RECONCILE_MS = 5 * 60_000;
+// Every outbound call is bounded: the loops are single-flight, so one hung
+// request would otherwise stall the whole pipeline.
+const CP_OVERLAY_TIMEOUT_MS = 5_000;
+const CP_HELIX_TIMEOUT_MS = 10_000;
+// Pages of 50 UNFULFILLED redemptions read per reward per reconcile.
+const CP_RECONCILE_PAGES = 20;
+
+/**
+ * The channel-points engine. Twitch EventSub redemptions of the rewards this app
+ * created land in a persisted ledger (deduped by redemption id), a pump hands
+ * each to the cobblemon-overlay's effect queue (POST /effects, loopback), polls
+ * the results, and turns them into a Twitch fulfil (applied/armed) or refund
+ * (anything else, including never getting delivered before the deadline) — so a
+ * viewer's points are never silently eaten. It also provisions the rewards
+ * (sync), recovers redemptions EventSub missed (reconcile), and pauses the
+ * rewards on Twitch while the game isn't taking effects (auto-pause; a manual
+ * pause wins). Pure logic lives in src/channelpoints.ts; this is the wiring.
+ */
+function createChannelPointsEngine(opts: {
+  config: ChannelPointsConfig;
+  clientId: string;
+  stateDir: string | null;
+  getEmitter: () => Emitter;
+  getChannelAuth: (login: string) => ChannelAuth | undefined;
+  /** The channel has an EventSub connection configured, so its token is
+   *  expected to arrive (otherwise only `rewards simulate` works). */
+  expectAuth: boolean;
+}): {
+  wiring: ChannelPointsWiring;
+  hooks: ChannelPointsHooks;
+  init: () => Promise<void>;
+  start: () => void;
+  /** Write every state file's latest contents to disk (graceful shutdown). */
+  flush: () => Promise<void>;
+} {
+  const { config } = opts;
+  const ledgerPath = channelPointsLedgerPath(opts.stateDir);
+  const rewardsPath = channelPointsRewardsPath(opts.stateDir);
+  const controlPath = channelPointsControlPath(opts.stateDir);
+  const specByKey = new Map(config.rewards.map((r) => [r.key, r]));
+
+  let ledger: RedemptionEntry[] = [];
+  let managed: ManagedRewards = emptyManagedRewards();
+  let control: ChannelPointsControl = { manualPause: false };
+  // Runtime-only observations (not persisted).
+  let scopes: readonly string[] | null = null;
+  let authSeen = false;
+  const startedAt = Date.now();
+  let accepting: boolean | null = null;
+  let ready: boolean | null = null;
+  let healthOk: boolean | null = null;
+  // Auto-pause hysteresis (contract §5.3): paused until the first good health
+  // check, then only after AUTO_PAUSE_BAD_CHECKS bad ones in a row.
+  let autoGate = initialAutoPauseGate();
+  let lastHealthAt: number | null = null;
+  let twitchPaused: boolean | null = null;
+  let overlayUp: boolean | null = null;
+  let lastSyncAt: number | null = null;
+  let lastSyncError: string | null = null;
+  let syncing: Promise<RewardSyncReport> | null = null;
+  let reconciling: Promise<void> | null = null;
+  // Reward sync and pause application both PATCH the managed rewards and both
+  // read or write `managed` / `twitchPaused`, so they run strictly one at a
+  // time on this chain: a pause run can't act on a reward map a sync is about
+  // to replace, nor record a pause state over a sync's "new rewards are born
+  // unpaused" reset.
+  let rewardsChain: Promise<unknown> = Promise.resolve();
+  let pumping = false;
+  let pumpAgain = false;
+
+  // One writer per file: a change that lands while a write is in flight is
+  // coalesced into one follow-up write of the latest state, so two quick
+  // changes can neither interleave on disk nor lose the second one. Each
+  // write is atomic (temp file + fsync + rename): a crash, kill or power loss
+  // mid-write leaves the previous state, never a torn file.
+  function writer(
+    path: string | null,
+    snapshot: () => string,
+  ): { (): void; flush: () => Promise<void> } {
+    let running: Promise<void> | null = null;
+    let again = false;
+    const schedule = () => {
+      if (!path) return;
+      if (running) {
+        again = true;
+        return;
+      }
+      running = (async () => {
+        do {
+          again = false;
+          await persistStateAtomic(path, snapshot());
+        } while (again);
+      })().finally(() => {
+        running = null;
+      });
+    };
+    return Object.assign(schedule, {
+      // Write the latest state now, or right after the write in flight.
+      flush: async () => {
+        schedule();
+        if (running) await running;
+      },
+    });
+  }
+  const persistLedger = writer(ledgerPath, () => serializeLedger(ledger));
+  const persistRewards = writer(rewardsPath, () => JSON.stringify(managed));
+  const persistControl = writer(controlPath, () => JSON.stringify(control));
+
+  /**
+   * Read one state file back: "missing" on a first run; "corrupt" for anything
+   * that isn't the expected JSON shape (a torn or empty file from a crash, a
+   * hand edit gone wrong) — that file is moved aside, kept for inspection
+   * instead of being overwritten by the next write, and reported loudly, so
+   * the caller falls back on purpose rather than silently starting empty.
+   */
+  async function readState(
+    path: string,
+    what: string,
+    shapeOk: (v: unknown) => boolean,
+  ): Promise<
+    { kind: "ok"; value: unknown } | { kind: "missing" } | { kind: "corrupt" }
+  > {
+    let raw: string;
+    try {
+      raw = await Deno.readTextFile(path);
+    } catch (e) {
+      if (e instanceof Deno.errors.NotFound) return { kind: "missing" };
+      console.error(
+        `[ChannelPoints] !!! could not read the ${what} (${path}): ${e}`,
+      );
+      return { kind: "corrupt" };
+    }
+    try {
+      const value: unknown = JSON.parse(raw);
+      if (shapeOk(value)) return { kind: "ok", value };
+    } catch { /* torn or empty */ }
+    const aside = quarantinePath(path, Date.now());
+    const moved = await Deno.rename(path, aside).then(() => true, () => false);
+    console.error(
+      `[ChannelPoints] !!! the ${what} (${path}) is corrupt${
+        moved ? ` — moved aside to ${aside}` : " and could not be moved aside"
+      }.`,
+    );
+    return { kind: "corrupt" };
+  }
+
+  /** Remove temp files an interrupted atomic write left in the state dir. */
+  async function sweepStaleTmp(): Promise<void> {
+    const dir = opts.stateDir;
+    const bases = [ledgerPath, rewardsPath, controlPath]
+      .filter((p): p is string => !!p)
+      .map((p) => p.slice(p.lastIndexOf("/") + 1));
+    if (!dir || bases.length === 0) return;
+    try {
+      for await (const ent of Deno.readDir(dir)) {
+        if (ent.isFile && bases.some((b) => isStaleStateTmp(ent.name, b))) {
+          await Deno.remove(`${dir}/${ent.name}`).catch(() => {});
+        }
+      }
+    } catch { /* best-effort */ }
+  }
+
+  /** Restore the ledger, reward map and manual pause. A corrupt file is moved
+   *  aside and reported with what starting without it means. */
+  async function init(): Promise<void> {
+    await sweepStaleTmp();
+    const isObject = (v: unknown) =>
+      typeof v === "object" && v !== null && !Array.isArray(v);
+    if (ledgerPath) {
+      const r = await readState(ledgerPath, "redemption ledger", Array.isArray);
+      if (r.kind === "ok") {
+        ledger = pruneLedger(normalizeLedger(r.value), Date.now());
+      } else if (r.kind === "corrupt") {
+        console.error(
+          "[ChannelPoints] !!! starting with an EMPTY redemption ledger. The " +
+            "reconcile pass re-admits redemptions still UNFULFILLED on Twitch " +
+            "(those past their deadline are refunded as stale — including any " +
+            "whose effect already ran but wasn't marked FULFILLED yet); " +
+            "in-flight simulations are forgotten.",
+        );
+      }
+    }
+    if (rewardsPath) {
+      const r = await readState(rewardsPath, "reward id map", isObject);
+      if (r.kind === "ok") managed = normalizeManagedRewards(r.value);
+      else if (r.kind === "corrupt") {
+        console.error(
+          "[ChannelPoints] !!! starting without the reward id map: the next " +
+            "reward sync re-adopts the rewards by title; until it runs, " +
+            "redemptions of them are not recognised (reconcile picks them up " +
+            "after the sync).",
+        );
+      }
+    }
+    if (controlPath) {
+      const r = await readState(controlPath, "pause control", isObject);
+      if (r.kind === "ok") control = normalizeChannelPointsControl(r.value);
+      else if (r.kind === "corrupt") {
+        // Fail safe: the operator may have paused the rewards on purpose.
+        control = { manualPause: true };
+        persistControl();
+        console.error(
+          "[ChannelPoints] !!! the manual-pause state was lost, so the rewards " +
+            "are treated as MANUALLY PAUSED — run `multichat rewards resume` " +
+            "to release them.",
+        );
+      }
+    }
+  }
+
+  /** Graceful shutdown: every state file's latest contents on disk. */
+  async function flush(): Promise<void> {
+    await Promise.all([
+      persistLedger.flush(),
+      persistRewards.flush(),
+      persistControl.flush(),
+    ]);
+  }
+
+  // Helix as the broadcaster, with one forced-refresh retry on 401 (the same
+  // pattern as the giveaway's follow check). Never throws: a missing token or a
+  // network failure comes back as a failed HelixResult (status 0).
+  async function helix(
+    build: (auth: ChannelAuth, token: string) => HttpRequest,
+    retried = false,
+  ): Promise<HelixResult> {
+    const auth = opts.getChannelAuth(config.channel);
+    if (!auth) {
+      return parseHelixResponse(0, {
+        message: `no EventSub token for ${config.channel}`,
+      });
+    }
+    const token = await auth.getToken(retried);
+    if (!token) return parseHelixResponse(0, { message: "no usable token" });
+    const req = build(auth, token);
+    let res: Response;
+    try {
+      res = await fetch(req.url, {
+        method: req.method,
+        headers: req.headers,
+        body: req.body,
+        signal: AbortSignal.timeout(CP_HELIX_TIMEOUT_MS),
+      });
+    } catch (e) {
+      return parseHelixResponse(0, { message: String(e) });
+    }
+    if (res.status === 401 && !retried) {
+      await res.body?.cancel();
+      return helix(build, true); // token expired mid-flight — refresh once
+    }
+    return parseHelixResponse(res.status, await res.json().catch(() => null));
+  }
+
+  /** A hint for the Helix failures an operator can act on. */
+  function helixHint(r: HelixResult): string {
+    if (r.ok) return "";
+    if (r.kind === "unauthorized") {
+      return ` — the token may lack ${REDEMPTIONS_MANAGE_SCOPE}; re-run ` +
+        `'multichat login' for ${config.channel} (see docs/configuration.md)`;
+    }
+    if (r.kind === "forbidden") {
+      return " — channel points need Affiliate/Partner, and only the Client ID " +
+        "that created a reward may manage it";
+    }
+    return "";
+  }
+
+  // The overlay's effect API over loopback. Status 0 = no answer at all.
+  async function overlay(
+    req: OverlayRequest,
+  ): Promise<{ status: number; json: unknown }> {
+    try {
+      const res = await fetch(req.url, {
+        method: req.method,
+        headers: req.headers,
+        body: req.body,
+        signal: AbortSignal.timeout(CP_OVERLAY_TIMEOUT_MS),
+      });
+      const json = await res.json().catch(() => null);
+      noteOverlay(true, "");
+      return { status: res.status, json };
+    } catch (e) {
+      noteOverlay(false, String(e));
+      return { status: 0, json: null };
+    }
+  }
+
+  // Log overlay reachability on transitions only, not on every 2s pump.
+  function noteOverlay(up: boolean, err: string): void {
+    if (overlayUp === up) return;
+    overlayUp = up;
+    if (up) {
+      console.log(`[ChannelPoints] overlay reachable at ${config.overlayUrl}`);
+    } else {
+      console.error(
+        `[ChannelPoints] overlay unreachable at ${config.overlayUrl}: ${err}`,
+      );
+    }
+  }
+
+  /**
+   * Send one owed withdrawal (POST /effects/<id>/cancel with the reason, §5.1)
+   * and settle it: 200/404 clears `cancelOwed`, anything else backs off for
+   * the next pump. Durable because the flag is persisted — a refund made while
+   * the overlay is down or restarting is withdrawn once it's back, before the
+   * mod can be handed the effect again. Returns true when acknowledged, null
+   * when nothing was owed.
+   */
+  async function withdraw(id: string): Promise<boolean | null> {
+    const e = ledger.find((x) => x.id === id);
+    if (!e?.cancelOwed) return null;
+    const reason = overlayCancelReason(e);
+    const res = await overlay(buildEffectCancelRequest(config, id, reason));
+    if (cancelAcknowledged(res.status)) {
+      const r = markCancelDone(ledger, id);
+      if (r.changed) {
+        ledger = r.ledger;
+        persistLedger();
+      }
+      return true;
+    }
+    const r = markCancelFailed(ledger, id, Date.now(), res.status);
+    if (r.changed) {
+      ledger = r.ledger;
+      persistLedger();
+    }
+    // No answer is reported by noteOverlay (on transitions); an HTTP error is
+    // logged on the first failure and then every 20th, not every retry.
+    const n = ledger.find((x) => x.id === id)?.cancelAttempts ?? 1;
+    if (res.status !== 0 && (n === 1 || n % 20 === 0)) {
+      console.error(
+        `[ChannelPoints] withdrawing ${id} (${reason}): overlay HTTP ` +
+          `${res.status} — retrying (attempt ${n}) until it confirms.`,
+      );
+    }
+    return false;
+  }
+
+  /** Every owed withdrawal that is due, oldest first; stops at the first
+   *  no-answer (the overlay is down — don't wait out a timeout per entry). */
+  async function withdrawDue(): Promise<void> {
+    for (const e of dueCancels(ledger, Date.now())) {
+      if ((await withdraw(e.id)) === false && overlayUp === false) break;
+    }
+  }
+
+  function announce(e: RedemptionEntry): void {
+    if (!config.announce) return;
+    const color = specByKey.get(e.key)?.color ?? TIER_COLORS[1];
+    opts.getEmitter().message(redemptionChatMessage(e, config.channel, color));
+  }
+
+  /** Admit one redemption (EventSub, reconcile or simulate) and kick the pump. */
+  function admit(
+    input: RedemptionInput,
+    source: string,
+  ): { entry: RedemptionEntry; added: boolean } {
+    const r = admitRedemption(
+      ledger,
+      input,
+      specByKey.get(input.key),
+      Date.now(),
+      config.ttlSec,
+    );
+    if (!r.added) return r;
+    ledger = r.ledger;
+    persistLedger();
+    const e = r.entry;
+    if (e.state === "resolved") {
+      console.log(
+        `[ChannelPoints] ${e.viewer} redeemed ${e.title} (${e.id}, ${source}) — ` +
+          `refunding: ${e.reason}`,
+      );
+    } else {
+      console.log(
+        `[ChannelPoints] ${e.viewer} redeemed ${e.title} (${e.id}, ${source}) → ` +
+          `${e.effect}`,
+      );
+      announce(e);
+    }
+    void pump();
+    return r;
+  }
+
+  /** Resolve an entry. `withdraw` = multichat decided this itself (not the
+   *  overlay's own final result), so if a POST /effects was ever attempted a
+   *  withdrawal is owed and goes out on the next pump round. */
+  function resolve(
+    id: string,
+    outcome: RedemptionOutcome,
+    reason: string,
+    how: { detail?: string; withdraw?: boolean } = {},
+  ): void {
+    const r = resolveEntry(ledger, id, outcome, reason, Date.now(), how);
+    if (!r.changed || !r.entry) return;
+    ledger = r.ledger;
+    persistLedger();
+    const { detail } = how;
+    console.log(
+      `[ChannelPoints] ${r.entry.viewer}'s ${r.entry.title} (${id}) → ` +
+        `${outcome === "fulfilled" ? "FULFILLED" : "REFUNDED"} (${reason}` +
+        `${detail ? `: ${detail}` : ""})${
+          r.entry.cancelOwed ? " — withdrawing it from the overlay" : ""
+        }`,
+    );
+    if (r.entry.cancelOwed) pumpAgain = true;
+  }
+
+  /** The streamer fulfilled/refunded it in the Twitch rewards queue: Twitch
+   *  already has the status, so no PATCH — just withdraw the effect (owed
+   *  whenever it was ever sent to the overlay, and retried until confirmed). */
+  function resolveExternally(id: string, outcome: RedemptionOutcome): void {
+    const r = resolveEntry(ledger, id, outcome, "external", Date.now(), {
+      twitchSynced: true,
+      withdraw: true,
+    });
+    if (!r.changed) return;
+    ledger = r.ledger;
+    persistLedger();
+    console.log(
+      `[ChannelPoints] ${id} was ${
+        outcome === "fulfilled" ? "fulfilled" : "refunded"
+      } in the Twitch rewards queue${
+        r.entry?.cancelOwed ? " — withdrawing its effect" : ""
+      }.`,
+    );
+    if (r.entry?.cancelOwed) void withdraw(id); // the pump retries a failure
+  }
+
+  function onRedemption(r: RedemptionEvent): void {
+    if (r.channel.toLowerCase() !== config.channel) return;
+    const key = rewardKeyById(managed.byKey).get(r.rewardId);
+    // Not a reward this app created (dashboard / another app): it can't be
+    // fulfilled or refunded from here, so leave it to the streamer.
+    if (key === undefined) return;
+    if (r.kind === "add") {
+      if (r.status && r.status !== "unfulfilled") return; // already final
+      admit({
+        id: r.redemptionId,
+        rewardId: r.rewardId,
+        key,
+        title: r.rewardTitle,
+        cost: r.cost,
+        viewer: r.displayName,
+        login: r.login,
+        redeemedAt: r.redeemedAt,
+        simulated: false,
+      }, "EventSub");
+      return;
+    }
+    // `.update` also echoes our own PATCHes; those entries are already
+    // resolved, so resolving them again is a no-op.
+    if (r.status === "fulfilled") {
+      resolveExternally(r.redemptionId, "fulfilled");
+    } else if (r.status === "canceled") {
+      resolveExternally(r.redemptionId, "canceled");
+    }
+  }
+
+  // ---- the pump: received → overlay → result → Twitch ----------------------
+
+  async function pump(): Promise<void> {
+    if (pumping) {
+      pumpAgain = true;
+      return;
+    }
+    pumping = true;
+    try {
+      // A few rounds at most per call: work that keeps re-arming itself (a
+      // requeue the overlay never keeps) waits for the next tick, not a spin.
+      let rounds = 0;
+      do {
+        pumpAgain = false;
+        // Withdrawals first: the moment an overlay that was down comes back,
+        // it restores its queue and the mod claims within seconds.
+        await withdrawDue();
+        await deliver();
+        await poll();
+        await syncTwitch();
+      } while (pumpAgain && ++rounds < 3);
+    } catch (e) {
+      console.error(`[ChannelPoints] pump error: ${e}`);
+    } finally {
+      pumping = false;
+    }
+  }
+
+  /** Hand every `received` entry to the overlay, oldest first. */
+  async function deliver(): Promise<void> {
+    const due = ledger.filter((e) => e.state === "received")
+      .sort((a, b) => a.receivedAt - b.receivedAt);
+    for (const e of due) {
+      // Refunded (or resolved in the rewards queue) during an earlier await
+      // of this loop: don't hand the overlay an effect nobody paid for.
+      if (ledger.find((x) => x.id === e.id)?.state !== "received") continue;
+      const now = Date.now();
+      if (now >= e.expiresAt) {
+        // An earlier POST that timed out may still have landed (and the
+        // overlay keeps an effect at least 30s), so a failed delivery owes a
+        // withdrawal.
+        resolve(
+          e.id,
+          "canceled",
+          e.attempts > 0 ? "overlay_unreachable" : "timeout",
+          { withdraw: true },
+        );
+        continue;
+      }
+      const res = await overlay(buildEffectEnqueueRequest(config, e, now));
+      const out = interpretEnqueueResponse(res.status, res.json);
+      if (ledger.find((x) => x.id === e.id)?.state === "resolved") {
+        // Refunded (or resolved in the rewards queue) while the POST was in
+        // flight. Unless the overlay cleanly refused it, it may now hold an
+        // effect nobody paid for: owe the withdrawal (durably — retried until
+        // the overlay confirms).
+        if (out.kind !== "refused") {
+          const r = oweCancel(ledger, e.id, Date.now());
+          if (r.changed) {
+            ledger = r.ledger;
+            persistLedger();
+            pumpAgain = true;
+          }
+        }
+        continue;
+      }
+      if (out.kind === "queued") {
+        ledger = markQueued(ledger, e.id).ledger;
+        persistLedger();
+      } else if (out.kind === "refused") {
+        // Only an earlier, unanswered POST could have left the overlay a copy.
+        resolve(e.id, "canceled", out.reason, { withdraw: true });
+      } else {
+        ledger = markAttempt(ledger, e.id).ledger;
+        persistLedger();
+        if (res.status === 0) break; // overlay down — don't hammer the rest
+      }
+    }
+  }
+
+  /** Ask the overlay how the queued effects went; map finals to outcomes. */
+  async function poll(): Promise<void> {
+    const queued = ledger.filter((e) => e.state === "queued");
+    for (let i = 0; i < queued.length; i += MAX_LOOKUP_IDS) {
+      const batch = queued.slice(i, i + MAX_LOOKUP_IDS);
+      const res = await overlay(
+        buildEffectsLookupRequest(config, batch.map((e) => e.id)),
+      );
+      const known = res.status >= 200 && res.status < 300
+        ? parseEffectsLookup(res.json)
+        : null;
+      const now = Date.now();
+      for (const e of batch) {
+        // Resolved while the lookup was in flight (a manual refund): done.
+        if (ledger.find((x) => x.id === e.id)?.state !== "queued") continue;
+        const s = known?.get(e.id);
+        const outcome = s ? effectOutcome(s.status) : null;
+        if (s && outcome) {
+          // The overlay's own final result: nothing to withdraw.
+          resolve(e.id, outcome, s.reason || s.status, { detail: s.detail });
+        } else if (queuedTimedOut(e, now)) {
+          resolve(e.id, "canceled", "timeout", { withdraw: true });
+        } else if (known && !s) {
+          // The overlay answered but has never heard of it (it lost its
+          // queue): deliver it again — every hop dedupes on the id.
+          ledger = requeueEntry(ledger, e.id).ledger;
+          persistLedger();
+          pumpAgain = true;
+        }
+      }
+    }
+  }
+
+  /** PATCH resolved redemptions to FULFILLED/CANCELED on Twitch, ≤50 per
+   *  reward per call, backing off on failure. Only the ids Twitch echoes back
+   *  count as settled; a multi-id batch it won't take whole (404/400 — one
+   *  stale id can sink it) is re-sent one id at a time, where a 404 is
+   *  terminal (no longer UNFULFILLED), so one bad id never strands the rest. */
+  async function syncTwitch(): Promise<void> {
+    const batches = dueSyncBatches(ledger, Date.now());
+    if (batches.length === 0 || !opts.getChannelAuth(config.channel)) return;
+    const patch = (b: SyncBatch, ids: string[]) =>
+      helix((auth, token) =>
+        buildUpdateRedemptionStatusRequest(
+          auth.broadcasterId,
+          b.rewardId,
+          ids,
+          b.status,
+          opts.clientId,
+          token,
+        )
+      );
+    const settle = (b: SyncBatch, ids: string[], res: HelixResult) => {
+      const v = judgeSyncBatch(ids, res);
+      if (v.synced.length) ledger = markSynced(ledger, v.synced);
+      if (v.failed.length) {
+        ledger = markSyncFailed(ledger, v.failed, Date.now());
+        if (!res.ok) {
+          console.error(
+            `[ChannelPoints] could not mark ${v.failed.length} redemption(s) ` +
+              `${b.status} (HTTP ${res.status}): ${res.message}${
+                helixHint(res)
+              }`,
+          );
+        }
+      }
+      persistLedger();
+      return v.split;
+    };
+    for (const b of batches) {
+      const split = settle(b, b.ids, await patch(b, b.ids));
+      for (const id of split) settle(b, [id], await patch(b, [id]));
+    }
+  }
+
+  // ---- reward sync ----------------------------------------------------------
+
+  /** Queue `fn` on the rewards chain (see `rewardsChain`). */
+  function onRewardsChain<T>(fn: () => Promise<T>): Promise<T> {
+    const run = rewardsChain.then(fn);
+    rewardsChain = run.catch(() => {});
+    return run;
+  }
+
+  /** Single-flight reward sync, serialized with pause application — and the
+   *  wanted pause state is applied in the same step, straight after the sync,
+   *  so a reward it just created (born unpaused) is never left live while the
+   *  rest are paused, not even for the length of a reconcile pass. */
+  function sync(): Promise<RewardSyncReport> {
+    if (!syncing) {
+      syncing = onRewardsChain(async () => {
+        const report = await doSync();
+        await runApplyPause().catch((e) =>
+          console.error(`[ChannelPoints] pause error: ${e}`)
+        );
+        return report;
+      }).finally(() => {
+        syncing = null;
+      });
+    }
+    return syncing;
+  }
+
+  async function doSync(): Promise<RewardSyncReport> {
+    const report: RewardSyncReport = {
+      ok: false,
+      message: "",
+      created: [],
+      updated: [],
+      disabled: [],
+      unchanged: 0,
+      errors: [],
+    };
+    if (!opts.getChannelAuth(config.channel)) {
+      report.message = `No EventSub token for "${config.channel}" yet — the ` +
+        `rewards live on its broadcaster token (see twitch.eventsub).`;
+      lastSyncError = report.message;
+      return report;
+    }
+    const list = await helix((auth, token) =>
+      buildGetCustomRewardsRequest(auth.broadcasterId, opts.clientId, token)
+    );
+    if (!list.ok) {
+      report.message = `Could not list the channel's rewards (HTTP ` +
+        `${list.status}): ${list.message}${helixHint(list)}`;
+      lastSyncError = report.message;
+      console.error(`[ChannelPoints] sync: ${report.message}`);
+      return report;
+    }
+    const plan = planRewardSync(
+      config.rewards,
+      parseCustomRewardsResponse(list.json),
+      managed.byKey,
+    );
+    const byKey: Record<string, string> = { ...plan.matched };
+    for (const s of plan.create) {
+      const res = await helix((auth, token) =>
+        buildCreateCustomRewardRequest(
+          auth.broadcasterId,
+          rewardFields(s),
+          opts.clientId,
+          token,
+        )
+      );
+      const created = res.ok ? parseCustomRewardsResponse(res.json)[0] : null;
+      if (created) {
+        byKey[s.key] = created.id;
+        report.created.push(s.key);
+      } else if (!res.ok && res.kind === "duplicate") {
+        report.errors.push(
+          `create ${s.key}: a reward titled "${s.title}" already exists but ` +
+            `wasn't created by multichat, so it can never be fulfilled or ` +
+            `refunded from here — delete or rename it in the Twitch dashboard`,
+        );
+      } else {
+        report.errors.push(
+          `create ${s.key}: ${
+            res.ok
+              ? "no reward in the response"
+              : `HTTP ${res.status} ${res.message}`
+          }${helixHint(res)}`,
+        );
+      }
+    }
+    for (const u of plan.update) {
+      const res = await helix((auth, token) =>
+        buildUpdateCustomRewardRequest(
+          auth.broadcasterId,
+          u.rewardId,
+          u.fields,
+          opts.clientId,
+          token,
+        )
+      );
+      if (res.ok) report.updated.push(u.key);
+      else {
+        report.errors.push(
+          `update ${u.key}: HTTP ${res.status} ${res.message}${helixHint(res)}`,
+        );
+      }
+    }
+    // Retired keys: disabled, never deleted — a DELETE fulfils their pending
+    // redemptions without a refund.
+    for (const d of plan.disable) {
+      const res = await helix((auth, token) =>
+        buildUpdateCustomRewardRequest(
+          auth.broadcasterId,
+          d.rewardId,
+          { is_enabled: false },
+          opts.clientId,
+          token,
+        )
+      );
+      if (res.ok) report.disabled.push(d.key);
+      else {
+        report.errors.push(
+          `disable ${d.key}: HTTP ${res.status} ${res.message}${
+            helixHint(res)
+          }`,
+        );
+      }
+    }
+    report.unchanged = Object.keys(plan.matched).length - plan.update.length -
+      plan.disable.length;
+    managed = { byKey, syncedAt: Date.now() };
+    persistRewards();
+    // New rewards are born unpaused; re-apply the pause state to all of them.
+    if (report.created.length > 0) twitchPaused = null;
+    report.ok = report.errors.length === 0;
+    const parts = [
+      report.created.length ? `created ${report.created.join(", ")}` : "",
+      report.updated.length ? `updated ${report.updated.join(", ")}` : "",
+      report.disabled.length ? `disabled ${report.disabled.join(", ")}` : "",
+      `${report.unchanged} unchanged`,
+    ].filter((p) => p);
+    report.message = `${report.ok ? "Synced" : "Synced with errors"}: ` +
+      parts.join(" · ");
+    lastSyncAt = Date.now();
+    lastSyncError = report.ok ? null : report.errors.join("; ");
+    console.log(`[ChannelPoints] ${report.message}`);
+    for (const err of report.errors) console.error(`[ChannelPoints] ${err}`);
+    return report;
+  }
+
+  // ---- reconcile: recover what EventSub dropped ------------------------------
+
+  function reconcile(): Promise<void> {
+    if (!reconciling) {
+      reconciling = doReconcile()
+        .catch((e) => console.error(`[ChannelPoints] reconcile error: ${e}`))
+        .finally(() => {
+          reconciling = null;
+        });
+    }
+    return reconciling;
+  }
+
+  async function doReconcile(): Promise<void> {
+    // The reward map may be about to change.
+    if (syncing) await syncing.catch(() => null);
+    if (!opts.getChannelAuth(config.channel)) return;
+    let found = 0;
+    // Retired keys are included: their stragglers get admitted as "retired"
+    // and refunded.
+    for (const [key, rewardId] of Object.entries(managed.byKey)) {
+      let after = "";
+      for (let page = 0; page < CP_RECONCILE_PAGES; page++) {
+        const res = await helix((auth, token) =>
+          buildGetRedemptionsRequest(
+            auth.broadcasterId,
+            rewardId,
+            opts.clientId,
+            token,
+            after,
+          )
+        );
+        if (!res.ok) {
+          if (res.kind !== "not_found") {
+            console.error(
+              `[ChannelPoints] reconcile ${key}: HTTP ${res.status} ` +
+                `${res.message}${helixHint(res)}`,
+            );
+          }
+          break;
+        }
+        const { redemptions, cursor } = parseRedemptionsResponse(res.json);
+        for (const x of redemptions) {
+          const r = admit({
+            id: x.id,
+            rewardId,
+            key,
+            title: x.rewardTitle,
+            cost: x.rewardCost,
+            viewer: x.userName,
+            login: x.userLogin,
+            redeemedAt: x.redeemedAt,
+            simulated: false,
+          }, "reconcile");
+          if (r.added) found++;
+        }
+        if (!cursor || redemptions.length === 0) break;
+        after = cursor;
+      }
+    }
+    if (found > 0) {
+      console.log(
+        `[ChannelPoints] reconcile picked up ${found} redemption(s) EventSub missed.`,
+      );
+    }
+  }
+
+  // ---- auto-pause ------------------------------------------------------------
+
+  /** One GET /effects/health, fed through the auto-pause hysteresis. Good =
+   *  the mod is polling AND says it's ready (not ESC-paused, not `/chaos
+   *  pause`d, the streamer online and alive) — a mod that polls but can't run
+   *  anything would otherwise hold viewers' points until the deadline. */
+  async function checkHealth(): Promise<void> {
+    const res = await overlay(buildEffectsHealthRequest(config));
+    const h = res.status >= 200 && res.status < 300
+      ? parseEffectsHealth(res.json)
+      : null;
+    lastHealthAt = Date.now();
+    const good = healthGood(h);
+    if (healthOk !== good) {
+      const why = !h
+        ? "overlay down or not answering"
+        : !h.enabled
+        ? "effects are off in the overlay"
+        : !h.accepting
+        ? "the game isn't polling for effects"
+        : "the game isn't ready — paused, loading, /chaos pause, or the " +
+          "streamer is dead";
+      console.log(
+        `[ChannelPoints] overlay ${
+          good ? "is taking effects" : `is NOT taking effects (${why})`
+        }.`,
+      );
+    }
+    healthOk = good;
+    accepting = h?.accepting ?? false;
+    ready = h?.ready ?? false;
+    autoGate = stepAutoPause(autoGate, good);
+  }
+
+  /** Paused when the operator said so, or (auto-pause) once the game has
+   *  been unable to take effects for two checks in a row — Twitch then blocks
+   *  redemptions instead of us refunding them after the fact. */
+  function desiredPaused(): boolean {
+    return control.manualPause || (config.autoPause && autoGate.paused);
+  }
+
+  // On the rewards chain, so a health tick, a CLI pause and a reward sync
+  // can't interleave; each run re-reads the desired state and the reward map,
+  // so a queued run is a cheap no-op.
+  function applyPause(): Promise<void> {
+    return onRewardsChain(runApplyPause).catch((e) =>
+      console.error(`[ChannelPoints] pause error: ${e}`)
+    );
+  }
+
+  async function runApplyPause(): Promise<void> {
+    const want = desiredPaused();
+    if (twitchPaused === want || !opts.getChannelAuth(config.channel)) return;
+    const targets = config.rewards
+      .filter((r) => r.enabled && managed.byKey[r.key])
+      .map((r) => ({ key: r.key, id: managed.byKey[r.key] }));
+    if (targets.length === 0) return;
+    let failed = 0;
+    for (const t of targets) {
+      const res = await helix((auth, token) =>
+        buildUpdateCustomRewardRequest(
+          auth.broadcasterId,
+          t.id,
+          { is_paused: want },
+          opts.clientId,
+          token,
+        )
+      );
+      if (!res.ok) {
+        failed++;
+        console.error(
+          `[ChannelPoints] ${want ? "pause" : "unpause"} ${t.key}: HTTP ` +
+            `${res.status} ${res.message}${helixHint(res)}`,
+        );
+      }
+    }
+    // Only record it when every reward took it; otherwise the next health tick
+    // tries again.
+    if (failed === 0) {
+      twitchPaused = want;
+      const why = control.manualPause
+        ? "manual pause"
+        : want
+        ? "auto: the game isn't taking effects"
+        : "the game is taking effects";
+      console.log(
+        `[ChannelPoints] rewards ${
+          want ? "PAUSED" : "live"
+        } on Twitch (${why}).`,
+      );
+    }
+  }
+
+  async function healthTick(): Promise<void> {
+    await checkHealth();
+    await applyPause();
+  }
+
+  // ---- EventSub wiring --------------------------------------------------------
+
+  /** First time the channel's token is usable: provision the rewards and
+   *  apply the pause state (in that one step — new rewards start live), then
+   *  recover missed redemptions. */
+  function onAuthReady(_auth: ChannelAuth, granted: readonly string[] | null) {
+    scopes = granted;
+    if (authSeen) return;
+    authSeen = true;
+    void (async () => {
+      await sync();
+      await reconcile();
+      await healthTick();
+      void pump();
+    })().catch((e) => console.error(`[ChannelPoints] startup error: ${e}`));
+  }
+
+  // ---- operator hooks (POST /api/rewards) ----------------------------------
+
+  function status(): ChannelPointsStatus {
+    const { rows, retired } = rewardStatusRows(config.rewards, managed.byKey);
+    return {
+      channel: config.channel,
+      overlayUrl: config.overlayUrl,
+      authReady: !!opts.getChannelAuth(config.channel),
+      scopeOk: scopes ? scopes.includes(REDEMPTIONS_MANAGE_SCOPE) : null,
+      accepting,
+      ready,
+      lastHealthAt,
+      autoPause: config.autoPause,
+      manualPause: control.manualPause,
+      twitchPaused,
+      lastSyncAt,
+      lastSyncError,
+      rewards: rows,
+      retired,
+      counts: ledgerCounts(ledger),
+    };
+  }
+
+  const hooks: ChannelPointsHooks = {
+    status,
+    sync: async () => {
+      const r = await sync(); // applies the pause state in the same step
+      if (r.ok) void reconcile();
+      return r;
+    },
+    pause: async (): Promise<RewardsPauseResult> => {
+      control = { manualPause: true };
+      persistControl();
+      await applyPause();
+      const ok = twitchPaused === true;
+      return {
+        ok,
+        message: ok
+          ? "Rewards paused on Twitch (manual — held until `rewards resume`, " +
+            "across restarts)."
+          : "Manual pause recorded, but Twitch wasn't updated yet (no token, " +
+            "rewards not synced, or a PATCH failed) — it is applied as soon as " +
+            "it can be.",
+        status: status(),
+      };
+    },
+    resume: async (): Promise<RewardsPauseResult> => {
+      control = { manualPause: false };
+      persistControl();
+      await checkHealth();
+      await applyPause();
+      const want = desiredPaused();
+      const ok = twitchPaused === want;
+      return {
+        ok,
+        message: want && ok
+          ? "Manual pause cleared, but auto-pause keeps the rewards paused: " +
+            "the overlay says the game isn't taking effects (not polling, or " +
+            "not ready)."
+          : ok
+          ? "Rewards are live on Twitch."
+          : "Manual pause cleared, but Twitch wasn't updated yet (no token, " +
+            "rewards not synced, or a PATCH failed).",
+        status: status(),
+      };
+    },
+    pending: () => openEntries(ledger),
+    refund: async (id): Promise<RewardsResult> => {
+      const before = ledger.find((e) => e.id === id);
+      if (!before) {
+        return { ok: false, message: `No redemption ${id} in the ledger.` };
+      }
+      if (before.state === "resolved") {
+        return {
+          ok: false,
+          message: `${id} is already resolved (${before.outcome}: ` +
+            `${before.reason ?? "?"}).`,
+          entry: before,
+        };
+      }
+      const r = resolveEntry(ledger, id, "canceled", "manual", Date.now(), {
+        withdraw: true,
+      });
+      ledger = r.ledger;
+      persistLedger();
+      // Withdraw it from the overlay now if it was ever sent there; when the
+      // overlay doesn't confirm, the pump keeps retrying until it does.
+      const withdrawn = r.entry?.cancelOwed ? await withdraw(id) : null;
+      void pump(); // the Twitch refund goes out on this pass
+      const overlayNote = withdrawn === false
+        ? " The overlay didn't confirm the effect's withdrawal yet — it is " +
+          "retried until it does."
+        : "";
+      return {
+        ok: true,
+        message:
+          (before.simulated
+            ? `Simulated redemption ${id} canceled (nothing to refund on Twitch).`
+            : `Refunding ${before.viewer}'s ${before.title} on Twitch.`) +
+          overlayNote,
+        entry: ledger.find((e) => e.id === id) ?? r.entry ?? undefined,
+      };
+    },
+    simulate: (key, user): Promise<RewardsResult> => {
+      const spec = specByKey.get(key);
+      if (!spec) {
+        return Promise.resolve({
+          ok: false,
+          message: `Unknown reward key "${key}" — one of: ${
+            [...specByKey.keys()].join(", ")
+          }`,
+        });
+      }
+      const r = admit(
+        simulatedRedemption(
+          spec,
+          managed.byKey[key] ?? "",
+          user ?? "",
+          crypto.randomUUID(),
+          Date.now(),
+        ),
+        "simulate",
+      );
+      return Promise.resolve({
+        ok: true,
+        message: `Simulated ${r.entry.viewer} redeeming ${spec.title} ` +
+          `(${r.entry.id}) → ${spec.effect}. Watch it with \`rewards pending\`.`,
+        entry: r.entry,
+      });
+    },
+  };
+
+  /** The channel's token never arrived (EventSub keeps retrying it): say so
+   *  loudly and repeatedly, because nothing here works without it — rewards
+   *  left live on Twitch take points that are neither fulfilled nor refunded. */
+  function nagIfNoAuth(): void {
+    if (authSeen || !opts.expectAuth) return;
+    console.error(
+      `[ChannelPoints] !!! still no usable Twitch token for #${config.channel} ` +
+        `after ${
+          Math.round((Date.now() - startedAt) / 60_000)
+        } min — rewards ` +
+        `can't be synced, paused, fulfilled or refunded, and redemptions of any ` +
+        `reward left live on Twitch are NOT being processed. See the [EventSub] ` +
+        `errors above (token refresh / broadcaster lookup, retried with back-off).`,
+    );
+  }
+
+  function start(): void {
+    setInterval(() => void pump(), CP_PUMP_MS);
+    setInterval(() => void healthTick(), CP_HEALTH_MS);
+    setTimeout(nagIfNoAuth, 60_000);
+    setInterval(() => {
+      nagIfNoAuth();
+      // The startup sync never got as far as listing the rewards (a network
+      // blip, Twitch down): keep trying rather than wait for `rewards sync`.
+      if (authSeen && lastSyncAt === null && !syncing) void sync();
+      void reconcile();
+      const pruned = pruneLedger(ledger, Date.now());
+      if (pruned.length !== ledger.length) {
+        ledger = pruned;
+        persistLedger();
+      }
+    }, CP_RECONCILE_MS);
+    void healthTick();
+    void pump();
+  }
+
+  return {
+    wiring: {
+      channel: config.channel,
+      onRedemption,
+      onAuthReady,
+      onSessionReady: () => void reconcile(),
+    },
+    hooks,
+    init,
+    start,
+    flush,
+  };
+}
+
+/** Log channel-points setup at startup (and anything that will stop it from
+ *  reaching Twitch or the game), so a misconfig is visible early. */
+function warnChannelPointsSetup(
+  config: ChannelPointsConfig,
+  twitch: TwitchConfig,
+): void {
+  console.log(
+    `[ChannelPoints] enabled on #${config.channel || "(unset)"} — ` +
+      `${config.rewards.length} reward(s), effects → ${config.overlayUrl}` +
+      `${config.overlayToken ? " (token set)" : ""}, auto-pause ` +
+      `${config.autoPause ? "on" : "off"}, deadline ${config.ttlSec}s.`,
+  );
+  const es = twitch.eventsub;
+  const logins = (es?.channels ?? []).map((c) => (c.login ?? "").toLowerCase());
+  for (
+    const p of channelPointsSetupProblems(
+      config,
+      logins,
+      !!es?.clientId && !!es?.clientSecret,
+    )
+  ) {
+    console.error(`[ChannelPoints] ${p}`);
+  }
+}
+
+/** Grace period for writing state on SIGTERM/SIGINT before exiting anyway. */
+const SHUTDOWN_FLUSH_MS = 3_000;
+
+/**
+ * On SIGTERM (systemd stop / deploy) or SIGINT (Ctrl-C), write the latest
+ * state before exiting instead of dying mid-write, bounded so a stuck disk
+ * can't hold the stop up. A second signal exits at once.
+ */
+function flushOnShutdown(flush: () => Promise<void>): void {
+  let stopping = false;
+  const onSignal = (sig: "SIGTERM" | "SIGINT") => {
+    const code = sig === "SIGINT" ? 130 : 0;
+    if (stopping) Deno.exit(code);
+    stopping = true;
+    console.log(`[Control] ${sig} — saving state before exit.`);
+    const deadline = new Promise<void>((r) => setTimeout(r, SHUTDOWN_FLUSH_MS));
+    void Promise.race([flush().catch(() => {}), deadline]).finally(() =>
+      Deno.exit(code)
+    );
+  };
+  for (const sig of ["SIGTERM", "SIGINT"] as const) {
+    try {
+      Deno.addSignalListener(sig, () => onSignal(sig));
+    } catch { /* signal unsupported on this platform */ }
+  }
+}
+
 async function runServer(configPath: string): Promise<void> {
   const settings = await loadSettings(configPath);
   const stateDir = await ensureStateDir(
@@ -1269,11 +2663,35 @@ async function runServer(configPath: string): Promise<void> {
     : undefined;
   if (giveawayEngine) await giveawayEngine.init();
 
-  // `keys`/`giveawayEngine` reference `emitter`/`broadcastGiveaway` only through
-  // deferred callbacks, so the forward reference to this destructure is fine.
+  // Channel points (when enabled): Twitch redemptions → overlay effects →
+  // fulfil/refund. Built before the server so /api/rewards can drive it; it
+  // reaches Twitch through the same deferred getChannelAuth bridge.
+  const channelPointsCfg = settings.channelPoints;
+  const channelPoints = channelPointsCfg?.enabled
+    ? createChannelPointsEngine({
+      config: channelPointsCfg,
+      clientId: settings.twitch.eventsub?.clientId ?? "",
+      stateDir,
+      getEmitter: () => emitter,
+      getChannelAuth: (login) => getChannelAuth(login),
+      expectAuth: !!channelPointsCfg.channel &&
+        esLogins.has(channelPointsCfg.channel) &&
+        !!settings.twitch.eventsub?.clientId &&
+        !!settings.twitch.eventsub?.clientSecret,
+    })
+    : undefined;
+  if (channelPoints) {
+    await channelPoints.init();
+    flushOnShutdown(() => channelPoints.flush());
+  }
+
+  // `keys`/`giveawayEngine`/`channelPoints` reference `emitter`/
+  // `broadcastGiveaway` only through deferred callbacks, so the forward
+  // reference to this destructure is fine.
   const { emitter, broadcastGiveaway } = createServer(settings, {
     setYouTubeKey: (key) => keys.apply(key, true),
     giveaway: giveawayEngine?.hooks,
+    channelPoints: channelPoints?.hooks,
   });
 
   const { twitch, youtube } = settings;
@@ -1316,6 +2734,7 @@ async function runServer(configPath: string): Promise<void> {
         onFollow: giveawayEngine
           ? (f) => giveawayEngine.onFollow(f)
           : undefined,
+        channelPoints: channelPoints?.wiring,
       });
       getChannelAuth = mgr.getChannelAuth;
       mgr.start();
@@ -1323,6 +2742,11 @@ async function runServer(configPath: string): Promise<void> {
   }
 
   if (giveawayEngine && giveawayCfg) warnGiveawaySetup(giveawayCfg, twitch);
+  if (channelPoints && channelPointsCfg) {
+    warnChannelPointsSetup(channelPointsCfg, twitch);
+    // Runs even without EventSub: `rewards simulate` still drives the overlay.
+    channelPoints.start();
+  }
 
   if (youtube.channels.length === 0) {
     console.log("No YouTube channels configured.");
@@ -1356,8 +2780,9 @@ function cliUsage(): string {
     "  multichat login [opts]                     authorize a Twitch channel for EventSub alerts",
     "  multichat fake [kind] [opts]               inject fake events (all kinds, or just one) into a running server",
     "  multichat giveaway [verb] [opts]           control the giveaway (status|open|close|draw|reset|demo|winners|packs|turns|report|plan|campaign-reset|remove <who>)",
+    "  multichat rewards [verb] [opts]            control channel-point chaos (status|sync|pause|resume|pending|refund <id>|simulate <key> [--user NAME])",
     "",
-    "Options (set-youtube-key, fake, and giveaway share these):",
+    "Options (set-youtube-key, fake, giveaway and rewards share these):",
     "  -p, --port <port>   server port   (default: $PORT or 8080)",
     "  -h, --host <host>   server host   (default: $HOST or 127.0.0.1)",
     "      --help          show this help",
@@ -1398,6 +2823,16 @@ function cliUsage(): string {
     "  multichat giveaway plan-clear   # drop the committed draw order (draws go fully random)",
     "  multichat giveaway campaign-reset --yes   # zero campaign + numbers; archives the winners log",
     "  multichat giveaway remove <who>      # drop one entrant: login, display name, #entry-number or userId",
+    "",
+    "rewards: drive channel-point chaos (Twitch custom rewards → game effects via the",
+    "cobblemon-overlay) on the running server. Loopback-only, like fake.",
+    "  multichat rewards status     # catalogue ↔ Twitch reward ids, pause state, overlay health, ledger counts",
+    "  multichat rewards sync       # create/update the managed rewards on Twitch (retired ones are disabled)",
+    "  multichat rewards pause      # pause every managed reward on Twitch (manual; wins over auto-pause)",
+    "  multichat rewards resume     # clear the manual pause (auto-pause may still hold them)",
+    "  multichat rewards pending    # redemptions still in flight or not yet fulfilled/refunded on Twitch",
+    "  multichat rewards refund <id>          # refund one open redemption and withdraw its effect",
+    "  multichat rewards simulate <key> [--user NAME]   # fake a redemption through the whole pipeline (no Twitch)",
   ].join("\n");
 }
 
@@ -1902,6 +3337,225 @@ async function runGiveaway(args: string[]): Promise<void> {
   Deno.exit(0);
 }
 
+/** "12s" / "4m" / "3h" / "2d" — for ages and last-check times in the CLI. */
+function ago(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 90) return `${s}s`;
+  if (s < 90 * 60) return `${Math.round(s / 60)}m`;
+  if (s < 36 * 3600) return `${Math.round(s / 3600)}h`;
+  return `${Math.round(s / 86400)}d`;
+}
+
+/** One ledger entry as a CLI line (pending / refund / simulate). */
+function describeRedemption(e: RedemptionEntry): string {
+  const where = e.state === "resolved"
+    ? `${e.outcome === "fulfilled" ? "FULFILLED" : "REFUNDED"} (${
+      e.reason ?? "?"
+    }${e.detail ? `: ${e.detail}` : ""})${
+      e.twitchSynced || e.simulated ? "" : " — Twitch not told yet"
+    }${e.cancelOwed ? " — overlay withdrawal not confirmed yet" : ""}`
+    : e.state;
+  return `${e.id}  ${e.key} → ${e.effect || "?"}  ${e.viewer}  ${where}  ` +
+    `${ago(Date.now() - e.receivedAt)} ago${
+      e.simulated ? "  [simulated]" : ""
+    }`;
+}
+
+/**
+ * CLI client: drive channel-point chaos on a running server via its loopback
+ * /api/rewards endpoint — sync the rewards to Twitch, pause/resume them, watch
+ * or refund in-flight redemptions, and simulate one end to end without Twitch.
+ * See docs/configuration.md#channel-points.
+ */
+async function runRewards(args: string[]): Promise<void> {
+  let host = Deno.env.get("HOST") ?? "127.0.0.1";
+  let port = Number(Deno.env.get("PORT") ?? "8080");
+  let action = "";
+  let target = "";
+  let user = "";
+
+  const VERBS = [
+    "status",
+    "sync",
+    "pause",
+    "resume",
+    "pending",
+    "refund",
+    "simulate",
+  ];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--help") {
+      console.log(cliUsage());
+      Deno.exit(0);
+    } else if (a === "-p" || a === "--port") {
+      port = Number(args[++i]);
+    } else if (a === "-h" || a === "--host") {
+      host = args[++i] ?? host;
+    } else if (a === "--user") {
+      user = args[++i] ?? "";
+    } else if (!action && VERBS.includes(a)) {
+      action = a;
+    } else if ((action === "refund" || action === "simulate") && !target) {
+      target = a; // the redemption id / reward key positional
+    } else {
+      console.error(`Unknown argument: ${a}`);
+      console.error(
+        `Usage: multichat rewards [${VERBS.join("|")}] [id|key] [--user NAME]`,
+      );
+      Deno.exit(2);
+    }
+  }
+  if (!action) action = "status";
+  if (!Number.isFinite(port) || port <= 0) {
+    console.error("Invalid --port.");
+    Deno.exit(2);
+  }
+  if (action === "refund" && !target) {
+    console.error(
+      "rewards refund needs a redemption id (see `multichat rewards pending`).",
+    );
+    Deno.exit(2);
+  }
+  if (action === "simulate" && !target) {
+    console.error(
+      "rewards simulate needs a reward key (see `multichat rewards status`).",
+    );
+    Deno.exit(2);
+  }
+
+  const wire: RewardsAction = action === "refund"
+    ? { action: "refund", id: target }
+    : action === "simulate"
+    ? (user
+      ? { action: "simulate", key: target, user }
+      : { action: "simulate", key: target })
+    : { action } as RewardsAction;
+  const { res, text } = await postControl(
+    host,
+    port,
+    "/api/rewards",
+    serializeRewardsAction(wire),
+    "application/json",
+  );
+  if (!res.ok) {
+    console.error(`Failed (HTTP ${res.status}): ${text}`);
+    Deno.exit(1);
+  }
+  try {
+    const data = JSON.parse(text) as {
+      status?: ChannelPointsStatus;
+      sync?: RewardSyncReport;
+      pending?: RedemptionEntry[];
+      ok?: boolean;
+      message?: string;
+      entry?: RedemptionEntry;
+    };
+    if (action === "sync") {
+      const s = data.sync;
+      if (!s) {
+        console.log(text);
+        Deno.exit(1);
+      }
+      console.log(s.message);
+      for (const err of s.errors) console.error(`  ✗ ${err}`);
+      Deno.exit(s.ok ? 0 : 1);
+    }
+    if (action === "pending") {
+      const list = data.pending ?? [];
+      if (list.length === 0) {
+        console.log(
+          "Nothing in flight — every redemption is settled on Twitch.",
+        );
+      } else {
+        for (const e of list) console.log(describeRedemption(e));
+        console.log(`${list.length} open redemption(s).`);
+      }
+      Deno.exit(0);
+    }
+    if (action === "refund" || action === "simulate") {
+      (data.ok ? console.log : console.error)(data.message ?? text);
+      if (data.entry) console.log("  " + describeRedemption(data.entry));
+      Deno.exit(data.ok ? 0 : 1);
+    }
+    // status / pause / resume all carry the status block.
+    if (data.message) {
+      (data.ok ? console.log : console.error)(data.message);
+    }
+    const s = data.status;
+    if (s) {
+      const now = Date.now();
+      console.log(
+        `Channel points on #${
+          s.channel || "(unset)"
+        } → overlay ${s.overlayUrl}`,
+      );
+      const token = s.authReady
+        ? `token ready${
+          s.scopeOk === false
+            ? `, MISSING ${REDEMPTIONS_MANAGE_SCOPE} (re-run 'multichat login')`
+            : s.scopeOk
+            ? ", scope ok"
+            : ""
+        }`
+        : "no EventSub token yet";
+      const paused = s.twitchPaused === null
+        ? "pause state not applied yet"
+        : s.twitchPaused
+        ? `rewards PAUSED (${s.manualPause ? "manual" : "auto"})`
+        : "rewards LIVE";
+      console.log(`  Twitch: ${token} · ${paused}`);
+      console.log(
+        `  Overlay: ${
+          s.accepting === null
+            ? "not checked yet"
+            : !s.accepting
+            ? "NOT accepting effects (game not polling, or overlay down)"
+            : s.ready === false
+            ? "game polling but NOT ready (paused, loading or dead)"
+            : "accepting effects, game ready"
+        }${
+          s.lastHealthAt ? ` (checked ${ago(now - s.lastHealthAt)} ago)` : ""
+        }` +
+          ` · auto-pause ${s.autoPause ? "on" : "off"}` +
+          `${s.manualPause ? " · manual pause ON" : ""}`,
+      );
+      console.log(
+        `  Last sync: ${
+          s.lastSyncAt ? `${ago(now - s.lastSyncAt)} ago` : "not yet"
+        }${s.lastSyncError ? ` — ${s.lastSyncError}` : ""}`,
+      );
+      console.log(`  Rewards (${s.rewards.length}):`);
+      for (const r of s.rewards) {
+        console.log(
+          `    ${r.key.padEnd(22)} ${String(r.cost).padStart(6)}  ` +
+            `${r.title.padEnd(24)} → ${r.effect.padEnd(16)} ${
+              r.rewardId ?? "(not on Twitch yet)"
+            }${r.enabled ? "" : "  [disabled]"}`,
+        );
+      }
+      for (const r of s.retired) {
+        console.log(
+          `    ${r.key.padEnd(22)} retired (kept disabled) ${r.rewardId}`,
+        );
+      }
+      const c = s.counts;
+      console.log(
+        `  Ledger: ${c.received} received · ${c.queued} queued · ` +
+          `${c.unsynced} awaiting Twitch · ${c.resolved} resolved${
+            c.withdrawing
+              ? ` · ${c.withdrawing} being withdrawn from the overlay`
+              : ""
+          }`,
+      );
+    }
+    Deno.exit(data.ok === false ? 1 : 0);
+  } catch {
+    console.log(text);
+  }
+  Deno.exit(0);
+}
+
 /** Read the Twitch app clientId/clientSecret from env, then settings.json. */
 async function loadEventSubCreds(
   settingsPath: string,
@@ -2074,6 +3728,13 @@ async function runTwitchLogin(args: string[]): Promise<void> {
 
   console.log("Authorized ✓");
   if (user) console.log(`Channel: ${user.login} (broadcaster id ${user.id})`);
+  if (tok.scopes) {
+    console.log(`Scopes granted: ${tok.scopes.join(" ") || "(none)"}`);
+    const missing = LOGIN_SCOPES.filter((s) => !tok.scopes!.includes(s));
+    if (missing.length > 0) {
+      console.error(`Missing (requested, not granted): ${missing.join(" ")}`);
+    }
+  }
   console.log(
     "\nAdd this entry to settings.json under twitch.eventsub.channels:\n",
   );
@@ -2091,6 +3752,15 @@ async function runTwitchLogin(args: string[]): Promise<void> {
   console.log(
     "\nThe refresh token rotates on first use; with a state directory the server " +
       "persists the rotated one, so this seed is only needed once.",
+  );
+  console.log(
+    "Re-authorizing a channel the server already runs (e.g. to add a scope)? " +
+      "The persisted rotated token (<state dir>/twitch-refresh-" +
+      `${
+        user?.id ?? "<broadcasterId>"
+      }) wins over any seed: replace the seed ` +
+      "(settings.json / refreshTokenFile) AND delete that file, then restart. " +
+      "See docs/configuration.md.",
   );
   Deno.exit(0);
 }
@@ -2110,6 +3780,8 @@ if (first === "set-youtube-key") {
   await runFake(rest);
 } else if (first === "giveaway") {
   await runGiveaway(rest);
+} else if (first === "rewards") {
+  await runRewards(rest);
 } else if (first === "--help" || first === "-h") {
   console.log(cliUsage());
 } else {

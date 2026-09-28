@@ -39,13 +39,15 @@ their settings.json counterparts; the YouTube key is resolved as persisted
 runtime key → `YOUTUBE_API_KEY` → `youtube.apiKey`.
 
 `--allow-write` exists so state can be persisted: the runtime YouTube key, the
-rotated Twitch refresh tokens, and the whole giveaway (entrant pool, campaign
+rotated Twitch refresh tokens, the whole giveaway (entrant pool, campaign
 counters, append-only winners log, turn ledger, chat-cards pack reports,
-committed draw plan). `resolveStateDir` in `src/control.ts` picks the directory —
-`$STATE_DIRECTORY` (systemd) → `$MULTICHAT_STATE_DIR` → `$XDG_STATE_HOME/multichat`
-→ `$HOME/.local/state/multichat`, never the working tree — and `ensureStateDir`
-in main.ts creates it 0700. Everything degrades to in-memory (with a warning) if
-it can't be created; persistence must never cost someone their stream. Deno's
+committed draw plan), and channel points (the redemption ledger, the catalogue
+key → Twitch reward id map, the manual pause). `resolveStateDir` in
+`src/control.ts` picks the directory — `$STATE_DIRECTORY` (systemd) →
+`$MULTICHAT_STATE_DIR` → `$XDG_STATE_HOME/multichat` →
+`$HOME/.local/state/multichat`, never the working tree — and `ensureStateDir` in
+main.ts creates it 0700. Everything degrades to in-memory (with a warning) if it
+can't be created; persistence must never cost someone their stream. Deno's
 `--allow-write` is an allow-list, so those default paths are in `deno.json` and
 `build.nix`; a custom `MULTICHAT_STATE_DIR` outside them is denied by Deno.
 
@@ -80,6 +82,18 @@ The same binary is also a small CLI client:
   `/giveaway` page (a CS2-style case reel; `?overlay` is a transparent OBS
   source, `?overlay&progress` adds a follower-milestone pill). See
   `docs/configuration.md#giveaway-mode`.
+- `multichat rewards <verb>` drives channel-point chaos on a running server via
+  its loopback-only `POST /api/rewards` endpoint (`status` / `sync` / `pause` /
+  `resume` / `pending` / `refund <id>` / `simulate <key> [--user NAME]`; it also
+  refuses anything a browser sends — an `Origin` or a cross-site
+  `Sec-Fetch-Site` gets `403`): `status` shows the catalogue ↔ Twitch reward
+  ids, pause state, overlay health and ledger counts; `sync` creates/patches the
+  managed rewards on Twitch; `pause`/`resume` set the persisted manual pause;
+  `pending` lists redemptions still in flight, not yet fulfilled/refunded on
+  Twitch, or still being withdrawn from the overlay; `refund` cancels one
+  (refund + effect withdrawn, retried until the overlay confirms); `simulate`
+  injects a `sim-<uuid>` redemption through the whole overlay → mod pipeline
+  without touching Twitch. See `docs/configuration.md#channel-points`.
 
 ## Configuration
 
@@ -151,6 +165,28 @@ Copy `settings.json.example` to `settings.json` and edit:
   allow-list: a subscriber host must be passed to `build.nix`'s `extraNetHosts`
   (module.nix derives it from `baseUrl`) or every delivery is denied. See
   `docs/configuration.md`
+- `channelPoints` — optional channel-point chaos
+  `{enabled, channel, overlayUrl, overlayToken, ttlSec, autoPause, announce,
+  rewards}`:
+  multichat creates and owns Twitch custom rewards on `channel` (only the Client
+  ID that created a reward may fulfil/refund it, so dashboard rewards can't be
+  used), each redemption becomes a game effect queued on the cobblemon-overlay
+  (`POST {overlayUrl}/effects`, loopback on the broadcast host; bearer
+  `overlayToken` / `MULTICHAT_EFFECTS_TOKEN`), and the outcome FULFILs
+  (applied/armed) or refunds (CANCELED: refused, expired, undeliverable, timed
+  out) the redemption. `rewards` null = `DEFAULT_CATALOG` (14 rewards,
+  corporate-villain prompts), a list replaces it; every reward has a ≥60s
+  cooldown (so none is redeemable offline), no user input, never skips the
+  request queue. `ttlSec` (30..3600, default 600) is the give-up deadline;
+  `autoPause` pauses the rewards on Twitch once the overlay's `/effects/health`
+  says the game isn't taking effects — not polling, or the mod not `ready`
+  (ESC-paused, `/chaos pause`, streamer dead) — two checks in a row (≈30s), and
+  resumes on the first good check (a manual pause wins); `announce` adds a
+  `kind:"system"` chat row per redemption. Needs the channel in
+  `twitch.eventsub.channels` with a token carrying `channel:manage:redemptions`
+  — a pre-existing token needs the re-login procedure (new login + replace the
+  seed + delete the persisted `twitch-refresh-<broadcasterId>`); startup warns
+  loudly when the scope is missing. See `docs/configuration.md#channel-points`
 
 YouTube channels require an API key, but it need not be in `settings.json` — it
 can be set on the running server with `multichat set-youtube-key` (see above).
@@ -164,18 +200,36 @@ stickers/memberships need only the API key). Full reference:
 
 ```
 main.ts          entry point — loads settings, wires the emitter to server + clients;
-                 also the `set-youtube-key` / `login` / `fake` / `giveaway` CLI subcommands +
-                 the runtime-key manager, the EventSub manager (per-channel token lifecycle +
-                 one WebSocket per broadcaster; exposes getChannelAuth, forwards onFollow), and
+                 also the `set-youtube-key` / `login` / `fake` / `giveaway` / `rewards` CLI
+                 subcommands + the runtime-key manager, the EventSub manager (per-channel token
+                 lifecycle + one WebSocket per broadcaster; exposes getChannelAuth, forwards
+                 onFollow; captures the token's granted scopes and hands the channel-points
+                 channel its redemption subscriptions + observers, warning loudly when its
+                 token lacks channel:manage:redemptions; a channel's first token refresh /
+                 broadcaster-id lookup is retried with back-off instead of skipping it), and
                  the giveaway engine (follow check + chat replies + entrant pool + campaign:
                  guaranteed-queue draws, follower-milestone counter fed by onFollow, append-only
                  winners JSONL; the turn lifecycle: per-draw turns, winner-only
                  mail/donate/destroy/pass disposition, seeded draw plan; driving the /giveaway page)
                  + the integration dispatcher (fires giveaway.turn.* events to configured subscribers)
+                 + the channel-points engine (createChannelPointsEngine: persisted redemption
+                 ledger fed by onRedemption; a 2s pump — retry owed overlay withdrawals
+                 (POST /effects/<id>/cancel {reason}, persisted `cancelOwed` until the overlay
+                 answers 200/404), deliver to the overlay's POST /effects, poll GET /effects for
+                 results, PATCH Twitch FULFILLED/CANCELED in ≤50-id batches (only echoed ids
+                 settle; 404/400 batches fall back to single ids) with back-off; reward sync on
+                 first auth + `rewards sync`, serialized with pause application on one chain and
+                 applying the pause right after; reconcile of UNFULFILLED redemptions on auth,
+                 every EventSub session and every 5 min; auto-pause from GET /effects/health
+                 every 15s with 2-check hysteresis on accepting && ready; a loud log every 5 min
+                 while the channel's token never arrived; state files written atomically (tmp +
+                 fsync + rename), flushed on SIGTERM/SIGINT, a corrupt one moved aside loudly;
+                 all outbound calls time-boxed)
 src/types.ts     shared TypeScript interfaces (Settings, ChatMessage w/ SubDetail, ServerEvent, Emitter,
                  TwitchEventSubConfig, EventSub frames, GiveawayConfig/State/Entrant/
                  CampaignState/CampaignSummary/Winner/Draw/Turn/Disposition/Plan, TermsAcceptance,
-                 TurnAggregates, IntegrationsConfig/Subscriber, PackReport)
+                 TurnAggregates, IntegrationsConfig/Subscriber, PackReport, ChannelPointsConfig/
+                 RewardSpec/RewardParams, RedemptionEntry/State/Outcome)
 src/twitch.ts    Twitch IRC over WebSocket (wss://irc-ws.chat.twitch.tv), with reconnect;
                  handleCommand takes an optional isCovered predicate so EventSub-covered
                  channels emit only chat text (their events come from EventSub instead), and
@@ -186,11 +240,18 @@ src/eventsub.ts  Twitch EventSub over WebSocket (wss://eventsub.wss.twitch.tv) �
                  notification→ChatMessage mappers + classifyFrame are exported/tested, the
                  socket-holding connectOnce/startTwitchEventSub are the wiring (receive-only);
                  an optional onFollow callback surfaces each follow's user_id/login to the
-                 giveaway milestone counter (kept out of the rendered ChatMessage/SSE)
+                 giveaway milestone counter (kept out of the rendered ChatMessage/SSE); an
+                 optional onRedemption callback surfaces channel-point redemption .add/.update
+                 (mapRedemption; nothing rendered), a per-channel `features` list gates the
+                 redemption subscriptions, and onSessionReady fires once a session's
+                 subscriptions are live (the reconcile trigger)
 src/twitchauth.ts pure Twitch OAuth + EventSub request builders / response parsers
-                 (refresh + auth-code grants, /users, create-subscription, /channels/followers
-                 follow check + /chat/messages send) + the SUBSCRIPTIONS table (source of truth
-                 for EventSub types/versions/scopes) + LOGIN_SCOPES (EVENTSUB_SCOPES + the
+                 (refresh + auth-code grants incl. the granted `scope[]`, /users,
+                 create-subscription, /channels/followers follow check + /chat/messages send,
+                 custom rewards GET/POST/PATCH + redemptions GET/PATCH + parseHelixResponse)
+                 + the SUBSCRIPTIONS table (source of truth for EventSub types/versions/scopes;
+                 the redemption pair is tagged feature "channelPoints", see subscriptionsFor)
+                 + LOGIN_SCOPES (EVENTSUB_SCOPES — now incl. channel:manage:redemptions — + the
                  user:write:chat action scope the login flow requests for giveaway replies)
 src/youtube.ts   YouTube Data API v3 polling — resolves channel → live video → live chat;
                  startYouTubePoller takes an AbortSignal so it can be torn down/restarted
@@ -201,6 +262,8 @@ src/server.ts    Deno.serve HTTP server: GET / + GET /overlay + GET /alerts + GE
                  ?direction=up|down flips the
                  message flow on any chat-rendering page), GET /events (SSE, replays the
                  giveaway pool on connect), POST /api/youtube-key + POST /api/fake +
+                 POST /api/rewards (always loopback-only, and refuses browser-originated
+                 requests: any Origin / cross-site Sec-Fetch-Site → 403) +
                  POST /api/giveaway (operator control; loopback-only unless server.controlAccess
                  widens it — see checkControlAccess) + POST /api/turn-report (the inbound
                  integration callback: chat-cards pushes back pack/card summaries; bearer
@@ -231,13 +294,30 @@ src/integrations.ts  pure integration-bus helpers: normalizeIntegrationsConfig, 
                  normalizePackReports behind POST /api/turn-report), plus applyIntegrationEnv /
                  subscriberTokenEnvVar (env overrides for both tokens; the env-var naming rule
                  is mirrored in module.nix and must stay in sync). The fetch wiring is in main.ts
+src/channelpoints.ts pure channel-points helpers: normalizeChannelPointsConfig /
+                 normalizeRewardSpec / applyChannelPointsEnv, DEFAULT_CATALOG + TIER_COLORS +
+                 KNOWN_EFFECTS, startup problems + the scope warning, the reward sync diff
+                 (rewardFields / planRewardSync: match by persisted id then exact title, PATCH
+                 drift, disable — never delete — retired keys), the ledger reducers keyed by
+                 redemption id (admitRedemption w/ dedupe + stale/retired/disabled refunds,
+                 markQueued/markAttempt/requeueEntry/resolveEntry/markSynced/markSyncFailed,
+                 dueSyncBatches + judgeSyncBatch, pruneLedger, normalizeLedger), the durable
+                 overlay withdrawal (resolveEntry {withdraw} / oweCancel / overlayCancelReason /
+                 markCancelDone / markCancelFailed / dueCancels — never pruned while owed), the
+                 overlay effect-API wire (enqueue/lookup/cancel{reason}/health builders,
+                 interpretEnqueueResponse, parseEffectsLookup, effectOutcome: applied/armed →
+                 fulfil, rejected/expired/canceled → refund), the auto-pause hysteresis
+                 (healthGood / stepAutoPause), the announce chat row, and the POST /api/rewards
+                 wire
 src/control.ts   pure control-plane helpers (loopback + private-range checks, the
                  controlAccess/controlToken policy behind POST /api/giveaway, key-body parse,
                  startup-key resolution, resolveStateDir + the state paths under it incl.
                  Twitch token/broadcaster-id + giveaway
-                 pool/campaign/winners-log/packs/turns/terms/plan) + the ServerHooks
-                 (setYouTubeKey + giveaway) / GiveawayHooks (draw/turnReport/packs/turns/report/
-                 plan/…) / KeyUpdateResult types
+                 pool/campaign/winners-log/packs/turns/terms/plan + channel-points
+                 ledger/rewards/control, the atomic-write temp / corrupt-file quarantine names,
+                 browserRequestDenied) + the ServerHooks
+                 (setYouTubeKey + giveaway + channelPoints) / GiveawayHooks (draw/turnReport/
+                 packs/turns/report/plan/…) / ChannelPointsHooks / KeyUpdateResult types
 src/fake.ts      pure fake-event helpers: the curated demo sequence + wire
                  (de)serialization/validation behind POST /api/fake
 tests/           one *_test.ts per source module; dependency-free assert shim in _assert.ts

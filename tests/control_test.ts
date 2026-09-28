@@ -1,12 +1,19 @@
 import {
+  browserRequestDenied,
+  channelPointsControlPath,
+  channelPointsLedgerPath,
+  channelPointsRewardsPath,
   checkControlAccess,
   isLoopbackAddr,
   isPrivateAddr,
+  isStaleStateTmp,
   keyStatePath,
   normalizeControlAccess,
   parseYouTubeKeyBody,
+  quarantinePath,
   resolveStartupKey,
   resolveStateDir,
+  stateTmpPath,
   twitchBroadcasterStatePath,
   twitchTokenStatePath,
 } from "../src/control.ts";
@@ -108,6 +115,25 @@ Deno.test("twitchBroadcasterStatePath: id cache keyed by lowercased login", () =
   );
   assertEquals(twitchBroadcasterStatePath(null, "streamer"), null);
   assertEquals(twitchBroadcasterStatePath("/var/lib/multichat", ""), null);
+});
+
+Deno.test("channel-points state paths: ledger, reward map, control under the dir", () => {
+  assertEquals(
+    channelPointsLedgerPath("/var/lib/multichat/"),
+    "/var/lib/multichat/channelpoints-ledger.json",
+  );
+  assertEquals(
+    channelPointsRewardsPath("/var/lib/multichat"),
+    "/var/lib/multichat/channelpoints-rewards.json",
+  );
+  assertEquals(
+    channelPointsControlPath("/var/lib/multichat"),
+    "/var/lib/multichat/channelpoints-control.json",
+  );
+  // No state dir → in-memory only, like the rest.
+  assertEquals(channelPointsLedgerPath(null), null);
+  assertEquals(channelPointsRewardsPath(undefined), null);
+  assertEquals(channelPointsControlPath(""), null);
 });
 
 // ---- Control-plane access policy -----------------------------------------
@@ -285,4 +311,66 @@ Deno.test("resolveStateDir: blank/absent env means in-memory only", () => {
     resolveStateDir(envFrom({ STATE_DIRECTORY: "  ", HOME: "" })),
     null,
   );
+});
+
+Deno.test("stateTmpPath / isStaleStateTmp: unique temp files beside the target", () => {
+  const p = "/var/lib/multichat/channelpoints-ledger.json";
+  const a = stateTmpPath(p, "123-1-abcd1234");
+  const b = stateTmpPath(p, "123-2-abcd1234");
+  assertEquals(a, `${p}.123-1-abcd1234.tmp`);
+  assert(a !== b, "two writes must never share a temp file");
+  // Nothing path-like can leak out of the unique part.
+  assertEquals(stateTmpPath(p, "../x/y"), `${p}.xy.tmp`);
+
+  const base = "channelpoints-ledger.json";
+  assert(isStaleStateTmp("channelpoints-ledger.json.123-1-ab.tmp", base));
+  assert(!isStaleStateTmp("channelpoints-ledger.json", base));
+  assert(!isStaleStateTmp("channelpoints-ledger.json..tmp", base));
+  assert(!isStaleStateTmp("channelpoints-rewards.json.1.tmp", base));
+  assert(!isStaleStateTmp("channelpoints-ledger.json.corrupt-x", base));
+});
+
+Deno.test("quarantinePath: a timestamped sibling, no colons", () => {
+  assertEquals(
+    quarantinePath(
+      "/s/channelpoints-ledger.json",
+      Date.parse("2026-09-25T20:01:02.345Z"),
+    ),
+    "/s/channelpoints-ledger.json.corrupt-2026-09-25T20-01-02-345Z",
+  );
+});
+
+Deno.test("browserRequestDenied: the CLI passes; any web page is refused", () => {
+  // Deno fetch / curl / the CLI: no Origin, no Sec-Fetch-*.
+  assertEquals(browserRequestDenied(new Headers()), null);
+  assertEquals(
+    browserRequestDenied(new Headers({ "content-type": "application/json" })),
+    null,
+  );
+  // Typed into the address bar / same-origin fetch without Origin: allowed.
+  assertEquals(
+    browserRequestDenied(new Headers({ "sec-fetch-site": "none" })),
+    null,
+  );
+  assertEquals(
+    browserRequestDenied(new Headers({ "sec-fetch-site": "same-origin" })),
+    null,
+  );
+  // Any Origin at all (a cross-site "simple" POST always carries one).
+  assertExists(
+    browserRequestDenied(new Headers({ origin: "https://evil.example" })),
+  );
+  assertExists(browserRequestDenied(new Headers({ origin: "null" })));
+  assertExists(
+    browserRequestDenied(
+      new Headers({
+        origin: "http://127.0.0.1:8080",
+        "sec-fetch-site": "same-origin",
+      }),
+    ),
+  );
+  // Cross-site / same-site fetch metadata, whatever the case.
+  for (const v of ["cross-site", "same-site", "Cross-Site", "bogus"]) {
+    assertExists(browserRequestDenied(new Headers({ "sec-fetch-site": v })));
+  }
 });

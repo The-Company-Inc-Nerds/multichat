@@ -11,6 +11,7 @@ import type {
   Settings,
 } from "./types.ts";
 import {
+  browserRequestDenied,
   checkControlAccess,
   isLoopbackAddr,
   normalizeControlAccess,
@@ -20,6 +21,7 @@ import {
 import { describeFakeAction, parseFakeAction } from "./fake.ts";
 import { parseGiveawayAction } from "./giveaway.ts";
 import { parseTurnReport } from "./integrations.ts";
+import { parseRewardsAction } from "./channelpoints.ts";
 
 const HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -1806,6 +1808,75 @@ export function createServer(
         else if (a.action === "delete") emitter.delete(a.data);
         else emitter.status(a.data.platform, a.data.name, a.data.state);
         return ctl("Injected: " + describeFakeAction(a) + "\n", 200);
+      }
+
+      // Operator control-plane for channel points (status/sync/pause/resume/
+      // pending/refund/simulate). Hard loopback-only like /api/fake, never
+      // widened by controlAccess: refund and simulate move viewers' points and
+      // fire effects in the streamer's game. Driven by `multichat rewards`.
+      if (pathname === "/api/rewards") {
+        const ctl = (body: string, status: number, json = false) =>
+          new Response(body, {
+            status,
+            headers: {
+              "x-multichat": "control",
+              ...(json ? { "content-type": "application/json" } : {}),
+            },
+          });
+        if (req.method !== "POST") return ctl("Method Not Allowed\n", 405);
+        if (!isLoopbackAddr(info.remoteAddr)) {
+          return ctl("Forbidden: the rewards endpoint is loopback-only\n", 403);
+        }
+        // Loopback alone isn't enough: any web page open in a browser on this
+        // host can POST to 127.0.0.1. The CLI sends no Origin; a page always
+        // does (contract §5.5).
+        const browser = browserRequestDenied(req.headers);
+        if (browser) {
+          return ctl(
+            JSON.stringify({
+              ok: false,
+              reason: "forbidden",
+              message:
+                `Forbidden: the rewards endpoint is CLI-only — ${browser}`,
+            }) + "\n",
+            403,
+            true,
+          );
+        }
+        if (!hooks.channelPoints) {
+          return ctl("Channel points are not enabled\n", 501);
+        }
+        const parsed = parseRewardsAction(await req.text());
+        if (!parsed.ok) {
+          return ctl("Bad Request: " + parsed.message + "\n", 400);
+        }
+        const cp = hooks.channelPoints;
+        const a = parsed.action;
+        let payload: unknown;
+        switch (a.action) {
+          case "status":
+            payload = { status: cp.status() };
+            break;
+          case "sync":
+            payload = { sync: await cp.sync() };
+            break;
+          case "pause":
+            payload = await cp.pause();
+            break;
+          case "resume":
+            payload = await cp.resume();
+            break;
+          case "pending":
+            payload = { pending: cp.pending() };
+            break;
+          case "refund":
+            payload = await cp.refund(a.id);
+            break;
+          case "simulate":
+            payload = await cp.simulate(a.key, a.user);
+            break;
+        }
+        return ctl(JSON.stringify(payload) + "\n", 200, true);
       }
 
       // Operator control-plane for the giveaway (open/close/draw/reset/remove/

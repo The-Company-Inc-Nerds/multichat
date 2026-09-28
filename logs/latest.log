@@ -1,0 +1,34 @@
+[17:41:49] [main/INFO]: [STDOUT]: ok  ids
+[17:41:49] [main/INFO]: [STDOUT]: ok  potion catalogue budget_cuts
+[17:41:49] [main/INFO]: [STDOUT]: ok  potion nausea
+[17:41:49] [main/INFO]: [STDOUT]: ok  potion defaults
+[17:41:49] [main/INFO]: [STDOUT]: ok  potion missing effect
+[17:41:49] [main/INFO]: [STDOUT]: ok  potion wither refused
+[17:41:49] [main/INFO]: [STDOUT]: ok  potion poison refused
+[17:41:49] [main/INFO]: [STDOUT]: ok  potion amp 3
+[17:41:49] [main/INFO]: [STDOUT]: ok  potion 4s
+[17:41:49] [main/INFO]: [STDOUT]: ok  potion 181s
+[17:41:49] [main/INFO]: [STDOUT]: ok  potion extra key
+[17:41:49] [main/INFO]: [STDOUT]: ok  sprint 60
+[17:41:49] [main/INFO]: [STDOUT]: ok  sprint default
+[17:41:49] [main/INFO]: [STDOUT]: ok  sprint 9
+[17:41:49] [main/INFO]: [STDOUT]: ok  mob random
+[17:41:49] [main/INFO]: [STDOUT]: ok  mob silverfish
+[17:41:49] [main/INFO]: [STDOUT]: ok  mob creeper refused
+[17:41:49] [main/INFO]: [STDOUT]: ok  mob non-string
+[17:41:49] [main/INFO]: [STDOUT]: ok  drop {}
+[17:41:49] [main/INFO]: [STDOUT]: ok  drop extra
+[17:41:49] [main/INFO]: [STDOUT]: ok  torch
+[17:41:49] [main/INFO]: [STDOUT]: ok  soul lantern
+[17:41:49] [main/INFO]: [STDOUT]: ok  sword
+[17:41:49] [main/INFO]: [STDOUT]: ok  plain paper
+[17:41:49] [main/INFO]: [STDOUT]: ok  named paper
+[17:41:49] [main/INFO]: [STDOUT]: ok  lored book
+[17:41:49] [main/INFO]: [STDOUT]: ok  named sword (not paperwork)
+[17:41:49] [main/INFO]: [STDOUT]: ok  ci_ custom_data
+[17:41:49] [main/INFO]: [STDOUT]: ok  lored paper
+[17:41:49] [main/INFO]: [STDOUT]: ok  bare written book
+[17:41:49] [main/INFO]: [STDOUT]: ok  soul torch
+[17:41:49] [main/INFO]: [STDOUT]: ok  lantern
+[17:41:49] [main/INFO]: [STDOUT]: ok  non-ci custom_data
+[17:41:49] [main/INFO]: [STDOUT]: ALL OK

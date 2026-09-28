@@ -110,7 +110,8 @@ export interface TwitchEventSubChannelConfig {
  *  chat text (see the coverage predicate in twitch.ts). Requires a Twitch app
  *  (clientId + clientSecret) and a per-channel user token authorized by the
  *  broadcaster (scopes: moderator:read:followers, channel:read:subscriptions,
- *  bits:read). Channels without EventSub creds keep full anonymous IRC behavior. */
+ *  bits:read; plus channel:manage:redemptions on the channel-points channel).
+ *  Channels without EventSub creds keep full anonymous IRC behavior. */
 export interface TwitchEventSubConfig {
   clientId: string;
   clientSecret: string;
@@ -503,6 +504,110 @@ export interface PackReport {
   receivedAt: number;
 }
 
+// ---- Channel points (Twitch custom rewards → cobblemon-overlay effects) --
+
+/** Effect parameters handed through to the game unchanged. Flat JSON scalars —
+ *  the mod is the authority on what each effect accepts (it refuses bad ones,
+ *  which refunds the viewer). */
+export type RewardParams = Record<string, string | number | boolean>;
+
+/** One managed Twitch custom reward: the catalogue entry multichat creates via
+ *  Helix (so it — and only it — may fulfil or refund the redemptions) and the
+ *  game effect a redemption asks for. `key` is the stable identity (persisted
+ *  key → reward id); `title` is what viewers see (≤45 chars, unique on the
+ *  channel). `cooldownSec` is ≥60 on every reward: Twitch only allows offline
+ *  redemptions of rewards without a cooldown, so this keeps them all live-only.
+ *  `maxPerStream`/`maxPerUserPerStream` 0 = no limit. Rewards are always created
+ *  without user input and never skip the request queue (only UNFULFILLED
+ *  redemptions can be refunded). */
+export interface RewardSpec {
+  key: string;
+  title: string;
+  cost: number;
+  prompt: string;
+  effect: string;
+  params: RewardParams;
+  cooldownSec: number;
+  maxPerStream: number;
+  maxPerUserPerStream: number;
+  /** "#RRGGBB" background on the reward tile. */
+  color: string;
+  enabled: boolean;
+}
+
+/** Channel-point chaos: viewers redeem managed custom rewards on `channel`, and
+ *  each redemption becomes a game effect queued on the cobblemon-overlay at
+ *  `overlayUrl` (loopback on the broadcast host), which the mod pulls and runs.
+ *  The outcome fulfils the redemption or refunds it. `ttlSec` is how long an
+ *  effect may wait to run before it is given up on (and refunded); `autoPause`
+ *  pauses the rewards on Twitch while the overlay reports the game isn't
+ *  accepting; `announce` adds a system row to chat per redemption. `rewards` is
+ *  always concrete here: settings `null`/absent means DEFAULT_CATALOG. */
+export interface ChannelPointsConfig {
+  enabled: boolean;
+  /** Twitch login the rewards live on (must be in twitch.eventsub.channels). */
+  channel: string;
+  overlayUrl: string;
+  /** Bearer for the overlay's effect routes ("" = none). */
+  overlayToken: string;
+  ttlSec: number;
+  autoPause: boolean;
+  announce: boolean;
+  rewards: RewardSpec[];
+}
+
+/** Where a redemption is in the pipeline: `received` (in the ledger, not yet
+ *  accepted by the overlay), `queued` (the overlay holds it), `resolved` (final
+ *  outcome known — independent of whether Twitch has been told yet). */
+export type RedemptionState = "received" | "queued" | "resolved";
+
+/** How a redemption ends on Twitch: FULFILLED (the effect ran / is armed) or
+ *  CANCELED (refunded — the effect was refused, expired or never delivered). */
+export type RedemptionOutcome = "fulfilled" | "canceled";
+
+/** One redemption in the channel-points ledger, keyed by the Twitch redemption
+ *  id (`sim-<uuid>` for a simulated one) — the idempotency key on every hop.
+ *  Times are epoch ms. `twitchSynced` means Twitch has the final status (our
+ *  PATCH landed, or it was resolved in the rewards queue); simulated entries
+ *  never touch Twitch. `attempts` counts overlay deliveries (answered or not —
+ *  a timed-out POST may still have landed); `syncAttempts` /
+ *  `nextSyncAt` back off a failing Twitch PATCH. */
+export interface RedemptionEntry {
+  id: string;
+  rewardId: string;
+  key: string;
+  effect: string;
+  params: RewardParams;
+  title: string;
+  cost: number;
+  viewer: string;
+  login: string;
+  redeemedAt: number;
+  receivedAt: number;
+  expiresAt: number;
+  state: RedemptionState;
+  outcome?: RedemptionOutcome;
+  /** Why it resolved the way it did (the overlay/mod reason, or ours:
+   *  "timeout", "overlay_unreachable", "stale", "manual", "external", …). */
+  reason?: string;
+  /** Free-text detail from the mod ("3 Pokémon filed to the PC"). */
+  detail?: string;
+  resolvedAt?: number;
+  twitchSynced: boolean;
+  simulated: boolean;
+  attempts: number;
+  syncAttempts?: number;
+  nextSyncAt?: number;
+  /** Resolved by multichat (refund, rewards-queue resolution, deadline) after a
+   *  POST /effects was attempted, so the overlay may still hold the effect: the
+   *  pump re-sends POST /effects/<id>/cancel until the overlay answers 200 or
+   *  404, then clears this. Never pruned while set. `cancelAttempts` /
+   *  `nextCancelAt` back off a failing withdrawal. */
+  cancelOwed?: boolean;
+  cancelAttempts?: number;
+  nextCancelAt?: number;
+}
+
 export interface Settings {
   server: ServerConfig;
   twitch: TwitchConfig;
@@ -510,4 +615,5 @@ export interface Settings {
   alerts?: AlertsConfig;
   giveaway?: GiveawayConfig;
   integrations?: IntegrationsConfig;
+  channelPoints?: ChannelPointsConfig;
 }

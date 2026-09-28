@@ -4,10 +4,12 @@
 # Also imported by flake.nix (packages.default) and module.nix (the package default).
 #
 # `extraNetHosts` widens the wrapper's --allow-net allow-list. The outbound
-# integration bus (settings.integrations.subscribers) fetches arbitrary URLs, and
-# Deno denies any host not listed here — so a subscriber on another machine needs
-# its host added. module.nix derives this from the configured subscribers
-# automatically; pass it by hand only when building the package yourself.
+# integration bus (settings.integrations.subscribers) and the channel-points
+# overlay (settings.channelPoints.overlayUrl) fetch configured URLs, and Deno
+# denies any host not listed here — so a subscriber or overlay on another machine
+# needs its host added (the default loopback overlay is already covered).
+# module.nix derives this from the configuration automatically; pass it by hand
+# only when building the package yourself.
 { pkgs ? import <nixpkgs> { }, extraNetHosts ? [ ] }:
 let
   netHosts = pkgs.lib.unique ([
@@ -41,6 +43,8 @@ let
     "MULTICHAT_CONTROL_TOKEN"
     "MULTICHAT_CALLBACK_TOKEN"
     "MULTICHAT_INTEGRATION_TOKEN_*"
+    # Bearer for the cobblemon-overlay effect routes (channelPoints.overlayToken).
+    "MULTICHAT_EFFECTS_TOKEN"
   ];
 in
 pkgs.stdenv.mkDerivation {

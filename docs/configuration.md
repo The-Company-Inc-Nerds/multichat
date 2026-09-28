@@ -93,18 +93,26 @@ it is remembered for 30 days — bookmark the plain `/giveaway` afterwards.
 Loopback is never asked for the token, so `multichat giveaway draw` on the host
 keeps working unchanged.
 
-Scope: this covers `/api/giveaway` only. `/api/youtube-key` and `/api/fake` stay
-loopback-only whatever `controlAccess` says — one sets a secret, the other forges
-events. And the read-only surfaces (`/`, `/overlay`, `/alerts`, `/giveaway`,
-`/events`) have never had authentication; `controlAccess` gates the buttons, not
-the pages.
+Scope: this covers `/api/giveaway` only. `/api/youtube-key`, `/api/fake` and
+`/api/rewards` stay loopback-only whatever `controlAccess` says — one sets a
+secret, one forges events, one moves viewers' channel points. And the read-only
+surfaces (`/`, `/overlay`, `/alerts`, `/giveaway`, `/events`) have never had
+authentication; `controlAccess` gates the buttons, not the pages.
 
 ## State directory
 
 The entrant pool, the campaign counters, the append-only winners log, the turn
 ledger, the pack reports pushed back by chat-cards, and any committed draw plan
 are all written to disk as they change and reloaded at startup — so a reboot
-mid-giveaway costs you nothing. The directory is resolved in this order:
+mid-giveaway costs you nothing. So are the [channel points](#channel-points)
+redemption ledger (`channelpoints-ledger.json`), the reward-id map
+(`channelpoints-rewards.json`) and the manual pause
+(`channelpoints-control.json`) — those three are written atomically (a temp
+file, fsynced, renamed into place) and flushed on SIGTERM/SIGINT, so a crash or
+a deploy mid-write never leaves a torn file; one that is corrupt anyway is moved
+aside to `<name>.corrupt-<timestamp>` with a loud log line saying what starting
+without it means (a lost manual pause is treated as paused). The directory is
+resolved in this order:
 
 | Source                 | Used when                                                     |
 | ---------------------- | ------------------------------------------------------------- |
@@ -244,8 +252,11 @@ and it prints a ready-to-paste `twitch.eventsub.channels` entry containing the
 channel's `login`, `broadcasterId`, and `refreshToken`. Add that entry (and the
 `clientId` / `clientSecret`) to `settings.json`. The requested scopes are
 `moderator:read:followers` (follows), `channel:read:subscriptions`
-(subs/gifts/resubs), and `bits:read` (cheers); raids need no scope. If you skip
-a scope, that alert type simply won't appear.
+(subs/gifts/resubs), and `bits:read` (cheers); raids need no scope. It also asks
+for `user:write:chat` (the giveaway's chat replies) and
+`channel:manage:redemptions` ([channel points](#channel-points)). If you skip a
+scope, that feature simply won't work. The command prints the scopes Twitch
+actually granted.
 
 `multichat login` (also spelled `twitch-login`) runs a temporary loopback web
 server as the OAuth redirect target; it needs no running multichat server.
@@ -273,6 +284,32 @@ The server refreshes reactively when a token is rejected, so it recovers on its
 own as long as the refresh token stays valid (re-run `multichat login` if you
 revoke the app's access). EventSub health is logged to the console; it does not
 change the sidebar status dots (chat's IRC connection owns those).
+
+### 4. Adding a scope later (re-login)
+
+A token keeps the scopes it was minted with. When a release asks for a new one
+(`user:write:chat` for giveaway replies, `channel:manage:redemptions` for
+channel points), a channel that is already running needs a fresh token — and
+re-running `multichat login` alone is **not** enough: the server prefers the
+persisted rotated token over any seed, so the old scopes quietly stay. The full
+procedure:
+
+1. Run `multichat login` signed in as the broadcaster. It prints the new refresh
+   token and the scopes Twitch granted — check the new one is listed.
+2. Replace the **seed** with the new token, wherever it lives: `refreshToken` in
+   `settings.json`, or the file behind `refreshTokenFile` on NixOS (for example
+   the password-manager item — Proton Pass, agenix, sops — that feeds the
+   `LoadCredential`).
+3. Delete the persisted token, `$STATE_DIRECTORY/twitch-refresh-<broadcasterId>`
+   (NixOS: `sudo rm /var/lib/private/multichat/twitch-refresh-<broadcasterId>`).
+   Do this _after_ step 2: the NixOS unit re-installs the seed whenever that
+   file is missing, and it must install the new one.
+4. Restart multichat.
+
+With channel points enabled, the server checks the scopes Twitch reports at
+startup and logs a loud `[ChannelPoints] … lacks channel:manage:redemptions`
+warning naming the exact file to delete; `multichat rewards status` shows
+`scope ok` once it is fixed.
 
 ## Alert themes
 
@@ -393,11 +430,12 @@ follows can't be verified and entries **fail closed** (nobody is admitted). Set
 
 **`replies` needs a re-authorization.** Sending chat as the broadcaster uses the
 `user:write:chat` scope, which is **new** — the `login` flow now requests it,
-but tokens minted before this release don't carry it. If replies are on, re-run
-`multichat login` for the giveaway channel so its token gains the scope;
-otherwise the follow gate and reel still work, but replies log a `401` and are
-skipped. Set `replies: false` to run silently (the `/giveaway` page still shows
-entries and the winner).
+but tokens minted before this release don't carry it. If replies are on,
+re-authorize the giveaway channel (see
+[Adding a scope later](#4-adding-a-scope-later-re-login) — a new login alone
+isn't picked up) so its token gains the scope; otherwise the follow gate and
+reel still work, but replies log a `401` and are skipped. Set `replies: false`
+to run silently (the `/giveaway` page still shows entries and the winner).
 
 **Running it.** Open `/giveaway` (the control view). Its buttons use the
 [`/api/giveaway`](api.md#post-apigiveaway) endpoint, which is loopback-only
@@ -577,6 +615,7 @@ These override their `settings.json` counterparts at startup:
 | `MULTICHAT_CONTROL_TOKEN` | `server.controlToken` |
 | `MULTICHAT_CALLBACK_TOKEN` | `integrations.callbackToken` |
 | `MULTICHAT_INTEGRATION_TOKEN_<NAME>` | a subscriber's `token` (see [Integrations](#integrations)) |
+| `MULTICHAT_EFFECTS_TOKEN` | `channelPoints.overlayToken` (see [Channel points](#channel-points)) |
 
 ## Integrations
 
@@ -673,6 +712,199 @@ Because those names are derived from your config, the packaged deno wrapper
 allows the whole `MULTICHAT_INTEGRATION_TOKEN_*` prefix rather than an
 enumerated list. A wrapper built before this existed simply finds no override
 instead of failing to start.
+
+## Channel points
+
+The optional `channelPoints` block runs **channel-point chaos**: viewers spend
+Twitch channel points on custom rewards that make the streamer's Cobblemon run
+harder, and each redemption becomes a game effect. multichat owns the Twitch
+side end to end — it creates the rewards, keeps the redemption ledger, and
+fulfils or refunds every redemption; the cobblemon-overlay (in
+[antlers](https://github.com/CalamooseLabs/antlers)) holds the effect queue, and
+the mod pulls effects from it and runs them.
+
+```
+Twitch EventSub ─▶ multichat ── POST /effects (loopback) ─▶ cobblemon-overlay
+                   ledger · fulfil / refund                  ▲ claim / result
+                                                             the mod (in game)
+```
+
+```json
+"channelPoints": {
+  "enabled": true,
+  "channel": "thecompanyinc",
+  "overlayUrl": "http://127.0.0.1:8082",
+  "overlayToken": "",
+  "ttlSec": 600,
+  "autoPause": true,
+  "announce": true,
+  "rewards": null
+}
+```
+
+| Field          | Type         | Default                   | Description                                                                    |
+| -------------- | ------------ | ------------------------- | ------------------------------------------------------------------------------ |
+| `enabled`      | bool         | `false`                   | Turn it on                                                                     |
+| `channel`      | string       | `""`                      | Twitch login the rewards live on — must also be in `twitch.eventsub.channels`  |
+| `overlayUrl`   | string       | `"http://127.0.0.1:8082"` | The cobblemon-overlay's base URL (`/effects…` is appended)                     |
+| `overlayToken` | string       | `""`                      | Bearer for the overlay's effect routes; `MULTICHAT_EFFECTS_TOKEN` wins over it |
+| `ttlSec`       | number       | `600`                     | How long a redemption may wait to run (30–3600s, counted from the redemption)  |
+| `autoPause`    | bool         | `true`                    | Pause the rewards on Twitch while the game isn't taking effects                |
+| `announce`     | bool         | `true`                    | Add a highlighted system row to chat per redemption (not on `/alerts`)         |
+| `rewards`      | array / null | `null`                    | The catalogue; `null` = the built-in one below, a list replaces it wholesale   |
+
+Each `rewards` entry:
+
+| Field                 | Description                                                                                     |
+| --------------------- | ----------------------------------------------------------------------------------------------- |
+| `key`                 | Stable identity (`a-z 0-9 _ -`). Change it and it becomes a new reward; the old one is disabled |
+| `title`               | What viewers see — at most 45 characters, unique on the channel                                 |
+| `cost`                | Price in channel points (≥ 1)                                                                   |
+| `prompt`              | Description shown to viewers (at most 200 characters)                                           |
+| `effect`              | The game effect id (see the catalogue below); the mod refuses an unknown one                    |
+| `params`              | Effect parameters (flat strings/numbers/booleans), passed to the mod unchanged                  |
+| `cooldownSec`         | Global cooldown, **at least 60** (raised if lower) — see below                                  |
+| `maxPerStream`        | Redemptions per stream; `0` = unlimited                                                         |
+| `maxPerUserPerStream` | Redemptions per viewer per stream; `0` = unlimited                                              |
+| `color`               | Tile color `#RRGGBB`                                                                            |
+| `enabled`             | `false` keeps the reward on Twitch but disabled                                                 |
+
+An entry that would fail on Twitch (title over 45, prompt over 200, no cost, a
+duplicate key or title) is dropped at startup with a log line; a missing or
+short cooldown is raised to 60. Rewards are always created without user input
+and never skip the request queue — only an unfulfilled redemption can be
+refunded.
+
+### The built-in catalogue
+
+With `rewards` null, these 14 are created (prompts are The Company, Inc.'s
+corporate-villain voice; see `DEFAULT_CATALOG` in `src/channelpoints.ts`):
+
+| Key                    | Title                | Effect             | Params                           | Cost  | Cooldown | Per stream |
+| ---------------------- | -------------------- | ------------------ | -------------------------------- | ----- | -------- | ---------- |
+| `butterfingers`        | Butterfingers        | `drop_held_item`   | —                                | 250   | 60s      | —          |
+| `hop_to_it`            | Hop To It            | `force_jump`       | —                                | 150   | 60s      | —          |
+| `about_face`           | About Face           | `about_face`       | —                                | 150   | 60s      | —          |
+| `hotbar_reorg`         | Hotbar Reorg         | `hotbar_shuffle`   | —                                | 400   | 120s     | —          |
+| `budget_cuts`          | Budget Cuts          | `potion`           | slowness, amplifier 1, 45s       | 750   | 180s     | —          |
+| `mandatory_overtime`   | Mandatory Overtime   | `potion`           | mining_fatigue, amplifier 1, 90s | 750   | 180s     | —          |
+| `performance_review`   | Performance Review   | `potion`           | weakness, amplifier 1, 60s       | 750   | 180s     | —          |
+| `team_building_cruise` | Team-Building Cruise | `potion`           | nausea, amplifier 0, 15s         | 750   | 180s     | —          |
+| `lights_out`           | Lights Out           | `potion`           | darkness, amplifier 0, 20s       | 1000  | 180s     | —          |
+| `hiring_freeze`        | Hiring Freeze        | `sprint_lock`      | 60s                              | 1000  | 300s     | —          |
+| `uninvited_contractor` | Uninvited Contractor | `spawn_mob`        | random mob                       | 2500  | 300s     | —          |
+| `workplace_incident`   | Workplace Incident   | `pokemon_status`   | random status                    | 5000  | 600s     | 5          |
+| `magikarp_mandate`     | Magikarp Mandate     | `magikarp_mandate` | —                                | 15000 | 3600s    | 1          |
+| `mandatory_meeting`    | Mandatory Meeting    | `forfeit_turns`    | 3 turns                          | 25000 | 3600s    | 1          |
+
+Tiles are colored by tier: `#9AA5B1` nuisances, `#E0A526` debuffs, `#D9534F`
+threats, `#7A1F1F` run-altering. Every effect makes the run harder, never
+easier, and the physical ones never land a killing blow (the mod enforces that).
+The two battle ones are deliberately brutal: **Magikarp Mandate** files the
+whole party to the PC and leaves a real level-1 Magikarp — battles are real, and
+the party only comes back by withdrawing from a PC; **Mandatory Meeting** makes
+the team pass its next 3 turns in the next _trainer_ battle, last Pokémon
+standing or not.
+
+### How a redemption is settled
+
+- **Provisioning.** Twitch lets only the app that _created_ a reward fulfil or
+  refund its redemptions, so multichat creates the rewards itself — on the first
+  start the channel's token is usable, and on `multichat rewards sync`. It
+  matches rewards it already made by the persisted id (then by exact title),
+  creates what is missing, and patches drift. A reward made in the Twitch
+  dashboard can't be used, and one with the same title blocks creation (sync
+  reports it — rename or delete it there). A key removed from the catalogue is
+  **disabled** on Twitch, never deleted: deleting a reward marks its pending
+  redemptions fulfilled without a refund.
+- **Redemption.** Each EventSub redemption of a managed reward lands in the
+  ledger (deduped by redemption id — EventSub can deliver twice), gets the
+  optional chat row, and is handed to the overlay with the time left before its
+  deadline.
+- **Fulfilled** when the mod reports the effect `applied` or `armed`.
+- **Refunded** (CANCELED) when the mod `rejected` it or it `expired`; when the
+  overlay refused it (`disabled`, `game_offline`, `queue_full`); when the
+  overlay couldn't be reached before the deadline; when no final result came
+  within the deadline plus two minutes (the effect is withdrawn too); when a
+  missed redemption turns up after its deadline (`stale`); or when its reward
+  was retired or disabled.
+- **Resolved in the rewards queue.** If you complete or reject a redemption in
+  Twitch's own queue, multichat withdraws the effect instead of running it (the
+  on-stream memo shows a completed one as "CLOSED — no action", not refunded).
+- **Withdrawals are durable.** Whenever multichat itself refunds or closes a
+  redemption it had already sent to the overlay (a `rewards refund`, the rewards
+  queue, its own deadline — including a delivery that timed out but may have
+  landed), it owes the overlay a cancel, with the reason (`refunded`,
+  `fulfilled_externally`, `manual`, `timeout`). That debt is persisted in the
+  ledger and retried every pump until the overlay answers `200` or `404`, so a
+  refund made while the overlay is down or restarting can't let the effect run
+  once it's back; the entry is never pruned until then.
+- **Missed events.** EventSub never replays what happened while the socket was
+  down, so multichat lists each reward's unfulfilled redemptions at startup, on
+  every EventSub (re)connect and every 5 minutes, and admits what it missed.
+- **Telling Twitch.** Outcomes are PATCHed in batches of up to 50, retried with
+  back-off. Only the redemptions Twitch echoes back count as done; the rest, and
+  every id of a batch Twitch refuses whole (`404`/`400` — one redemption that is
+  no longer unfulfilled can sink a batch), are re-sent one at a time, where a
+  `404` (already resolved) counts as done. The ledger is persisted, so a restart
+  mid-redemption loses nothing.
+
+### Pausing
+
+With `autoPause` on, multichat asks the overlay every 15s whether the game is
+taking effects (`GET /effects/health`: the mod is polling _and_ reports itself
+`ready` — not ESC-paused, not `/chaos pause`d, the streamer online and alive)
+and pauses every enabled reward on Twitch once it hasn't been for two checks in
+a row (≈30s, so one missed poll doesn't flap them) — viewers can't spend points
+into a game that isn't running — then unpauses on the first good check. The
+rewards start paused until the first good check, and a reward sync applies the
+pause state in the same step, so a newly created reward is never left live while
+the rest are paused. `multichat rewards pause` sets a manual pause that wins in
+both directions and survives restarts until `multichat rewards resume`. Every
+reward also carries a cooldown of at least 60s, which is what makes it
+live-only: Twitch allows redemptions while the channel is offline only for
+rewards without one.
+
+### Operating it
+
+```bash
+multichat rewards status            # catalogue ↔ reward ids, pause state, overlay health, ledger counts
+multichat rewards sync              # create / patch the rewards on Twitch
+multichat rewards pause             # manual pause (wins over auto-pause)
+multichat rewards resume            # clear it
+multichat rewards pending           # redemptions in flight, or not yet settled on Twitch
+multichat rewards refund <id>       # refund one and withdraw its effect
+multichat rewards simulate budget_cuts --user Nova   # a fake redemption, whole pipeline, no Twitch
+```
+
+All of them go to the loopback-only
+[`POST /api/rewards`](api.md#post-apirewards) endpoint (never widened by
+`controlAccess` — they move viewers' points and fire effects in the game), which
+also refuses anything sent by a web page (an `Origin` header or a cross-site
+`Sec-Fetch-Site`), so a site open in a browser on the host can't drive it.
+`simulate` runs the real overlay → mod path with a `sim-<uuid>` id and never
+touches Twitch, so it works without EventSub at all.
+
+### Requirements
+
+- **A monetized channel.** Channel points need Affiliate or Partner; otherwise
+  every reward call answers `403`.
+- **EventSub on that channel,** with a token carrying
+  `channel:manage:redemptions`. A token minted before channel points existed
+  lacks it — follow [Adding a scope later](#4-adding-a-scope-later-re-login);
+  startup warns loudly (naming the state file to delete) until it's fixed. If
+  the token or broadcaster id can't be had at startup (Twitch or the network
+  briefly down), it is retried with back-off (5s up to every 5 min) instead of
+  the channel being skipped, and while channel points still have no token a loud
+  `!!!` line is logged every 5 minutes — nothing is synced, paused, fulfilled or
+  refunded until it arrives.
+- **The 50-reward cap** is per channel and counts dashboard rewards too.
+- **Deploy order:** the overlay first (with its effect routes), then multichat,
+  then the mod. An overlay without the routes answers `404`, which multichat
+  treats as a refusal — every redemption would be refunded.
+- **`--allow-net`.** The default loopback overlay is already allowed; an overlay
+  on another host must be added to the wrapper's allow-list (the NixOS module
+  derives it from `overlayUrl`).
 
 ## Getting a YouTube API key
 

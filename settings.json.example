@@ -59,5 +59,15 @@
         "packSize": 0
       }
     ]
+  },
+  "channelPoints": {
+    "enabled": false,
+    "channel": "",
+    "overlayUrl": "http://127.0.0.1:8082",
+    "overlayToken": "",
+    "ttlSec": 600,
+    "autoPause": true,
+    "announce": true,
+    "rewards": null
   }
 }

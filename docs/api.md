@@ -3,7 +3,8 @@
 multichat serves a single page and a Server-Sent Events stream. The viewer
 surface is read-only and unauthenticated — meant to run on a trusted network —
 plus loopback-only control endpoints: setting the YouTube API key, injecting
-fake events for previewing how they render, and driving the giveaway.
+fake events for previewing how they render, driving the giveaway, and driving
+channel points.
 
 ## Endpoints
 
@@ -17,6 +18,8 @@ fake events for previewing how they render, and driving the giveaway.
 | `POST` | `/api/youtube-key`      | `text/plain`        | Set the YouTube API key (loopback-only — see below)                                    |
 | `POST` | `/api/fake`             | `text/plain`        | Inject a fake chat event for previewing (loopback-only — see below)                    |
 | `POST` | `/api/giveaway`         | `application/json`  | Drive the giveaway: open/close/draw/reset/remove (loopback, or wider via `controlAccess`) |
+| `POST` | `/api/turn-report`      | `application/json`  | Integration callback: chat-cards reports a pack back (callback token, else loopback)  |
+| `POST` | `/api/rewards`          | `application/json`  | Drive channel points: status/sync/pause/resume/pending/refund/simulate (loopback-only) |
 | any    | anything else           | `404`               | Not found                                                                              |
 
 The viewer page also takes `?overlay` and `?alerts` query params (`/?overlay` is
@@ -233,6 +236,80 @@ restart.
 | `501`  | No giveaway is enabled in settings            |
 
 See [Integrations](configuration.md#integrations) for the outbound half.
+
+## `POST /api/rewards`
+
+Drives [channel points](configuration.md#channel-points) on the running server.
+Backs `multichat rewards <verb>`; only present when `channelPoints.enabled` is
+on.
+
+- **Loopback-only, always.** A non-loopback peer gets `403` whatever
+  `server.controlAccess` and `server.controlToken` say: `refund` moves a
+  viewer's points and `simulate` fires an effect in the streamer's game.
+- **Not from a browser.** Loopback alone can't tell the CLI from a web page open
+  on the same host, so a request carrying an `Origin` header, or a
+  `Sec-Fetch-Site` other than `none` / `same-origin`, gets `403`
+  `{"ok":false,"reason":"forbidden","message":…}`. The CLI, curl and Deno's
+  fetch send neither.
+- **Body.** A JSON object `{ "action": … }`, one of `status`, `sync`, `pause`,
+  `resume`, `pending`, `{"action":"refund","id":"<redemption id>"}`, or
+  `{"action":"simulate","key":"<catalogue key>","user"?:"<viewer name>"}`
+  (`user` defaults to "The Board"; control characters are stripped and it is cut
+  to 25 characters).
+- **Response.** JSON, `200` whenever the action ran — check `ok` where present:
+  - `status` → `{ "status": ChannelPointsStatus }`: `channel`, `overlayUrl`,
+    `authReady` (the channel's EventSub token is usable), `scopeOk`
+    (`channel:manage:redemptions` granted; `null` = unknown), `accepting` and
+    `ready` (last overlay health: the mod is polling / it says it can run
+    effects; `null` = not checked), `lastHealthAt`, `autoPause`, `manualPause`,
+    `twitchPaused` (what was last applied on Twitch; `null` = not yet),
+    `lastSyncAt`, `lastSyncError`, `rewards`
+    (`[{key, title, cost, effect, enabled, rewardId|null}]`), `retired`
+    (`[{key, rewardId}]` — removed from the catalogue, kept disabled), and
+    `counts` `{received, queued, unsynced, withdrawing, resolved}`
+    (`withdrawing` = resolved, but the overlay hasn't confirmed the effect's
+    withdrawal yet).
+  - `sync` →
+    `{ "sync": { ok, message, created, updated, disabled, unchanged,
+    errors } }`
+    (keys per action taken).
+  - `pause` / `resume` → `{ ok, message, status }`; `ok` is false when Twitch
+    couldn't be updated yet (no token, rewards not synced, a PATCH failed) — the
+    manual pause is recorded regardless and applied as soon as it can be.
+  - `pending` → `{ "pending": RedemptionEntry[] }` — every entry not yet
+    resolved, resolved but not yet on Twitch, or still being withdrawn from the
+    overlay.
+  - `refund` / `simulate` → `{ ok, message, entry? }`. `refund` refuses an
+    unknown id or one that is already resolved, and its `message` notes when the
+    overlay didn't confirm the effect's withdrawal on the spot (it is retried
+    until it does); `simulate` refuses an unknown key.
+
+A `RedemptionEntry` is
+`{ id, rewardId, key, effect, params, title, cost,
+viewer, login, redeemedAt, receivedAt, expiresAt, state, outcome?, reason?,
+detail?, resolvedAt?, twitchSynced, simulated, attempts, syncAttempts?,
+nextSyncAt?, cancelOwed?, cancelAttempts?, nextCancelAt? }`
+— `state` is `received` (not yet accepted by the overlay), `queued` (the overlay
+holds it) or `resolved`; `outcome` is `fulfilled` or `canceled` (refunded);
+`cancelOwed` marks an entry multichat resolved after it was sent to the overlay,
+whose `POST /effects/<id>/cancel` (body
+`{"reason": "refunded" |
+"fulfilled_externally" | "manual" | "timeout"}`) is
+retried until the overlay answers `200` or `404`; times are epoch ms. Simulated
+entries have a `sim-` id and never touch Twitch.
+
+| Status | Meaning                                                    |
+| ------ | ---------------------------------------------------------- |
+| `200`  | Ran; JSON body as above                                    |
+| `400`  | Body was not valid JSON, or the action was unknown/invalid |
+| `403`  | Not from loopback, or sent by a web page (`Origin`)        |
+| `405`  | Method was not `POST`                                      |
+| `501`  | Channel points are not enabled in settings                 |
+
+With `announce` on, each redemption also appears on the SSE feed as an ordinary
+`message` with `kind: "system"` — `"<viewer> redeemed <title>"`, the reward's
+tier color as `accentColor`, and the cost as `amount` — so it shows as a
+highlighted row in `/` and `/overlay` but never pops on `/alerts`.
 
 ## The SSE stream
 

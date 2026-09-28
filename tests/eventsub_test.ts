@@ -9,9 +9,11 @@ import {
   mapCheer,
   mapFollow,
   mapRaid,
+  mapRedemption,
   mapSubGift,
   mapSubMessage,
   mapSubscribe,
+  type RedemptionEvent,
   subTierLabel,
 } from "../src/eventsub.ts";
 import { fakeEmitter } from "./_fake.ts";
@@ -204,6 +206,132 @@ Deno.test("handleNotification: onFollow fires for follows with a user id", () =>
     e,
   );
   assertEquals(e.captured.messages.length, 4);
+});
+
+// The documented channel.channel_points_custom_reward_redemption.add example.
+const REDEMPTION = {
+  id: "17fa2df1-ad76-4804-bfa5-a40ef63efe63",
+  broadcaster_user_id: "1337",
+  broadcaster_user_login: "cool_user",
+  broadcaster_user_name: "Cool_User",
+  user_id: "9001",
+  user_login: "cooler_user",
+  user_name: "Cooler_User",
+  user_input: "pogchamp",
+  status: "unfulfilled",
+  reward: {
+    id: "92af127c-7326-4483-a52b-b0da0be61c01",
+    title: "title",
+    cost: 100,
+    prompt: "reward prompt",
+  },
+  redeemed_at: "2020-07-15T17:16:03.17106713Z",
+};
+
+Deno.test("mapRedemption: the redemption + reward ids, viewer, lowercase status", () => {
+  const r = mapRedemption(REDEMPTION, "chan", "add");
+  assertEquals(r, {
+    channel: "chan",
+    kind: "add",
+    redemptionId: "17fa2df1-ad76-4804-bfa5-a40ef63efe63",
+    rewardId: "92af127c-7326-4483-a52b-b0da0be61c01",
+    rewardTitle: "title",
+    cost: 100,
+    userId: "9001",
+    login: "cooler_user",
+    displayName: "Cooler_User",
+    status: "unfulfilled",
+    redeemedAt: Date.parse("2020-07-15T17:16:03.17106713Z"),
+  });
+
+  // An .update carries the new status; casing is normalized.
+  const u = mapRedemption({ ...REDEMPTION, status: "CANCELED" }, "c", "update");
+  assertEquals(u?.kind, "update");
+  assertEquals(u?.status, "canceled");
+
+  // Without either id it can be neither deduped nor fulfilled → dropped.
+  assertEquals(mapRedemption({ ...REDEMPTION, id: "" }, "c", "add"), null);
+  assertEquals(mapRedemption({ ...REDEMPTION, reward: {} }, "c", "add"), null);
+  // A missing timestamp is 0 (the engine treats that as "now").
+  assertEquals(
+    mapRedemption({ ...REDEMPTION, redeemed_at: "junk" }, "c", "add")
+      ?.redeemedAt,
+    0,
+  );
+});
+
+Deno.test("handleNotification: redemptions reach onRedemption and render nothing", () => {
+  const e = fakeEmitter();
+  const seen: RedemptionEvent[] = [];
+  const onRedemption = (r: RedemptionEvent) => seen.push(r);
+
+  assertEquals(
+    handleNotification(
+      "channel.channel_points_custom_reward_redemption.add",
+      REDEMPTION,
+      "chan",
+      "msg-1",
+      e,
+      undefined,
+      onRedemption,
+    ),
+    true,
+  );
+  assertEquals(
+    handleNotification(
+      "channel.channel_points_custom_reward_redemption.update",
+      { ...REDEMPTION, status: "fulfilled" },
+      "chan",
+      "msg-2",
+      e,
+      undefined,
+      onRedemption,
+    ),
+    true,
+  );
+  assertEquals(seen.map((r) => [r.kind, r.status]), [
+    ["add", "unfulfilled"],
+    ["update", "fulfilled"],
+  ]);
+  // Only the engine knows which rewards it manages — no chat row here.
+  assertEquals(e.captured.messages.length, 0);
+
+  // Handled (true) even with no observer, and an id-less payload is skipped.
+  assertEquals(
+    handleNotification(
+      "channel.channel_points_custom_reward_redemption.add",
+      { reward: {} },
+      "chan",
+      "msg-3",
+      e,
+      undefined,
+      onRedemption,
+    ),
+    true,
+  );
+  assertEquals(seen.length, 2);
+  assertEquals(
+    handleNotification(
+      "channel.channel_points_custom_reward_redemption.add",
+      REDEMPTION,
+      "chan",
+      "msg-4",
+      e,
+    ),
+    true,
+  );
+
+  // Other notifications never reach the redemption observer.
+  handleNotification(
+    "channel.follow",
+    { user_id: "1", user_name: "A" },
+    "chan",
+    "msg-5",
+    e,
+    undefined,
+    onRedemption,
+  );
+  assertEquals(seen.length, 2);
 });
 
 Deno.test("classifyFrame: maps message_type to a frame kind", () => {
