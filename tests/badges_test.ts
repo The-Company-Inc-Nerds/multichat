@@ -92,10 +92,35 @@ Deno.test("resolveBadgeArt: subscriber falls to the channel's nearest lower vers
   assertEquals(resolveBadgeArt("subscriber", "5", channel)?.title, "t1-3");
   // Tier 2 never borrows Tier 1 art, even when Tier 1 has a closer version.
   assertEquals(resolveBadgeArt("subscriber", "2012", channel)?.title, "t2-6");
-  // Nothing at or below 3012 in Tier 3 (only 3024): the generic badge.
+  // Nothing at or below 3012 in Tier 3 (only 3024): the same months in the
+  // channel's Tier 1 art, as Twitch shows it.
+  assertEquals(resolveBadgeArt("subscriber", "3012", channel)?.title, "t1-12");
+});
+
+Deno.test("resolveBadgeArt: Tier 2/3 subs fall back to the channel's Tier 1 art", () => {
+  // A channel that uploaded only Tier 1 badges: Twitch shows them to Tier 2/3.
+  const tier1 = new Map([
+    ["subscriber/0", art("t1-0")],
+    ["subscriber/6", art("t1-6")],
+    ["subscriber/12", art("t1-12")],
+  ]);
+  assertEquals(resolveBadgeArt("subscriber", "2014", tier1)?.title, "t1-12");
+  assertEquals(resolveBadgeArt("subscriber", "3003", tier1)?.title, "t1-0");
+  assertEquals(resolveBadgeArt("subscriber", "3000", tier1)?.title, "t1-0");
+  // Tier-specific art still wins, even over a closer Tier 1 version.
+  const withT2 = new Map([...tier1, ["subscriber/2000", art("t2-0")]]);
+  assertEquals(resolveBadgeArt("subscriber", "2012", withT2)?.title, "t2-0");
+  assertEquals(resolveBadgeArt("subscriber", "3012", withT2)?.title, "t1-12");
+  // No Tier 1 art at or below the months either: the generic badge.
+  const late = new Map([["subscriber/6", art("t1-6")]]);
   assertEquals(
-    resolveBadgeArt("subscriber", "3012", channel)?.url,
+    resolveBadgeArt("subscriber", "2003", late)?.url,
     snapshotArt("subscriber", "0")?.url,
+  );
+  // A Tier 1 badge with nothing at or below in the channel: the global one.
+  assertEquals(
+    resolveBadgeArt("subscriber", "3", late)?.url,
+    snapshotArt("subscriber", "3")?.url,
   );
 });
 
@@ -198,42 +223,53 @@ Deno.test("badgeLabel: unknown sets get a prettified id, not the raw one", () =>
   assertEquals(badgeLabel("constructor"), "Constructor");
 });
 
-Deno.test("decorateBadge: art supplies the urls and Twitch's title", () => {
+Deno.test("decorateBadge: art supplies the urls and Twitch's title; the short label stays", () => {
   const mod = decorateBadge(
     { id: "moderator", label: "Mod", version: "1" },
     art("Moderator"),
   );
   assertEquals(mod, {
     id: "moderator", // the bare set id survives: the page keys colours on it
-    label: "Moderator",
+    label: "Mod", // the chip text if the art fails to load
     version: "1",
     url: "https://example.test/Moderator/1",
     url2x: "https://example.test/Moderator/2",
     url4x: "https://example.test/Moderator/3",
+    title: "Moderator",
   });
 });
 
 Deno.test("decorateBadge: sub/founder titles gain the exact months", () => {
   const sub = decorateBadge(
+    { id: "subscriber", label: "T3 Sub · 14 mo", version: "3012", info: "14" },
+    art("Subscriber"),
+  );
+  assertEquals(sub.title, "Subscriber (14 months)");
+  assertEquals(sub.label, "T3 Sub · 14 mo"); // the chip keeps the tier
+  const year = decorateBadge(
     { id: "subscriber", label: "Sub · 14 mo", version: "12", info: "14" },
     art("1-Year Subscriber"),
   );
-  assertEquals(sub.label, "1-Year Subscriber (14 months)");
+  assertEquals(year.title, "1-Year Subscriber (14 months)");
   const one = decorateBadge(
-    { id: "founder", label: "Founder", version: "0", info: "1" },
+    { id: "founder", label: "Founder · 1 mo", version: "0", info: "1" },
     art("Founder"),
   );
-  assertEquals(one.label, "Founder (1 month)");
+  assertEquals(one.title, "Founder (1 month)");
   // Prediction info isn't a month count.
   const pred = decorateBadge(
     { id: "predictions", label: "Predictions", info: "Blue" },
     art("Blue 1"),
   );
-  assertEquals(pred.label, "Blue 1");
+  assertEquals(pred.title, "Blue 1");
+  assertEquals(pred.label, "Predictions");
 });
 
-Deno.test("decorateBadge: no art leaves the badge as is; an untitled art keeps the label", () => {
+Deno.test("decorateBadge: no art leaves the badge as is; an untitled art adds no title", () => {
   const b = { id: "x", label: "X" };
   assertEquals(decorateBadge(b, undefined), b);
-  assertEquals(decorateBadge(b, { ...art("ignored"), title: "" }).label, "X");
+  const untitled = decorateBadge(b, { ...art("ignored"), title: "" });
+  assertEquals(untitled.label, "X");
+  assertEquals(untitled.title, undefined);
+  assertEquals(untitled.url, "https://example.test/ignored/1");
 });

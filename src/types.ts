@@ -12,9 +12,13 @@ export interface Badge {
   /** The bare badge set id ("moderator", "subscriber", "member", …). The page
    *  keys its chip colours on it, so it never carries the version. */
   id: string;
-  /** Short human text: the chip text, and the image's alt/tooltip once art
-   *  is resolved (then Twitch's own title, e.g. "Moderator"). */
+  /** Short chip text ("Mod", "T2 Sub · 14 mo", "Bits 1000"): the chip drawn
+   *  when there is no art or the art fails to load, so it stays terse. */
   label: string;
+  /** Twitch's own title for the resolved art, with the exact months for a
+   *  subscriber/founder badge ("Subscriber (14 months)"): the image's alt and
+   *  tooltip. Absent when there is no art or Twitch gave it no title. */
+  title?: string;
   /** Twitch badge version from the `badges` tag, e.g. "3012" for a Tier 3
    *  12-month subscriber badge or "1000" for bits. */
   version?: string;

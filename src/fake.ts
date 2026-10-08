@@ -316,6 +316,7 @@ function parseBadges(x: unknown): Badge[] | undefined {
     };
     if (typeof b.version === "string") badge.version = b.version;
     if (typeof b.info === "string") badge.info = b.info;
+    if (typeof b.title === "string") badge.title = b.title;
     // Image URLs land in <img src> for every viewer: https only.
     for (const k of ["url", "url2x", "url4x"] as const) {
       const u = b[k];

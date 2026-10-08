@@ -359,12 +359,13 @@ Deno.test("parseFakeAction: badge art/version/info pass through, https only", ()
         badges: [
           {
             id: "subscriber",
-            label: "Subscriber (14 months)",
+            label: "Sub · 14 mo",
             version: "12",
             info: "14",
             url: "https://cdn.test/1",
             url2x: "https://cdn.test/2",
             url4x: "https://cdn.test/3",
+            title: "Subscriber (14 months)",
           },
           {
             id: "vip",
@@ -373,6 +374,7 @@ Deno.test("parseFakeAction: badge art/version/info pass through, https only", ()
             url: "http://cdn.test/1", // not https → dropped
             url2x: "javascript:alert(1)",
             url4x: 7,
+            title: ["VIP"], // not a string → dropped
           },
         ],
       },
@@ -382,9 +384,10 @@ Deno.test("parseFakeAction: badge art/version/info pass through, https only", ()
   assertEquals(r.action.data.badges, [
     {
       id: "subscriber",
-      label: "Subscriber (14 months)",
+      label: "Sub · 14 mo",
       version: "12",
       info: "14",
+      title: "Subscriber (14 months)",
       url: "https://cdn.test/1",
       url2x: "https://cdn.test/2",
       url4x: "https://cdn.test/3",
@@ -412,9 +415,11 @@ Deno.test("demoActions: Twitch demo badges carry real badge art", () => {
     );
     assert(b.url2x && b.url4x, `demo badge ${b.id} lacks 2x/4x art`);
   }
-  // The subscriber badge shows the exact months from badge-info.
+  // The subscriber badge's title shows the exact months from badge-info; its
+  // label stays the short chip text.
   const sub = badges.find((b) => b.id === "subscriber" && b.info === "14");
-  assertEquals(sub?.label, "Subscriber (14 months)");
+  assertEquals(sub?.title, "Subscriber (14 months)");
+  assertEquals(sub?.label, "Sub · 14 mo");
 });
 
 Deno.test("describeFakeAction: one-line summaries per action", () => {

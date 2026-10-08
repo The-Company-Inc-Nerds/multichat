@@ -77,9 +77,11 @@ function nearestLower(
 /**
  * The art to show for one badge, or undefined (render the text chip). Order:
  * the channel's exact version; for subscriber only, the channel's nearest
- * lower version in the same tier (a channel's own sub art beats Twitch's
- * generic star); the global exact version, live Helix data before the
- * snapshot; for bits, the channel's nearest lower version only after that,
+ * lower version in the same tier, then — for a Tier 2/3 badge — the same
+ * months in the channel's Tier 1 art, which is what Twitch shows when a
+ * channel didn't upload tier-specific badges (a channel's own sub art beats
+ * Twitch's generic star); the global exact version, live Helix data before
+ * the snapshot; for bits, the channel's nearest lower version only after that,
  * since Twitch shows its global gem for any tier the channel didn't customise;
  * then, for subscriber/founder, the generic global version 0.
  */
@@ -95,6 +97,11 @@ export function resolveBadgeArt(
   if (set === "subscriber") {
     const lower = nearestLower(channel, set, version);
     if (lower) return lower;
+    const v = numericVersion(version);
+    if (v !== null && v >= 2000) {
+      const tier1 = nearestLower(channel, set, String(v % 1000));
+      if (tier1) return tier1;
+    }
   }
   const g = global?.get(key) ?? snapshotArt(set, version);
   if (g) return g;
@@ -159,18 +166,23 @@ export function badgeLabel(set: string, version = "", info?: string): string {
 
 /**
  * Attach resolved art to a parsed badge: the image URLs, and Twitch's own
- * title as the label (the image's alt/tooltip), with the exact months for a
- * subscriber/founder badge — "3-Month Subscriber (14 months)". No art = the
- * badge unchanged (it renders as its text chip).
+ * title as `title` (the image's alt/tooltip), with the exact months for a
+ * subscriber/founder badge — "3-Month Subscriber (14 months)". `label` keeps
+ * the short badgeLabel text, which is what the page's chip shows if the art
+ * fails to load. No art = the badge unchanged (it renders as its text chip).
  */
 export function decorateBadge(b: Badge, art?: BadgeArt): Badge {
   if (!art) return b;
-  let label = art.title || b.label;
-  const months = b.id === "subscriber" || b.id === "founder"
-    ? monthCount(b.info)
-    : 0;
-  if (months) label += ` (${months} month${months === 1 ? "" : "s"})`;
-  return { ...b, label, url: art.url, url2x: art.url2x, url4x: art.url4x };
+  const out: Badge = { ...b, url: art.url, url2x: art.url2x, url4x: art.url4x };
+  if (art.title) {
+    const months = b.id === "subscriber" || b.id === "founder"
+      ? monthCount(b.info)
+      : 0;
+    out.title = months
+      ? `${art.title} (${months} month${months === 1 ? "" : "s"})`
+      : art.title;
+  }
+  return out;
 }
 
 /** Where twitch.ts looks badge art up. `resolve` must be synchronous and must

@@ -38,22 +38,27 @@ readable.
 Twitch badges render as Twitch's own badge images, before the author name and
 in the head of highlighted event rows that carry them (cheers, subs, raids and
 announcements arriving over IRC; EventSub events have no badges). Hovering a
-badge shows its Twitch title, and a subscriber badge also shows the exact months
-from Twitch's `badge-info` (e.g. "1-Year Subscriber (14 months)"). Images come
-from `static-cdn.jtvnw.net` at 1x/2x/4x, so they stay sharp in the larger
-`/overlay`.
+badge shows Twitch's title for it, and a subscriber badge also shows the exact
+months from Twitch's `badge-info`: a 14-month sub reads "Subscriber (14
+months)" out of the box, or the channel's own title, such as "1-Year Subscriber
+(14 months)", once app credentials load its badge art. Images come from
+`static-cdn.jtvnw.net` at 1x/2x/4x: dense screens pick the larger art, and the
+bigger `/alerts` cards start on the 2x art, so badges stay sharp in OBS.
 
 - **Global badges** (moderator, VIP, broadcaster, verified, Prime, Turbo, the
   standard bits and subscriber badges, …) work out of the box, from a built-in
   copy of Twitch's global badge list.
 - **The channel's own subscriber and bits badges** need Twitch app credentials,
-  since Twitch only hands them out to an authenticated app. See
-  [Badge images](configuration.md#badge-images).
+  since Twitch only hands them out to an authenticated app. As on Twitch, a
+  Tier 2/3 sub in a channel with no art for that tier gets its Tier 1 badge.
+  See [Badge images](configuration.md#badge-images).
 
-A badge with no image (an unknown one, or art that fails to load) falls back to
-a small colored text chip: `Mod`, `VIP`, `T2 Sub · 14 mo`, `Bits 1000`, and so
-on. YouTube badges are always chips, because the YouTube API reports only
-yes/no flags with no badge art.
+A badge with no image (one Twitch's badge lists don't cover) or whose image
+fails to load (a blocked CDN, a retired image) falls back to a small colored
+text chip with a short label: `Mod`, `VIP`, `T2 Sub · 14 mo`, `Bits 1000`, and
+so on. Hovering the chip still shows Twitch's title when there was one. YouTube
+badges are always chips, because the YouTube API reports only yes/no flags with
+no badge art.
 
 ## Author colors
 

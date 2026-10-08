@@ -194,11 +194,16 @@ const HTML = `<!DOCTYPE html>
     .role.turbo     { background: #59399a; color: #fff; }
 
     /* Twitch badge art (a badge with a url). Sized in px to match the 18px 1x
-       image; the srcset supplies the 2x/4x art for dense screens and the
-       larger OBS sizes. Not .badge — that's the T/YT platform chip. */
+       image; the srcset's x-descriptors only cover dense screens (OBS is 1x),
+       so badgeImg starts the ~27px alert-card badge on the 36px art itself.
+       Twitch's art is square, so aspect-ratio reserves a square box until the
+       image loads (then its own ratio applies): a late badge can't widen, and
+       re-wrap, an already-pinned row. Not .badge — that's the T/YT platform
+       chip. */
     .tbadge {
       height: 18px;
       width: auto;
+      aspect-ratio: auto 1 / 1;
       flex-shrink: 0;
       align-self: center;
     }
@@ -680,29 +685,49 @@ const HTML = `<!DOCTYPE html>
                        'founder','member','verified','partner','staff','admin','global_mod',
                        'premium','turbo'];
 
+    // The short label is the chip text; Twitch's title (when the art had one)
+    // is the fuller hover text.
     function roleChip(b) {
       var cls = ROLE_COLORS.indexOf(b.id) !== -1 ? 'role ' + b.id : 'role';
       var chip = make('span', cls, b.label);
-      chip.title = b.label;
+      chip.title = b.title || b.label;
       return chip;
     }
 
-    // Twitch badge art at 1x/2x/4x, labelled for hover and screen readers.
+    // Twitch badge art at 1x/2x/4x, titled for hover and screen readers.
     function badgeImg(b) {
       var img = document.createElement('img');
       img.className = 'tbadge';
-      img.src = b.url;
-      var set = [b.url + ' 1x'];
-      if (b.url2x) set.push(b.url2x + ' 2x');
-      if (b.url4x) set.push(b.url4x + ' 4x');
-      img.srcset = set.join(', ');
-      img.alt = b.label;
-      img.title = b.label;
-      img.decoding = 'async';
+      // .tbadge reserves a square box up front; should the art (or the chip
+      // that replaces it) still change the row's height, keep a pinned feed
+      // on its newest row.
+      img.onload = function() {
+        if (pinned) scrollToNewest();
+      };
       // Art that won't load (a retired image, a blocked CDN) becomes the chip.
       img.onerror = function() {
-        if (img.parentNode) img.parentNode.replaceChild(roleChip(b), img);
+        if (!img.parentNode) return;
+        img.parentNode.replaceChild(roleChip(b), img);
+        if (pinned) scrollToNewest();
       };
+      // x-descriptors pick by device pixel ratio only, and OBS renders at 1x:
+      // the alert card draws badges at ~27px (0.9em of 30px), so it starts one
+      // step up on the 36px art; elsewhere the 18px art is drawn at ~18px.
+      var set;
+      if (alertsMode && b.url2x) {
+        img.src = b.url2x;
+        set = [b.url2x + ' 1x'];
+        if (b.url4x) set.push(b.url4x + ' 2x');
+      } else {
+        img.src = b.url;
+        set = [b.url + ' 1x'];
+        if (b.url2x) set.push(b.url2x + ' 2x');
+        if (b.url4x) set.push(b.url4x + ' 4x');
+      }
+      img.srcset = set.join(', ');
+      img.alt = b.title || b.label;
+      img.title = b.title || b.label;
+      img.decoding = 'async';
       return img;
     }
 

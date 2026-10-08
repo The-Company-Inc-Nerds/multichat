@@ -154,13 +154,15 @@ Deno.test("handleCommand: PRIVMSG badges are decorated by the BadgeSource, by ro
     "12",
   ]]);
   const [mod, sub] = e.captured.messages[0].badges ?? [];
+  // Art: Twitch's title for hover; the short label stays the fallback chip.
   assertEquals(mod, {
     id: "moderator",
-    label: "Moderator",
+    label: "Mod",
     version: "1",
     url: "https://cdn.test/mod/1",
     url2x: "https://cdn.test/mod/2",
     url4x: "https://cdn.test/mod/3",
+    title: "Moderator",
   });
   // No art: the text chip, labelled from the version + badge-info.
   assertEquals(sub, {
