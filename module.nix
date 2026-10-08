@@ -261,7 +261,7 @@ in
       type = lib.types.listOf lib.types.str;
       default = [ ];
       example = lib.literalExpression ''[ "streamer1" "streamer2" ]'';
-      description = "Twitch channel names (lowercase) to monitor. Chat works anonymously.";
+      description = "Twitch channel names to monitor (case and a leading # don't matter). Chat works anonymously.";
     };
 
     twitch.eventsub.clientId = lib.mkOption {
@@ -269,8 +269,10 @@ in
       default = "";
       description = ''
         Twitch application Client ID for EventSub alerts (follows, cheers, subs,
-        raids). Not a secret. Leave empty (and channels empty) to disable EventSub
-        and run Twitch chat anonymously.
+        raids). Not a secret. Together with clientSecretFile it also shows the
+        channel's own sub/bits badge art in chat, even with no EventSub channels
+        (global badges render without it). Leave empty (and channels empty) to
+        disable EventSub and run Twitch chat anonymously.
       '';
     };
 

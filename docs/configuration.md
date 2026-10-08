@@ -317,7 +317,9 @@ YouTube API poller and need nothing extra here. (YouTube has no "follow" event.)
    **Register Your Application**.
 2. Set an **OAuth Redirect URL** of `http://localhost:3000` (the default used by
    `multichat login`; pass `--redirect-port` to change it).
-3. Note the **Client ID** and generate a **Client Secret**.
+3. Pick the **Confidential** client type (a Public client has no secret, and
+   both the login flow and badge art need one), then note the **Client ID** and
+   generate a **Client Secret**.
 
 ### 2. Authorize each channel with `multichat login`
 
@@ -1037,7 +1039,10 @@ and the end of a stream is noticed minutes late, so set `budgetHours` to your
 real daily streaming time to keep chat responsive. The ledger is saved to
 `youtube-quota.json` in the [state directory](#state-directory) (at most every
 30 seconds, and on shutdown), so a restart doesn't forget what today has
-already cost.
+already cost. It also remembers a `quotaExceeded` from Google until midnight
+Pacific; if Google grants more quota mid-day, raise `dailyQuota`, delete
+`youtube-quota.json` (under NixOS `/var/lib/private/multichat/`) and restart
+the service to resume at once.
 
 | Setting       | Default | Effect                                                                    |
 | ------------- | ------- | ------------------------------------------------------------------------- |

@@ -117,10 +117,10 @@ Deno.test("resolveBadgeArt: Tier 2/3 subs fall back to the channel's Tier 1 art"
     resolveBadgeArt("subscriber", "2003", late)?.url,
     snapshotArt("subscriber", "0")?.url,
   );
-  // A Tier 1 badge with nothing at or below in the channel: the global one.
+  // A Tier 1 badge with nothing at or below in the channel: the generic one.
   assertEquals(
     resolveBadgeArt("subscriber", "3", late)?.url,
-    snapshotArt("subscriber", "3")?.url,
+    snapshotArt("subscriber", "0")?.url,
   );
 });
 
@@ -136,10 +136,20 @@ Deno.test("resolveBadgeArt: generic subscriber/founder fallback, Helix before sn
     resolveBadgeArt("founder", "7")?.url,
     snapshotArt("founder", "0")?.url,
   );
-  // The global set's own low sub versions resolve exactly.
+  // Global sub versions number Twitch's default art in sequence, not by
+  // months ("subscriber/4" is the 6-month badge), so an IRC month version is
+  // never looked up there: with no channel art every sub gets the generic one.
+  for (const months of ["3", "4", "6", "12", "24"]) {
+    assertEquals(
+      resolveBadgeArt("subscriber", months)?.url,
+      snapshotArt("subscriber", "0")?.url,
+    );
+  }
+  // The same holds for Helix's live global list.
+  const helixSeq = new Map([["subscriber/4", art("helix-6mo")]]);
   assertEquals(
-    resolveBadgeArt("subscriber", "3")?.url,
-    snapshotArt("subscriber", "3")?.url,
+    resolveBadgeArt("subscriber", "4", undefined, helixSeq)?.url,
+    snapshotArt("subscriber", "0")?.url,
   );
 });
 

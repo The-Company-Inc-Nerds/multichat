@@ -670,6 +670,13 @@ const HTML = `<!DOCTYPE html>
             img.alt = s.alt;
             img.title = s.alt;
             img.loading = 'lazy';
+            // An unreachable CDN would leave a broken-image icon: show the
+            // emote's code as text instead, like a badge falls back to a chip.
+            img.onerror = function() {
+              if (this.parentNode) {
+                this.parentNode.replaceChild(document.createTextNode(this.alt), this);
+              }
+            };
             el.appendChild(img);
           } else {
             el.appendChild(document.createTextNode(s.text));

@@ -81,9 +81,12 @@ function nearestLower(
  * months in the channel's Tier 1 art, which is what Twitch shows when a
  * channel didn't upload tier-specific badges (a channel's own sub art beats
  * Twitch's generic star); the global exact version, live Helix data before
- * the snapshot; for bits, the channel's nearest lower version only after that,
- * since Twitch shows its global gem for any tier the channel didn't customise;
- * then, for subscriber/founder, the generic global version 0.
+ * the snapshot — except for subscriber, whose global versions number Twitch's
+ * default art in sequence rather than by months (global "subscriber/4" is the
+ * 6-month badge), so an IRC month version must not be looked up there; for
+ * bits, the channel's nearest lower version only after that, since Twitch
+ * shows its global gem for any tier the channel didn't customise; then, for
+ * subscriber/founder, the generic global version 0.
  */
 export function resolveBadgeArt(
   set: string,
@@ -103,7 +106,9 @@ export function resolveBadgeArt(
       if (tier1) return tier1;
     }
   }
-  const g = global?.get(key) ?? snapshotArt(set, version);
+  const g = set === "subscriber"
+    ? undefined
+    : global?.get(key) ?? snapshotArt(set, version);
   if (g) return g;
   if (set === "bits") return nearestLower(channel, set, version);
   if (set === "subscriber" || set === "founder") {
