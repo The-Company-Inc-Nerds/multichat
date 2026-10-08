@@ -7,7 +7,7 @@ broadcaster, which pushes events to connected browsers over Server-Sent Events.
 
 | File                   | Responsibility                                                                                                                                                                                     |
 | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `main.ts`              | Entry point — loads settings, creates the server, starts the platform clients, owns the runtime-key + EventSub managers and the CLI subcommands                                                    |
+| `main.ts`              | Entry point — loads settings, creates the server, starts the platform clients, owns the runtime-key manager (shared YouTube runtime + quota ledger), the Twitch badge manager, the EventSub manager and the CLI subcommands |
 | `src/types.ts`         | Shared interfaces: `Settings`, `ChatMessage`, `ServerEvent`, `Emitter`, `ChannelStatus`, `TwitchEventSubConfig`, EventSub frames                                                                   |
 | `src/twitch.ts`        | Twitch IRC over WebSocket (`wss://irc-ws.chat.twitch.tv`), with reconnect; suppresses events for EventSub-covered channels; decorates badges with art via a `BadgeSource`                            |
 | `src/eventsub.ts`      | Twitch EventSub over WebSocket (`wss://eventsub.wss.twitch.tv`) — follow/cheer/sub/raid; pure mappers + socket client                                                                              |
@@ -57,7 +57,11 @@ with image URLs by an optional `BadgeSource`, keyed by the message's `room-id`
 `createTwitchBadgeManager` is that source: without Twitch app credentials it
 serves the built-in snapshot of global badges; with them it mints an app token
 (client-credentials grant) and loads Helix global badges plus each room's custom
-sub/bits badges as ROOMSTATE announces the room. `resolve` is synchronous and
+sub/bits badges as ROOMSTATE announces the room. A Tier 2/3 subscriber badge
+with no art in its own tier uses the channel's Tier 1 art for the same months,
+as Twitch does. `decorateBadge` keeps the short `badgeLabel` text in `label`
+(the page's fallback chip) and puts Twitch's title in `title` (the image's
+alt/tooltip). `resolve` is synchronous and
 never throws, so badge loading can't stall or drop chat.
 
 When a channel is configured for EventSub, `handleCommand` is passed an
@@ -87,13 +91,17 @@ ledger + per-channel caches) that outlives key changes. Discovery checks the
 channel's uploads playlist + `videos.list` every 3 minutes (about 2 units);
 `search.list` is only a rationed fallback because its bucket is 100 calls a day.
 Once a live video with an `activeLiveChatId` is found, the loop polls
-`liveChat/messages` at the larger of the API's suggested interval and the quota
-governor's floor. `emitItem` maps each `snippet.type` to a `ChatMessage` (text,
+`liveChat/messages` at the larger of the API's suggested interval (capped at
+60s) and the quota governor's floor (which may stretch it up to 10 minutes). `emitItem` maps each `snippet.type` to a `ChatMessage` (text,
 Super Chat, Super Sticker, membership) or a delete. The chat loop ends — and
 discovery resumes 30 seconds later, to catch a restarted stream — on
 `liveChatEnded`/`liveChatNotFound`, a confirmed `offlineAt`, a `chatEndedEvent`,
 or the periodic `videos.list` check. Page tokens and a seen-id set survive
-re-attaches, so a re-attach neither replays nor duplicates chat. See
+re-attaches, so a re-attach neither replays nor duplicates chat. While catching
+up — any attach, a page-token reset, or an unplanned gap of more than 5 minutes
+— items older than 5 minutes are flagged `backlog`. A key or project rejection
+mid-chat shows `error` and keeps the chat's page token, so a new key resumes it
+at once. See
 [Reliability & limits](#reliability--limits) for the quota handling.
 
 ## Design notes
@@ -135,10 +143,15 @@ Tuned for unattended multi-hour streams:
   a spent daily pool (`quotaExceeded`) parks the channel until midnight Pacific,
   a spent search bucket (`429 … Search Queries per day`) only stops searching
   until then, "polled too fast" (`rateLimitExceeded`) waits briefly on the same
-  page token, and transient failures back off 5s→60s. A per-Pacific-day ledger
-  (persisted as `youtube-quota.json`) estimates spend and stretches the chat
-  poll interval so a `youtube.budgetHours` stream fits `youtube.dailyQuota`.
-  Every request is time-boxed (15s) and the key is redacted from logs. See
+  page token, and transient failures back off 5s→60s, for chat polls and
+  discovery checks alike (`error` only after 3 in a row). A per-Pacific-day
+  ledger (persisted as `youtube-quota.json`) estimates spend and stretches the
+  chat poll interval — holding back ≈40 units/h of discovery per watched
+  channel, and slowing to as much as 10 minutes between polls past the budget
+  rather than exhausting the pool — so a `youtube.budgetHours` stream fits
+  `youtube.dailyQuota`. Every request is time-boxed (15s) and the key is
+  redacted from logs, including network-error text that quotes the request
+  URL. See
   [Configuration → Quota and long streams](../configuration.md#quota-and-long-streams).
 - **SSE client cap.** `/events` is capped at 50 concurrent connections (returns
   `503` beyond that) so an exposed port can't be flooded with open streams.

@@ -124,7 +124,10 @@ Copy `settings.json.example` to `settings.json` and edit:
   least one field per entry
 - `youtube.dailyQuota` / `youtube.budgetHours` — optional quota pacing (default
   10000 units/day, 4 live hours/day): the chat poll interval is stretched so a
-  `budgetHours` stream fits what's left of the Pacific day's quota
+  `budgetHours` stream fits what's left of the Pacific day's quota; past
+  `budgetHours` the quota floor keeps stretching polling (YouTube's own interval
+  is capped at 60s, the floor at 10 min) instead of exhausting the pool — set
+  `budgetHours` to the real daily stream length for responsiveness
 - `alerts` — optional `{activeTheme, themes}` registry that skins the `/alerts`
   overlay (built-in styles `default` / `company-memo`); unset = default look.
   Under `company-memo`, three kinds get stamped Company documents: subs =
@@ -210,7 +213,8 @@ stickers/memberships need only the API key). Full reference:
 main.ts          entry point — loads settings, wires the emitter to server + clients;
                  also the `set-youtube-key` / `login` / `fake` / `giveaway` / `rewards` CLI
                  subcommands + the runtime-key manager (owns one YouTube runtime across key
-                 changes: quota ledger persisted to youtube-quota.json, throttled, reset when the
+                 changes: quota ledger persisted to youtube-quota.json (stale temp files swept
+                 before it loads), throttled, reset when the
                  key's fingerprint changes), the Twitch badge manager (createTwitchBadgeManager:
                  a BadgeSource — snapshot-only without app creds; with them a lazily minted
                  client-credentials app token, Helix global badges refreshed daily and each
@@ -237,10 +241,11 @@ main.ts          entry point — loads settings, wires the emitter to server + c
                  every EventSub session and every 5 min; auto-pause from GET /effects/health
                  every 15s with 2-check hysteresis on accepting && ready; a loud log every 5 min
                  while the channel's token never arrived; state files written atomically (tmp +
-                 fsync + rename), flushed on SIGTERM/SIGINT, a corrupt one moved aside loudly;
+                 fsync + rename; leftover temp files swept at init by the shared
+                 sweepStaleTmp), flushed on SIGTERM/SIGINT, a corrupt one moved aside loudly;
                  all outbound calls time-boxed)
 src/types.ts     shared TypeScript interfaces (Settings, ChatMessage w/ SubDetail + backlog flag,
-                 Badge w/ version/info/url/url2x/url4x, ServerEvent, Emitter, TwitchConfig.app,
+                 Badge w/ version/info/title/url/url2x/url4x, ServerEvent, Emitter, TwitchConfig.app,
                  TwitchEventSubConfig, EventSub frames, GiveawayConfig/State/Entrant/
                  CampaignState/CampaignSummary/Winner/Draw/Turn/Disposition/Plan, TermsAcceptance,
                  TurnAggregates, IntegrationsConfig/Subscriber, PackReport, ChannelPointsConfig/
@@ -254,9 +259,11 @@ src/twitch.ts    Twitch IRC over WebSocket (wss://irc-ws.chat.twitch.tv), with r
                  room-id (Shared Chat: source-badges vs source-room-id; ROOMSTATE → noteRoom);
                  parseBadges keeps version + badge-info; normalizeChannels for settings
 src/badges.ts    pure badge-art helpers: BadgeArt/BadgeArtMap, resolveBadgeArt (channel exact →
-                 channel nearest-lower sub tier → Helix global → snapshot → generic
-                 subscriber/founder), badgeLabel (short chip text), decorateBadge, the
-                 BadgeSource interface + SNAPSHOT_BADGES
+                 channel nearest-lower sub in the same tier → the channel's Tier 1 art for a
+                 Tier 2/3 sub → Helix global → snapshot → channel nearest-lower bits →
+                 generic subscriber/founder), badgeLabel (short chip text, kept as
+                 Badge.label), decorateBadge (adds url/url2x/url4x + Twitch's title as
+                 Badge.title), the BadgeSource interface + SNAPSHOT_BADGES
 src/twitchbadges.ts generated snapshot of Twitch's global chat badges (set/version → CDN uuid +
                  title); regenerate with tools/gen-global-badges.ts; live Helix data wins
 src/eventsub.ts  Twitch EventSub over WebSocket (wss://eventsub.wss.twitch.tv) — the source
@@ -283,11 +290,18 @@ src/youtube.ts   YouTube Data API v3 polling, quota-aware: live detection from t
                  playlist + videos.list (~2 units/check every 3 min) with a rationed search.list
                  fallback (daily cap + spacing, parked until Pacific midnight on its 429);
                  classifyYtError/ytFetch (JSON error reasons → quotaDaily/searchQuota/
-                 rateLimited/chatEnded/badPageToken/denied/transient; time-boxed, key redacted);
-                 the per-Pacific-day quota ledger + poll-interval governor (pollFloorMs);
+                 rateLimited/chatEnded/badPageToken/denied/transient; time-boxed, key
+                 redacted from URLs and error text by redactKey); the per-Pacific-day quota
+                 ledger + poll-interval governor (pollFloorMs holds back ≈40 units/h of
+                 discovery per watched channel; governedIntervalMs caps the API's ask at
+                 60s but lets the quota floor stretch to MAX_GOVERNED_POLL_MS = 10 min);
                  the chat loop ends on liveChatEnded/offlineAt/chatEndedEvent/periodic
-                 videos.list check and rediscovers; seen-id dedupe + page tokens survive
-                 re-attaches, history on attach is flagged backlog. createYouTubeRuntime
+                 videos.list check and rediscovers; a key/project rejection mid-chat is an
+                 `error` on the 10-min retry that keeps the chat's page token, so a new key
+                 resumes at once; discovery rides out transient failures (5s→60s back-off,
+                 `error` after 3 in a row); seen-id dedupe + page tokens survive
+                 re-attaches; while catching up (any attach, a pageTokenInvalid reset, an
+                 unplanned gap > 5 min) items older than 5 min are flagged backlog. createYouTubeRuntime
                  (injectable clock/sleep/fetch for the scenario tests) is shared across poller
                  generations; startYouTubePoller takes an AbortSignal so it can be torn down
 src/server.ts    Deno.serve HTTP server: GET / + GET /overlay + GET /alerts + GET /giveaway

@@ -191,8 +191,10 @@ getting the pair.
 With credentials, the server fetches Twitch's live global badge list (refreshed
 daily; it wins over the built-in copy) and each joined channel's custom badges
 (refreshed every 6 hours), and logs `[Badges] room <id>: N custom badge
-version(s)` once per channel. Without them it logs one line at startup saying
-so, and a custom subscriber badge shows Twitch's generic one instead. A failed
+version(s)` once per channel. A Tier 2/3 sub in a channel that uploaded only
+Tier 1 badges shows that Tier 1 badge, as on Twitch. Without credentials it
+logs one line at startup saying so, and a custom subscriber badge shows
+Twitch's generic one instead. A failed
 fetch keeps the last good list and is retried after 5 minutes; chat is never
 held up by it. The images themselves are loaded by the browser straight from
 `static-cdn.jtvnw.net`.
@@ -689,7 +691,7 @@ These override their `settings.json` counterparts at startup:
 | `HOST`                 | `server.host`                                            |
 | `YOUTUBE_API_KEY`      | the startup YouTube key (below a persisted runtime key)  |
 | `TWITCH_CLIENT_SECRET` | `twitch.eventsub.clientSecret`                           |
-| `TWITCH_CLIENT_ID`     | `twitch.eventsub.clientId` (read by `multichat login`)   |
+| `TWITCH_CLIENT_ID`     | `twitch.eventsub.clientId` when that's empty (badge art), and `multichat login` |
 | `STATE_DIRECTORY`      | directory all persistent state is written to (systemd)   |
 | `MULTICHAT_STATE_DIR`  | the same, outside systemd (see [State directory](#state-directory)) |
 | `MULTICHAT_CONTROL_ACCESS` | `server.controlAccess` |
