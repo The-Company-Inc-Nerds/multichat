@@ -87,8 +87,9 @@ export interface ChatMessage {
   /** Structured sub detail (tier + new/resub/gift) for `kind: "sub"` rows. */
   sub?: SubDetail;
   timestamp: number;
-  /** History replayed when the poller (re)attached — render it, but overlays
-   *  shouldn't pop an alert for it. Absent on live messages. */
+  /** History older than 5 minutes that YouTube returns while the poller is
+   *  catching up — a fresh attach, a resume after a gap, or a page-token
+   *  reset; render it, overlays shouldn't alert on it. Absent otherwise. */
   backlog?: boolean;
 }
 

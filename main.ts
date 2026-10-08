@@ -383,6 +383,29 @@ async function persistStateAtomic(path: string, value: string): Promise<void> {
   }
 }
 
+/** Remove the temp files an interrupted persistStateAtomic of any of `paths`
+ *  left beside it (a SIGKILL or power loss between open and rename). Best
+ *  effort; each owner calls it once, before its first write, so a temp file
+ *  a live writer is still using can't be swept. */
+async function sweepStaleTmp(paths: (string | null)[]): Promise<void> {
+  const byDir = new Map<string, string[]>();
+  for (const p of paths) {
+    if (!p) continue;
+    const i = p.lastIndexOf("/");
+    const dir = i > 0 ? p.slice(0, i) : i === 0 ? "/" : ".";
+    byDir.set(dir, [...(byDir.get(dir) ?? []), p.slice(i + 1)]);
+  }
+  for (const [dir, bases] of byDir) {
+    try {
+      for await (const ent of Deno.readDir(dir)) {
+        if (ent.isFile && bases.some((b) => isStaleStateTmp(ent.name, b))) {
+          await Deno.remove(`${dir}/${ent.name}`).catch(() => {});
+        }
+      }
+    } catch { /* best-effort */ }
+  }
+}
+
 /** Best-effort append one line to a state file (0600) — the winners JSONL.
  *  Append-only means a crash can corrupt at most the trailing line. */
 async function appendState(path: string, line: string): Promise<void> {
@@ -425,12 +448,14 @@ function createYouTubeKeyManager(opts: {
 
   // Load (once) the persisted ledger and build the shared runtime. Writes are
   // throttled to one per YT_QUOTA_PERSIST_MS, serialized, atomic, and flushed
-  // on SIGTERM/SIGINT. A missing/unreadable file just starts today at zero.
+  // on SIGTERM/SIGINT. A missing/unreadable file just starts today at zero;
+  // temp files an interrupted write left behind are swept first.
   function getRuntime(): Promise<YouTubeRuntime> {
     runtime ??= (async () => {
       const path = opts.quota?.statePath ?? null;
       let snapshot: unknown;
       if (path) {
+        await sweepStaleTmp([path]);
         try {
           snapshot = JSON.parse(await Deno.readTextFile(path));
         } catch (e) {
@@ -1884,26 +1909,10 @@ function createChannelPointsEngine(opts: {
     return { kind: "corrupt" };
   }
 
-  /** Remove temp files an interrupted atomic write left in the state dir. */
-  async function sweepStaleTmp(): Promise<void> {
-    const dir = opts.stateDir;
-    const bases = [ledgerPath, rewardsPath, controlPath]
-      .filter((p): p is string => !!p)
-      .map((p) => p.slice(p.lastIndexOf("/") + 1));
-    if (!dir || bases.length === 0) return;
-    try {
-      for await (const ent of Deno.readDir(dir)) {
-        if (ent.isFile && bases.some((b) => isStaleStateTmp(ent.name, b))) {
-          await Deno.remove(`${dir}/${ent.name}`).catch(() => {});
-        }
-      }
-    } catch { /* best-effort */ }
-  }
-
   /** Restore the ledger, reward map and manual pause. A corrupt file is moved
    *  aside and reported with what starting without it means. */
   async function init(): Promise<void> {
-    await sweepStaleTmp();
+    await sweepStaleTmp([ledgerPath, rewardsPath, controlPath]);
     const isObject = (v: unknown) =>
       typeof v === "object" && v !== null && !Array.isArray(v);
     if (ledgerPath) {

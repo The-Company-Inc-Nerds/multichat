@@ -400,8 +400,11 @@ in
       example = 6;
       description = ''
         Hours of YouTube live chat per (Pacific) day the remaining quota is spread
-        over. Longer means slower polling (fewer units per hour); streaming past it
-        keeps working, just more slowly. Clamped to 0.5..24.
+        over. Longer means slower polling (fewer units per hour). YouTube's own
+        suggested interval is capped at 60s, but past budgetHours the quota floor
+        stretches polling up to 10 minutes between polls, so streaming past it
+        keeps working, just more slowly; set it to your real daily stream length
+        to keep chat responsive. Clamped to 0.5..24.
       '';
     };
 

@@ -23,8 +23,9 @@ const BASE = "https://www.googleapis.com/youtube/v3";
  *  the method; the long-standing community figure is 5, so plan for that (read
  *  the real figure off Cloud Console → Quotas if it matters). */
 export const LIVE_CALL_COST = 5;
-/** Units held back per remaining hour of the Pacific day for discovery — an
- *  offline check every DISCOVERY_TICK_MS costs ≈2, so ≈40/hour. */
+/** Units held back per watched channel and remaining hour of the Pacific day
+ *  for discovery — an offline check every DISCOVERY_TICK_MS costs ≈2, so ≈40
+ *  an hour per channel. */
 export const DISCOVERY_UNITS_PER_HOUR = 40;
 /** search.list calls per Pacific day the fallback may make (the bucket is 100;
  *  the rest is headroom for restarts and other tools on the project). */
@@ -44,15 +45,22 @@ export const LIVE_VERIFY_MS = 10 * 60_000;
 export const FETCH_TIMEOUT_MS = 15_000;
 /** Message ids remembered per channel, so a re-attach doesn't replay rows. */
 export const SEEN_MAX = 5000;
-/** On a fresh attach, first-page items older than this are history (backlog). */
+/** While catching up on a chat, items older than this are history (backlog);
+ *  an unplanned gap this long between good polls means catching up again. */
 export const BACKLOG_WINDOW_MS = 5 * 60_000;
+/** Longest gap between chat polls once the quota floor takes over (YouTube's
+ *  own suggestion is capped at 60s): at 10 min a chat costs ≈30 units/h, plus
+ *  ≈6/h verifying it, under the 40/h discovery reserve released toward
+ *  midnight — so a stream past budgetHours slows down instead of running the
+ *  pool dry. */
+export const MAX_GOVERNED_POLL_MS = 10 * 60_000;
 
 const HOUR_MS = 3_600_000;
 const DAY_MS = 24 * HOUR_MS;
 const UNIT_COST = 1; // channels / playlistItems / videos .list
 const DEFAULT_POLL_MS = 5_000; // when the API gives no pollingIntervalMillis
 const MIN_POLL_MS = 1_000;
-const MAX_POLL_MS = 60_000;
+const MAX_POLL_MS = 60_000; // ceiling for YouTube's own pollingIntervalMillis
 const MIN_PLANNED_LIVE_MS = 30 * 60_000;
 const UPCOMING_SOON_MS = 15 * 60_000;
 const UPCOMING_OVERDUE_MS = 2 * HOUR_MS;
@@ -60,7 +68,7 @@ const ERROR_RETRY_MS = 60_000;
 const DENIED_RETRY_MS = 10 * 60_000;
 const TRANSIENT_BASE_MS = 5_000;
 const TRANSIENT_MAX_MS = 60_000;
-const TRANSIENT_ERROR_AFTER = 3; // failed chat polls in a row before "error"
+const TRANSIENT_ERROR_AFTER = 3; // failed polls / checks in a row → "error"
 const RATE_LIMIT_MIN_MS = 10_000;
 const OFFLINE_POLL_MIN_MS = 10_000; // poll floor while offlineAt is set
 const OFFLINE_VERIFY_EVERY_MS = 60_000;
@@ -266,6 +274,23 @@ export function redactUrl(url: string): string {
   }
 }
 
+/**
+ * Free text (a thrown fetch error, an unexpected exception) as it may be
+ * logged: every `key=` parameter is masked, and so is the literal `key`
+ * wherever else it appears — Deno's fetch errors embed the whole request URL,
+ * sometimes re-encoded, so matching the URL verbatim isn't enough.
+ */
+export function redactKey(text: string, key = ""): string {
+  const out = text.replace(/([?&])key=[^&\s)]*/g, "$1key=…");
+  return key ? out.split(key).join("…") : out;
+}
+
+/** The `key` query parameter of a request URL ("" when it has none). */
+function keyParam(url: string): string {
+  const q = url.indexOf("?");
+  return q < 0 ? "" : new URLSearchParams(url.slice(q + 1)).get("key") ?? "";
+}
+
 export type FetchFn = (url: string, init?: RequestInit) => Promise<Response>;
 export type LogFn = (line: string, level?: "info" | "error") => void;
 
@@ -277,7 +302,8 @@ const defaultLog: LogFn = (line, level) =>
  * failure. Every request is time-boxed (FETCH_TIMEOUT_MS) and tied to the
  * poller generation's `signal`, so neither a hung connection nor a torn-down
  * generation can stall or outlive the loop. A failure is logged once, with
- * the key stripped from the URL; nothing is logged for an aborted request.
+ * the key stripped from the URL and the message (see redactKey); nothing is
+ * logged for an aborted request.
  */
 export async function ytFetch<T>(
   url: string,
@@ -312,7 +338,10 @@ export async function ytFetch<T>(
     kind: c.kind,
     status,
     reason: netError ? (timeout.aborted ? "timeout" : "network") : c.reason,
-    message: netError || c.message.replace(/<[^>]*>/g, "").slice(0, 300),
+    message: redactKey(
+      netError || c.message.replace(/<[^>]*>/g, "").slice(0, 300),
+      keyParam(url),
+    ),
   };
   if (!signal?.aborted) {
     log(
@@ -435,16 +464,19 @@ export function normalizeQuotaSnapshot(
  * The slowest-allowed chat poll interval that still lets the rest of today's
  * budgeted live time fit in what's left of the quota:
  *
- *   remainingForChat   = dailyQuota − unitsSpent − 40 × hoursUntilMidnightPT
+ *   remainingForChat   = dailyQuota − unitsSpent
+ *                          − 40 × watchedChannels × hoursUntilMidnightPT
  *   plannedRemainingMs = max(budgetHours·1h − liveMsToday, 30 min)
  *   floor = LIVE_CALL_COST × plannedRemainingMs
  *             / max(remainingForChat / activeChats, LIVE_CALL_COST)
  *
  * i.e. spread each chat's share of the units evenly over the hours still
- * planned. A fresh 10,000-unit day with a 4h budget gives ≈8s; going past the
- * budget keeps stretching (30 min is always assumed left) instead of
- * exhausting the pool; a bigger dailyQuota shrinks it towards the API's own
- * pollingIntervalMillis.
+ * planned, after holding back each watched channel's discovery for the rest
+ * of the day (`watching`, default 1). A fresh 10,000-unit day with a 4h
+ * budget and one channel gives ≈8s; going past the budget keeps stretching
+ * (30 min is always assumed left; governedIntervalMs caps it at
+ * MAX_GOVERNED_POLL_MS) instead of exhausting the pool; a bigger dailyQuota
+ * shrinks it towards the API's own pollingIntervalMillis.
  */
 export function pollFloorMs(o: {
   dailyQuota: number;
@@ -453,8 +485,10 @@ export function pollFloorMs(o: {
   liveMsToday: number;
   msUntilMidnight: number;
   activeChats: number;
+  watching?: number;
 }): number {
-  const reserve = DISCOVERY_UNITS_PER_HOUR * (o.msUntilMidnight / HOUR_MS);
+  const reserve = DISCOVERY_UNITS_PER_HOUR * Math.max(1, o.watching ?? 1) *
+    (o.msUntilMidnight / HOUR_MS);
   const remainingForChat = o.dailyQuota - o.unitsSpent - reserve;
   const plannedRemainingMs = Math.max(
     o.budgetHours * HOUR_MS - o.liveMsToday,
@@ -468,13 +502,17 @@ export function pollFloorMs(o: {
 }
 
 /** The interval actually slept between chat polls: never faster than the API
- *  asks (pollingIntervalMillis) or than the quota floor, kept in 1s..60s. */
+ *  asks (pollingIntervalMillis, itself kept in 1s..60s) or than the quota
+ *  floor, which may stretch it past 60s up to MAX_GOVERNED_POLL_MS. */
 export function governedIntervalMs(
   pollingIntervalMillis: number | undefined,
   floorMs: number,
 ): number {
-  const asked = pollingIntervalMillis ?? DEFAULT_POLL_MS;
-  return Math.min(Math.max(asked, floorMs, MIN_POLL_MS), MAX_POLL_MS);
+  const asked = Math.min(
+    Math.max(pollingIntervalMillis ?? DEFAULT_POLL_MS, MIN_POLL_MS),
+    MAX_POLL_MS,
+  );
+  return Math.min(Math.max(asked, floorMs), MAX_GOVERNED_POLL_MS);
 }
 
 /** Minimum gap before the next search: the day's remaining searches spread
@@ -511,9 +549,12 @@ export interface QuotaLedger {
   markExhausted(): boolean;
   addLiveMs(ms: number): void;
   searchAllowed(): boolean;
+  /** The governed chat interval with `chats` live and `watching` channels
+   *  watched in all (each needs its discovery reserve; default 1). */
   pollIntervalMs(
     pollingIntervalMillis: number | undefined,
     chats: number,
+    watching?: number,
   ): number;
   /** Record which key is spending. A different key than the stored one may
    *  belong to another Google project, so today restarts from zero (→ true). */
@@ -579,7 +620,7 @@ export function createQuotaLedger(opts: {
       changed();
     },
     searchAllowed: () => searchGateOpen(cur(), now()),
-    pollIntervalMs(pollingIntervalMillis, chats) {
+    pollIntervalMs(pollingIntervalMillis, chats, watching = 1) {
       const s = cur();
       const floor = pollFloorMs({
         dailyQuota,
@@ -588,6 +629,7 @@ export function createQuotaLedger(opts: {
         liveMsToday: s.liveMs,
         msUntilMidnight: msUntilPacificMidnight(now()),
         activeChats: chats,
+        watching,
       });
       return governedIntervalMs(pollingIntervalMillis, floor);
     },
@@ -667,8 +709,8 @@ export function buildBadges(a: ChatItem["authorDetails"]): Badge[] {
   return out;
 }
 
-/** `opts.backlog` flags history replayed on (re)attach: rendered as usual,
- *  but the /alerts overlay won't pop it (see ChatMessage.backlog). */
+/** `opts.backlog` flags history fetched while catching up on a chat: rendered
+ *  as usual, but the /alerts overlay won't pop it (see ChatMessage.backlog). */
 export function emitItem(
   item: ChatItem,
   channel: string,
@@ -770,8 +812,9 @@ export function rememberId(
 
 /**
  * One page of chat → the items to emit: ids already seen (a re-attach, a
- * dropped page token) are skipped, and when `backlogBefore` is set (the first
- * page of a fresh attach) items published before it are flagged as backlog.
+ * dropped page token) are skipped, and when `backlogBefore` is set (the poller
+ * is catching up — see pollChat) items published before it are flagged as
+ * backlog.
  */
 export function freshItems(
   items: ChatItem[],
@@ -860,15 +903,21 @@ export interface ChannelCache {
 export type SleepFn = (ms: number, signal?: AbortSignal) => Promise<void>;
 
 // Abortable sleep: resolves early (does not reject) when the signal fires, so a
-// poll loop parked in a backoff wakes immediately when its key is replaced.
+// poll loop parked in a backoff wakes immediately when its key is replaced. A
+// timer that fires normally takes its abort listener with it — a generation's
+// signal can live for months, and must not collect one listener per poll.
 const sleep: SleepFn = (ms, signal) =>
   new Promise<void>((resolve) => {
     if (signal?.aborted) return resolve();
-    const t = setTimeout(resolve, ms);
-    signal?.addEventListener("abort", () => {
+    const onAbort = () => {
       clearTimeout(t);
       resolve();
-    }, { once: true });
+    };
+    const t = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 
 export interface YouTubeRuntime {
@@ -1238,11 +1287,12 @@ function rememberToken(cache: ChannelCache, chatId: string, token: string) {
 
 type ChatEnd =
   | { why: "ended"; detail: string }
+  | { why: "denied"; failure: YtFailure }
   | { why: "quota" }
   | { why: "aborted" };
 
-/** Poll one live chat until it ends, quota runs out, or the generation is
- *  torn down. */
+/** Poll one live chat until it ends, quota runs out, the key is refused, or
+ *  the generation is torn down. */
 async function pollChat(
   ctx: ChannelCtx,
   videoId: string,
@@ -1252,11 +1302,13 @@ async function pollChat(
   const { rt, cache, signal } = ctx;
   let token = cache.pageTokens.get(chatId);
   const attachedAt = rt.now();
-  // A fresh attach replays recent history on its first page: render it, but
-  // flag what's older than the window so overlays don't re-alert it.
-  let backlogBefore: number | null = token
-    ? null
-    : attachedAt - BACKLOG_WINDOW_MS;
+  // Catching up: a fresh attach makes YouTube replay recent history, and a
+  // resume (after a quota park, a key change, a rejected page token or a long
+  // outage) returns everything since. Render it all, but while catching up
+  // flag what's older than the window so overlays don't re-alert it; a page
+  // with nothing that old on it means the poller has caught up.
+  let catchingUp = true;
+  let lastOkAt = attachedAt;
   let lastVerify = attachedAt;
   let lastOfflineCheck = -Infinity;
   let lastTick = attachedAt;
@@ -1294,18 +1346,24 @@ async function pollChat(
       if (!res.ok) {
         switch (res.kind) {
           case "chatEnded":
-          case "denied":
             forgetChat(cache, chatId, rt.now());
             return {
               why: "ended",
               detail: `${res.status || ""} ${res.reason}`.trim(),
             };
+          case "denied":
+            // A key or project problem, not the end of the chat: keep its page
+            // token and don't mark it dead, so a fixed key re-attaches at once
+            // and resumes where this one stopped.
+            return { why: "denied", failure: res };
           case "quotaDaily":
             return { why: "quota" };
           case "badPageToken":
-            // Start over without it; the seen set absorbs the replay.
+            // Start over without it: the seen set absorbs the replay, and
+            // what's new in it but old is history.
             cache.pageTokens.delete(chatId);
             token = undefined;
+            catchingUp = true;
             await rt.sleep(interval, signal);
             continue;
           case "rateLimited":
@@ -1331,18 +1389,25 @@ async function pollChat(
       backoff = TRANSIENT_BASE_MS;
 
       const page = res.data;
+      const items = page.items ?? [];
+      const okAt = rt.now();
+      // More than the window beyond the planned sleep since the last good
+      // page (failures, waits): what this page holds may be old. Measured
+      // past `interval`, so a quota-stretched poll isn't mistaken for a gap.
+      if (okAt - lastOkAt - interval > BACKLOG_WINDOW_MS) catchingUp = true;
+      lastOkAt = okAt;
+      const cutoff = catchingUp ? okAt - BACKLOG_WINDOW_MS : null;
       let ended = false;
-      for (
-        const { item, backlog } of freshItems(
-          page.items ?? [],
-          cache.seen,
-          backlogBefore,
-        )
-      ) {
+      for (const { item, backlog } of freshItems(items, cache.seen, cutoff)) {
         emitItem(item, ctx.label, ctx.emitter, { backlog });
         if (item.snippet?.type === "chatEndedEvent") ended = true;
       }
-      backlogBefore = null;
+      if (cutoff !== null) {
+        // Seen ids count too: a page of old duplicates is still history.
+        catchingUp = items.some((it) =>
+          Date.parse(it?.snippet?.publishedAt ?? "") < cutoff
+        );
+      }
       if (page.nextPageToken) {
         token = page.nextPageToken;
         rememberToken(cache, chatId, token);
@@ -1355,6 +1420,7 @@ async function pollChat(
       interval = rt.ledger.pollIntervalMs(
         page.pollingIntervalMillis,
         rt.active.size,
+        rt.channels.size, // every watched channel needs discovery units
       );
       const now = rt.now();
       let verify = now - lastVerify >= LIVE_VERIFY_MS;
@@ -1421,6 +1487,10 @@ export async function pollYouTubeChannel(
     status,
   };
 
+  // Transient discovery failures in a row, and the back-off before the next.
+  let failures = 0;
+  let backoff = TRANSIENT_BASE_MS;
+
   status("connecting", "looking for a live stream");
   while (!signal?.aborted) {
     let wait: number;
@@ -1445,15 +1515,27 @@ export async function pollYouTubeChannel(
 
       const d = await discover(ctx);
       if (signal?.aborted) break;
+      if (d.kind !== "failed") {
+        failures = 0;
+        backoff = TRANSIENT_BASE_MS;
+      }
       if (d.kind === "live") {
         const end = await pollChat(ctx, d.videoId, d.chatId, d.via);
         if (signal?.aborted || end.why === "aborted") break;
         if (end.why === "quota") continue;
-        status(
-          "offline",
-          `live chat ended (${end.detail}) — rechecking in 30s`,
-        );
-        wait = RESTART_RECHECK_MS;
+        if (end.why === "denied") {
+          status(
+            "error",
+            `liveChatMessages.list failed (${end.failure.reason}: ${end.failure.message}) — retrying in 10m`,
+          );
+          wait = DENIED_RETRY_MS;
+        } else {
+          status(
+            "offline",
+            `live chat ended (${end.detail}) — rechecking in 30s`,
+          );
+          wait = RESTART_RECHECK_MS;
+        }
       } else if (d.kind === "offline") {
         status(
           "offline",
@@ -1462,18 +1544,30 @@ export async function pollYouTubeChannel(
         wait = d.soon ? UPCOMING_TICK_MS : DISCOVERY_TICK_MS;
       } else {
         if (d.failure.kind === "quotaDaily") continue;
-        const denied = d.failure.kind === "denied";
-        wait = denied ? DENIED_RETRY_MS : ERROR_RETRY_MS;
-        status(
-          "error",
-          `${d.step} failed (${d.failure.reason}: ${d.failure.message}) — ` +
-            `retrying in ${denied ? "10m" : "60s"}`,
-        );
+        const what =
+          `${d.step} failed (${d.failure.reason}: ${d.failure.message})`;
+        if (d.failure.kind === "denied") {
+          wait = DENIED_RETRY_MS;
+          status("error", `${what} — retrying in 10m`);
+        } else {
+          // A blip (5xx, timeout, network, rate limit): retry with back-off,
+          // and only turn the dot red once it keeps failing.
+          wait = backoff;
+          backoff = Math.min(backoff * 2, TRANSIENT_MAX_MS);
+          if (++failures >= TRANSIENT_ERROR_AFTER) {
+            status(
+              "error",
+              `${what} — ${failures} checks failed in a row, retrying in ${
+                wait / 1000
+              }s`,
+            );
+          }
+        }
       }
     } catch (e) {
       // A bug must not end the poller for good: report it and retry.
       if (signal?.aborted) break;
-      status("error", `unexpected error: ${e}`);
+      status("error", `unexpected error: ${redactKey(String(e), key)}`);
       wait = ERROR_RETRY_MS;
     }
     await rt.sleep(wait, signal);
