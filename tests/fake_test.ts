@@ -348,6 +348,75 @@ Deno.test("parseFakeAction: keeps valid segments and badges, drops junk", () => 
   ]);
 });
 
+Deno.test("parseFakeAction: badge art/version/info pass through, https only", () => {
+  const r = parseFakeAction(
+    JSON.stringify({
+      action: "message",
+      data: {
+        platform: "twitch",
+        channel: "c",
+        author: "A",
+        badges: [
+          {
+            id: "subscriber",
+            label: "Subscriber (14 months)",
+            version: "12",
+            info: "14",
+            url: "https://cdn.test/1",
+            url2x: "https://cdn.test/2",
+            url4x: "https://cdn.test/3",
+          },
+          {
+            id: "vip",
+            label: "VIP",
+            version: 1, // not a string → dropped
+            url: "http://cdn.test/1", // not https → dropped
+            url2x: "javascript:alert(1)",
+            url4x: 7,
+          },
+        ],
+      },
+    }),
+  );
+  assert(r.ok && r.action.action === "message");
+  assertEquals(r.action.data.badges, [
+    {
+      id: "subscriber",
+      label: "Subscriber (14 months)",
+      version: "12",
+      info: "14",
+      url: "https://cdn.test/1",
+      url2x: "https://cdn.test/2",
+      url4x: "https://cdn.test/3",
+    },
+    { id: "vip", label: "VIP" },
+  ]);
+});
+
+Deno.test("demoActions: Twitch demo badges carry real badge art", () => {
+  const badges = demoActions(0).flatMap((a) =>
+    a.action === "message" && a.data.platform === "twitch"
+      ? a.data.badges ?? []
+      : []
+  );
+  const ids = new Set(badges.map((b) => b.id));
+  for (
+    const id of ["moderator", "subscriber", "vip", "broadcaster", "partner"]
+  ) {
+    assert(ids.has(id), `demo is missing a ${id} badge`);
+  }
+  for (const b of badges) {
+    assert(
+      b.url?.startsWith("https://static-cdn.jtvnw.net/badges/v1/"),
+      `demo badge ${b.id} has no art`,
+    );
+    assert(b.url2x && b.url4x, `demo badge ${b.id} lacks 2x/4x art`);
+  }
+  // The subscriber badge shows the exact months from badge-info.
+  const sub = badges.find((b) => b.id === "subscriber" && b.info === "14");
+  assertEquals(sub?.label, "Subscriber (14 months)");
+});
+
 Deno.test("describeFakeAction: one-line summaries per action", () => {
   const [twStatus] = demoActions(0);
   assert(describeFakeAction(twStatus).startsWith("set twitch"));

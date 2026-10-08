@@ -133,13 +133,17 @@ covered; a custom `MULTICHAT_STATE_DIR` needs adding to those flags.
 
 | Field      | Type     | Description                                                                                            |
 | ---------- | -------- | ------------------------------------------------------------------------------------------------------ |
-| `channels` | string[] | Lowercase Twitch channel names to read chat from. Anonymous read-only access — no credentials needed   |
+| `channels` | string[] | Twitch channel names to read chat from (case-insensitive). Anonymous read-only — no credentials needed |
 | `eventsub` | object   | Optional. Enables follow/cheer/sub/raid **alerts** via Twitch EventSub (see below). Omit for chat-only |
 
 Chat (`twitch.channels`) works anonymously with no credentials. Shoutout
 **alerts** (follows, cheers/bits, subs, gifts, resubs, raids) need
 `twitch.eventsub`, because those events are not available on the anonymous IRC
 connection.
+
+Channel names are matched the way Twitch reports them: `"TheCompanyInc"`,
+`"thecompanyinc"` and `"#thecompanyinc"` all mean the same channel, and
+duplicates are dropped.
 
 ### `twitch.eventsub`
 
@@ -163,6 +167,35 @@ Each `twitch.eventsub.channels` entry:
 | `broadcasterId` | Optional. The numeric user id — supply it to skip the one-time login→id lookup               |
 
 See [Twitch EventSub alerts](#twitch-eventsub-alerts) below for the full setup.
+
+### Badge images
+
+Twitch chat badges render as Twitch's own badge images. The global ones
+(moderator, VIP, broadcaster, verified, Prime, the standard subscriber and bits
+badges, …) work with no configuration at all, from a copy of Twitch's global
+badge list built into multichat.
+
+The channel's **own** subscriber and bits badges are only handed out by
+Twitch's API to a registered application, so they need your Twitch app's
+**Client ID and Client Secret** — nothing more. No `multichat login`, no
+broadcaster token and no `twitch.eventsub.channels` entry are needed: set
+`twitch.eventsub.clientId` + `twitch.eventsub.clientSecret` (the `channels`
+list may be empty or absent), or the `TWITCH_CLIENT_ID` /
+`TWITCH_CLIENT_SECRET` environment variables. The secret follows the same
+precedence as for EventSub (`TWITCH_CLIENT_SECRET` wins over the file). Under
+NixOS, `services.multichat.twitch.eventsub.clientId` plus
+`twitch.eventsub.clientSecretFile` already suffice, even with no EventSub
+channels. See [Create a Twitch application](#1-create-a-twitch-application) for
+getting the pair.
+
+With credentials, the server fetches Twitch's live global badge list (refreshed
+daily; it wins over the built-in copy) and each joined channel's custom badges
+(refreshed every 6 hours), and logs `[Badges] room <id>: N custom badge
+version(s)` once per channel. Without them it logs one line at startup saying
+so, and a custom subscriber badge shows Twitch's generic one instead. A failed
+fetch keeps the last good list and is retried after 5 minutes; chat is never
+held up by it. The images themselves are loaded by the browser straight from
+`static-cdn.jtvnw.net`.
 
 ## `youtube`
 

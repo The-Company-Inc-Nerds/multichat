@@ -440,12 +440,20 @@ are optional.
 | `timestamp`   | number                  | Epoch milliseconds                                                                                                |
 | `authorColor` | string?                 | CSS color; derived from the name if the platform gives none                                                       |
 | `segments`    | Segment[]?              | Tokenized body: `{type:"text",text}` or `{type:"emote",url,alt}`                                                  |
-| `badges`      | Badge[]?                | Role chips: `{id,label}`                                                                                          |
+| `badges`      | Badge[]?                | Badges: `{id,label,version?,info?,url?,url2x?,url4x?}`; `url*` = Twitch badge art (1x/2x/4x), else a chip         |
 | `kind`        | MessageKind?            | `chat` (default), `action`, `cheer`, `sub`, `raid`, `follow`, `superchat`, `supersticker`, `membership`, `system` |
 | `amount`      | string?                 | e.g. `"500 bits"`, `"$5.00"`                                                                                      |
 | `quantity`    | number?                 | Numeric twin of `amount` where themed cards need it (cheer bits, raid viewers)                                    |
 | `accentColor` | string?                 | Highlight color for event rows / tiers                                                                            |
 | `eventText`   | string?                 | Notice line for event rows, e.g. "X subscribed for 3 months"                                                      |
 | `sub`         | object?                 | Structured detail for `kind: "sub"`: `{tier?: 1\|2\|3, variant: "new"\|"resub"\|"gift", count?}` (alert themes key off it; `tier` absent = unknown) |
+
+A `Badge`'s `id` is the bare set id (`moderator`, `subscriber`, `member`, …)
+and `label` is short human text. Twitch badges also carry `version` (e.g.
+`"3012"`, a Tier 3 12-month subscriber badge) and `info` (the unescaped
+`badge-info` value, e.g. the exact months `"14"`). When the server resolved art
+for the badge, `url` / `url2x` / `url4x` are its 18/36/72px images and `label`
+is Twitch's title for it (e.g. `"Moderator"`); otherwise the page draws a text
+chip. YouTube badges are `{id,label}` only.
 
 See [Chat Features](features.md) for how these fields are rendered.

@@ -28,12 +28,30 @@ readable.
 
 ## Role badges
 
-| Platform | Badges                                                                        |
-| -------- | ----------------------------------------------------------------------------- |
-| Twitch   | broadcaster, moderator, VIP, subscriber, founder, staff, turbo, prime/partner |
-| YouTube  | owner, moderator, member, verified                                            |
+| Platform | Badges                                                              |
+| -------- | ------------------------------------------------------------------- |
+| Twitch   | every badge Twitch sends: broadcaster, moderator, VIP, sub, bits, … |
+| YouTube  | owner, moderator, member, verified                                  |
 
-Badges render as small colored chips before the author name.
+Twitch badges render as Twitch's own badge images, before the author name and
+in the head of highlighted event rows that carry them (cheers, subs, raids and
+announcements arriving over IRC; EventSub events have no badges). Hovering a
+badge shows its Twitch title, and a subscriber badge also shows the exact months
+from Twitch's `badge-info` (e.g. "1-Year Subscriber (14 months)"). Images come
+from `static-cdn.jtvnw.net` at 1x/2x/4x, so they stay sharp in the larger
+`/overlay`.
+
+- **Global badges** (moderator, VIP, broadcaster, verified, Prime, Turbo, the
+  standard bits and subscriber badges, …) work out of the box, from a built-in
+  copy of Twitch's global badge list.
+- **The channel's own subscriber and bits badges** need Twitch app credentials,
+  since Twitch only hands them out to an authenticated app. See
+  [Badge images](configuration.md#badge-images).
+
+A badge with no image (an unknown one, or art that fails to load) falls back to
+a small colored text chip: `Mod`, `VIP`, `T2 Sub · 14 mo`, `Bits 1000`, and so
+on. YouTube badges are always chips, because the YouTube API reports only
+yes/no flags with no badge art.
 
 ## Author colors
 

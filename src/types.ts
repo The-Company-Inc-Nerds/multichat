@@ -9,8 +9,24 @@ export interface ChannelStatus {
 }
 
 export interface Badge {
+  /** The bare badge set id ("moderator", "subscriber", "member", …). The page
+   *  keys its chip colours on it, so it never carries the version. */
   id: string;
+  /** Short human text: the chip text, and the image's alt/tooltip once art
+   *  is resolved (then Twitch's own title, e.g. "Moderator"). */
   label: string;
+  /** Twitch badge version from the `badges` tag, e.g. "3012" for a Tier 3
+   *  12-month subscriber badge or "1000" for bits. */
+  version?: string;
+  /** The unescaped `badge-info` value for this set, e.g. the exact months
+   *  subscribed ("14") or a prediction outcome. */
+  info?: string;
+  /** Badge image (18px, https); absent = render the text chip. */
+  url?: string;
+  /** The same image at 2x (36px). */
+  url2x?: string;
+  /** The same image at 4x (72px). */
+  url4x?: string;
 }
 
 export type Segment =
@@ -121,6 +137,11 @@ export interface TwitchEventSubConfig {
 export interface TwitchConfig {
   channels: string[];
   eventsub?: TwitchEventSubConfig;
+  /** The Twitch application's credentials, for app-token Helix reads (badge
+   *  art). Taken from twitch.eventsub.clientId/clientSecret even when eventsub
+   *  has no channels, or from TWITCH_CLIENT_ID/TWITCH_CLIENT_SECRET; absent =
+   *  global badges come from the built-in snapshot only. */
+  app?: { clientId: string; clientSecret: string };
 }
 
 // ---- Twitch EventSub WebSocket frames (only the fields we read) ----------

@@ -6,6 +6,7 @@ import type {
   SubDetail,
   TwitchConfig,
 } from "./types.ts";
+import { badgeLabel, type BadgeSource, decorateBadge } from "./badges.ts";
 
 export function parseTags(raw: string): Record<string, string> {
   const tags: Record<string, string> = {};
@@ -69,27 +70,84 @@ export function parseIRC(line: string): IRCLine | null {
   return { tags, prefix, command, params };
 }
 
-const BADGE_LABELS: Record<string, string> = {
-  broadcaster: "Broadcaster",
-  moderator: "Mod",
-  vip: "VIP",
-  subscriber: "Sub",
-  founder: "Founder",
-  staff: "Staff",
-  admin: "Admin",
-  global_mod: "Global Mod",
-  turbo: "Turbo",
-  premium: "Prime",
-  partner: "Verified",
-};
+// Twitch writes a comma inside a badge-info value (a prediction outcome) as
+// U+2E1D, since a real comma separates the entries.
+const BADGE_INFO_COMMA = /\u2E1D/g;
 
-export function parseBadges(tag: string): Badge[] {
+/** `badge-info` ("subscriber/14,predictions/Blue") → set id → unescaped value. */
+function parseBadgeInfo(tag: string): Map<string, string> {
+  const info = new Map<string, string>();
+  for (const part of tag ? tag.split(",") : []) {
+    const slash = part.indexOf("/");
+    if (slash <= 0) continue;
+    info.set(
+      part.slice(0, slash),
+      unescapeTag(part.slice(slash + 1)).replace(BADGE_INFO_COMMA, ","),
+    );
+  }
+  return info;
+}
+
+/** Parse a `badges` tag ("moderator/1,subscriber/3012") with its `badge-info`
+ *  twin. `id` stays the bare set id (the page keys chip colours on it); the
+ *  version and info ride along for art lookup and the label. */
+export function parseBadges(tag: string, infoTag = ""): Badge[] {
   if (!tag) return [];
+  const info = parseBadgeInfo(infoTag);
   const out: Badge[] = [];
   for (const part of tag.split(",")) {
-    const id = part.split("/")[0];
+    const slash = part.indexOf("/");
+    const id = slash === -1 ? part : part.slice(0, slash);
     if (!id) continue;
-    out.push({ id, label: BADGE_LABELS[id] ?? id });
+    const version = slash === -1 ? "" : part.slice(slash + 1);
+    const extra = info.get(id) ?? "";
+    const badge: Badge = { id, label: badgeLabel(id, version, extra) };
+    if (version) badge.version = version;
+    if (extra) badge.info = extra;
+    out.push(badge);
+  }
+  return out;
+}
+
+/**
+ * The badges to show for a PRIVMSG/USERNOTICE, with art from `source` when
+ * given. A Twitch Shared Chat message relayed from another channel carries
+ * that channel's badges in `source-badges`, so those are shown — resolved
+ * against the source room's custom art — instead of this room's.
+ */
+function messageBadges(
+  tags: Record<string, string>,
+  source?: BadgeSource,
+): Badge[] {
+  const roomId = tags["room-id"] || undefined;
+  const sourceRoom = tags["source-room-id"];
+  const shared = !!sourceRoom && sourceRoom !== roomId &&
+    "source-badges" in tags;
+  const badges = shared
+    ? parseBadges(tags["source-badges"], tags["source-badge-info"] ?? "")
+    : parseBadges(tags["badges"] ?? "", tags["badge-info"] ?? "");
+  if (!source) return badges;
+  const room = shared ? sourceRoom : roomId;
+  return badges.map((b) => {
+    try {
+      return decorateBadge(b, source.resolve(room, b.id, b.version ?? ""));
+    } catch {
+      return b; // art is cosmetic: a resolver bug must never drop a message
+    }
+  });
+}
+
+/** Twitch channel names as IRC knows them: trimmed, without a leading "#",
+ *  lowercased, empties and non-strings dropped, deduped in order. IRC reports
+ *  every channel by its lowercase login, so a configured "TheCompanyInc" would
+ *  otherwise seed a sidebar entry no status ever reaches. */
+export function normalizeChannels(raw: unknown): string[] {
+  const list = Array.isArray(raw) ? raw : typeof raw === "string" ? [raw] : [];
+  const out: string[] = [];
+  for (const c of list) {
+    if (typeof c !== "string") continue;
+    const name = c.trim().replace(/^#+/, "").trim().toLowerCase();
+    if (name && !out.includes(name)) out.push(name);
   }
   return out;
 }
@@ -219,6 +277,7 @@ async function connectOnce(
   emitter: Emitter,
   isCovered?: CoveredPredicate,
   onMessage?: ChatMessageHandler,
+  badges?: BadgeSource,
 ): Promise<void> {
   const nick = `justinfan${10000 + Math.floor(Math.random() * 89999)}`;
   const ws = new WebSocket("wss://irc-ws.chat.twitch.tv");
@@ -275,7 +334,9 @@ async function connectOnce(
         }
 
         // PING/RECONNECT need the socket; everything else is emitter-only and unit-testable.
-        if (handleCommand(msg, emitter, isCovered, onMessage)) continue;
+        if (handleCommand(msg, emitter, isCovered, onMessage, badges)) {
+          continue;
+        }
       }
     };
     ws.onclose = () => fail(new Error("closed"));
@@ -290,18 +351,28 @@ export function handleCommand(
   emitter: Emitter,
   isCovered?: CoveredPredicate,
   onMessage?: ChatMessageHandler,
+  badges?: BadgeSource,
 ): boolean {
   const channel = (msg.params[0] ?? "").replace(/^#/, "");
   switch (msg.command) {
     // Twitch emits one ROOMSTATE per channel right after we join — use it as "joined".
-    case "ROOMSTATE":
+    // Its room-id is the broadcaster id the channel's custom badge art is
+    // fetched by, so the badge source hears it before the first message.
+    case "ROOMSTATE": {
+      const roomId = msg.tags["room-id"];
+      if (roomId) {
+        try {
+          badges?.noteRoom?.(roomId);
+        } catch { /* badge art is cosmetic; never block the join */ }
+      }
       if (channel) emitter.status("twitch", channel, "live");
       return true;
+    }
     case "PRIVMSG":
-      handlePrivmsg(msg, emitter, isCovered, onMessage);
+      handlePrivmsg(msg, emitter, isCovered, onMessage, badges);
       return true;
     case "USERNOTICE":
-      handleUsernotice(msg, emitter, isCovered);
+      handleUsernotice(msg, emitter, isCovered, badges);
       return true;
     case "CLEARMSG": {
       const messageId = msg.tags["target-msg-id"];
@@ -324,11 +395,12 @@ export function handlePrivmsg(
   emitter: Emitter,
   isCovered?: CoveredPredicate,
   onMessage?: ChatMessageHandler,
+  badgeSource?: BadgeSource,
 ): void {
   const channel = (msg.params[0] ?? "").replace(/^#/, "");
   let content = msg.params[1] ?? "";
   const author = msg.tags["display-name"] || msg.prefix.split("!")[0] || "anon";
-  const badges = parseBadges(msg.tags["badges"] ?? "");
+  const badges = messageBadges(msg.tags, badgeSource);
 
   let kind: MessageKind = "chat";
 
@@ -390,6 +462,7 @@ export function handleUsernotice(
   msg: IRCLine,
   emitter: Emitter,
   isCovered?: CoveredPredicate,
+  badgeSource?: BadgeSource,
 ): void {
   const channel = (msg.params[0] ?? "").replace(/^#/, "");
   const author = msg.tags["display-name"] || msg.tags["login"] || "anon";
@@ -457,7 +530,7 @@ export function handleUsernotice(
   const segments = userComment
     ? buildSegments(userComment, msg.tags["emotes"] ?? "")
     : undefined;
-  const badges = parseBadges(msg.tags["badges"] ?? "");
+  const badges = messageBadges(msg.tags, badgeSource);
 
   emitter.message({
     id: msg.tags["id"] || `twitch-un-${Date.now()}-${Math.random()}`,
@@ -483,6 +556,7 @@ export function startTwitchClient(
   emitter: Emitter,
   isCovered?: CoveredPredicate,
   onMessage?: ChatMessageHandler,
+  badges?: BadgeSource,
 ): void {
   const delays = [2_000, 4_000, 8_000, 16_000, 30_000];
   let attempt = 0;
@@ -495,7 +569,13 @@ export function startTwitchClient(
         for (const ch of config.channels) {
           emitter.status("twitch", ch, "connecting");
         }
-        await connectOnce(config.channels, emitter, isCovered, onMessage);
+        await connectOnce(
+          config.channels,
+          emitter,
+          isCovered,
+          onMessage,
+          badges,
+        );
       } catch (err) {
         for (const ch of config.channels) emitter.status("twitch", ch, "error");
         // A connection that stayed up a while is a fresh failure, not a flaky endpoint —

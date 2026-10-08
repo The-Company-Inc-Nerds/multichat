@@ -22,7 +22,11 @@ import type {
   TwitchEventSubConfig,
   YouTubeChannelConfig,
 } from "./src/types.ts";
-import { startTwitchClient, type TwitchChatMessage } from "./src/twitch.ts";
+import {
+  normalizeChannels,
+  startTwitchClient,
+  type TwitchChatMessage,
+} from "./src/twitch.ts";
 import { startYouTubePoller } from "./src/youtube.ts";
 import { createServer } from "./src/server.ts";
 import { normalizeAlertsConfig } from "./src/alerts.ts";
@@ -38,8 +42,11 @@ import {
   buildAuthCodeRequest,
   buildAuthorizeUrl,
   buildCheckFollowRequest,
+  buildClientCredentialsRequest,
   buildCreateCustomRewardRequest,
+  buildGetChannelChatBadgesRequest,
   buildGetCustomRewardsRequest,
+  buildGetGlobalChatBadgesRequest,
   buildGetRedemptionsRequest,
   buildRefreshRequest,
   buildSendChatMessageRequest,
@@ -50,6 +57,8 @@ import {
   type HelixResult,
   type HttpRequest,
   LOGIN_SCOPES,
+  parseAppTokenResponse,
+  parseChatBadgesResponse,
   parseCustomRewardsResponse,
   parseFollowersResponse,
   parseHelixResponse,
@@ -57,8 +66,15 @@ import {
   parseTokenResponse,
   parseUsersResponse,
   REDEMPTIONS_MANAGE_SCOPE,
+  resolveAppCredentials,
   type SubscriptionFeature,
 } from "./src/twitchauth.ts";
+import {
+  type BadgeArt,
+  type BadgeSource,
+  resolveBadgeArt,
+  SNAPSHOT_BADGES,
+} from "./src/badges.ts";
 import {
   admitRedemption,
   applyChannelPointsEnv,
@@ -244,8 +260,13 @@ async function loadSettings(path: string): Promise<Settings> {
         raw.server?.controlToken ?? "").trim(),
     },
     twitch: {
-      channels: raw.twitch?.channels ?? [],
+      // Lowercased + deduped: IRC reports every channel by its lowercase
+      // login, so "TheCompanyInc" must not seed a sidebar entry of its own.
+      channels: normalizeChannels(raw.twitch?.channels),
       eventsub: parseEventSubConfig(raw.twitch?.eventsub),
+      // App-token credentials for badge art; kept even with no eventsub
+      // channels (parseEventSubConfig drops the block then).
+      app: resolveAppCredentials(raw.twitch?.eventsub, readEnv),
     },
     youtube: {
       // The key is resolved separately at startup (persisted/env/settings) so the
@@ -428,6 +449,201 @@ function createYouTubeKeyManager(opts: {
   }
 
   return { apply };
+}
+
+/** How long a fetched badge list is trusted before it is refreshed, and the
+ *  floor between attempts after a failed fetch. */
+const BADGE_GLOBAL_REFRESH_MS = 24 * 60 * 60_000;
+const BADGE_ROOM_REFRESH_MS = 6 * 60 * 60_000;
+const BADGE_RETRY_MS = 5 * 60_000;
+
+/**
+ * Owns Twitch chat-badge art for the IRC client: a BadgeSource whose
+ * synchronous resolve() answers from whatever is loaded right now, while the
+ * Helix fetches happen lazily behind it. Without Twitch app credentials it is
+ * just the built-in global snapshot. With them: an app token (client
+ * credentials — no `multichat login` needed) cached until 5 min before it
+ * expires, minted single-flight and re-minted once on a 401; Helix global
+ * badges loaded at start and refreshed daily; each room's custom subscriber/
+ * bits badges loaded on its ROOMSTATE (or first message) and refreshed every
+ * 6h. A failed fetch keeps the last good list and is retried no sooner than
+ * 5 min later, on the next resolve/noteRoom. Every call is time-boxed and
+ * caught, so nothing here can throw into the IRC path.
+ */
+function createTwitchBadgeManager(app: TwitchConfig["app"]): BadgeSource {
+  if (!app) {
+    console.log(
+      "[Badges] Global Twitch badges (mod, VIP, Prime, …) render from the " +
+        "built-in set; the channel's own subscriber/bits badges need " +
+        "twitch.eventsub.clientId + clientSecret (or TWITCH_CLIENT_ID/" +
+        "TWITCH_CLIENT_SECRET) — see docs/configuration.md.",
+    );
+    return SNAPSHOT_BADGES;
+  }
+  const { clientId, clientSecret } = app;
+
+  let token = "";
+  let tokenExpiresAt = 0;
+  let minting: Promise<string | null> | null = null;
+
+  async function mintToken(): Promise<string | null> {
+    const req = buildClientCredentialsRequest(clientId, clientSecret);
+    let status = 0;
+    let json: unknown = null;
+    try {
+      const res = await fetch(req.url, {
+        method: req.method,
+        headers: req.headers,
+        body: req.body,
+        signal: AbortSignal.timeout(10_000),
+      });
+      status = res.status;
+      json = res.ok ? await res.json() : await res.json().catch(() => null);
+    } catch (e) {
+      console.error(`[Badges] app token request failed: ${e}`);
+      return null;
+    }
+    const parsed = status < 300 ? parseAppTokenResponse(json) : null;
+    if (!parsed) {
+      const r = parseHelixResponse(status, json);
+      console.error(
+        `[Badges] app token rejected (HTTP ${status}): ${
+          r.ok ? "no access_token in the response" : r.message
+        } — check the Twitch app's clientId/clientSecret`,
+      );
+      return null;
+    }
+    token = parsed.accessToken;
+    tokenExpiresAt = Date.now() +
+      Math.max(0, parsed.expiresInSec - 300) * 1000;
+    return token;
+  }
+
+  // Single-flight: badge lists loading together share one mint.
+  function getToken(): Promise<string | null> {
+    if (token && Date.now() < tokenExpiresAt) return Promise.resolve(token);
+    if (!minting) {
+      minting = mintToken().finally(() => {
+        minting = null;
+      });
+    }
+    return minting;
+  }
+
+  /** GET one Helix badge list; null on any failure (already logged). */
+  async function fetchBadges(
+    label: string,
+    build: (token: string) => HttpRequest,
+  ): Promise<Map<string, BadgeArt> | null> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const tok = await getToken();
+      if (!tok) return null; // mintToken logged why
+      const req = build(tok);
+      let status = 0;
+      let json: unknown = null;
+      try {
+        const res = await fetch(req.url, {
+          method: req.method,
+          headers: req.headers,
+          signal: AbortSignal.timeout(10_000),
+        });
+        status = res.status;
+        // A 2xx body that won't parse is a failure, not an empty list.
+        json = res.ok ? await res.json() : await res.json().catch(() => null);
+      } catch (e) {
+        console.error(`[Badges] ${label}: request failed: ${e}`);
+        return null;
+      }
+      const r = parseHelixResponse(status, json);
+      if (r.ok) return parseChatBadgesResponse(r.json);
+      // Revoked or expired early: drop the token (unless a concurrent load
+      // already replaced it) and mint a fresh one, once.
+      if (r.kind === "unauthorized" && attempt === 0) {
+        if (token === tok) token = "";
+        continue;
+      }
+      console.error(`[Badges] ${label}: HTTP ${r.status} — ${r.message}`);
+      return null;
+    }
+    return null;
+  }
+
+  interface BadgeList {
+    /** The last good list (undefined until one loads). */
+    art?: Map<string, BadgeArt>;
+    /** Start a fetch if one is due and none is running. */
+    poke: () => void;
+  }
+
+  function badgeList(
+    label: string,
+    noun: string,
+    refreshMs: number,
+    build: (token: string) => HttpRequest,
+  ): BadgeList {
+    let nextAt = 0;
+    let busy = false;
+    const list: BadgeList = {
+      poke() {
+        if (busy || Date.now() < nextAt) return;
+        busy = true;
+        fetchBadges(label, build)
+          .then((art) => {
+            if (art && !list.art) {
+              console.log(`[Badges] ${label}: ${art.size} ${noun}`);
+            }
+            if (art) list.art = art;
+            nextAt = Date.now() + (art ? refreshMs : BADGE_RETRY_MS);
+          })
+          .catch((e) => {
+            console.error(`[Badges] ${label}: ${e}`);
+            nextAt = Date.now() + BADGE_RETRY_MS;
+          })
+          .finally(() => {
+            busy = false;
+          });
+      },
+    };
+    return list;
+  }
+
+  const global = badgeList(
+    "global",
+    "badge version(s) from Helix",
+    BADGE_GLOBAL_REFRESH_MS,
+    (t) => buildGetGlobalChatBadgesRequest(clientId, t),
+  );
+  const rooms = new Map<string, BadgeList>();
+
+  // The room's list, created on first sight; room ids are numeric user ids.
+  function roomList(roomId: string | undefined): BadgeList | undefined {
+    if (!roomId || !/^\d+$/.test(roomId)) return undefined;
+    let list = rooms.get(roomId);
+    if (!list) {
+      list = badgeList(
+        `room ${roomId}`,
+        "custom badge version(s)",
+        BADGE_ROOM_REFRESH_MS,
+        (t) => buildGetChannelChatBadgesRequest(clientId, t, roomId),
+      );
+      rooms.set(roomId, list);
+    }
+    return list;
+  }
+
+  global.poke();
+  return {
+    resolve(roomId, set, version) {
+      global.poke();
+      const room = roomList(roomId);
+      room?.poke();
+      return resolveBadgeArt(set, version, room?.art, global.art);
+    },
+    noteRoom(roomId) {
+      global.poke();
+      roomList(roomId)?.poke();
+    },
+  };
 }
 
 /**
@@ -2715,6 +2931,9 @@ async function runServer(configPath: string): Promise<void> {
             console.error(`[Giveaway] handler error: ${e}`)
           )
         : undefined,
+      // Badge art: the built-in global set, plus Helix (global + each
+      // channel's custom sub/bits badges) when Twitch app creds exist.
+      createTwitchBadgeManager(twitch.app),
     );
   } else {
     console.log("No Twitch channels configured.");

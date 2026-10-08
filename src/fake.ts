@@ -22,8 +22,9 @@ import type {
   Segment,
   SubDetail,
 } from "./types.ts";
-import { cheerColor } from "./twitch.ts";
+import { cheerColor, parseBadges as parseBadgeTag } from "./twitch.ts";
 import { tierColor } from "./youtube.ts";
+import { decorateBadge, SNAPSHOT_BADGES } from "./badges.ts";
 
 /** One thing the server should do with a faked event, in wire form. */
 export type FakeAction =
@@ -57,6 +58,14 @@ const SAMPLE_EMOTE = {
   url: "https://static-cdn.jtvnw.net/emoticons/v2/25/default/dark/1.0",
   alt: "Kappa",
 };
+
+// Demo Twitch badges go through the real IRC parse + built-in snapshot art, so
+// the showcase previews the image badges a zero-config server renders.
+function twitchBadges(tag: string, info = ""): Badge[] {
+  return parseBadgeTag(tag, info).map((b) =>
+    decorateBadge(b, SNAPSHOT_BADGES.resolve(undefined, b.id, b.version ?? ""))
+  );
+}
 
 /**
  * A fixed, curated showcase of every message kind, in the order they should be
@@ -92,7 +101,7 @@ export function demoActions(now = 0): FakeAction[] {
       channel: TW,
       author: "AlphaViewer",
       authorColor: "#ff7f50",
-      badges: [{ id: "subscriber", label: "Sub" }],
+      badges: twitchBadges("subscriber/12", "subscriber/14"),
       kind: "chat",
       content: "hey everyone, glad to be here o/",
     }),
@@ -100,7 +109,7 @@ export function demoActions(now = 0): FakeAction[] {
       platform: "twitch",
       channel: TW,
       author: "ModSam",
-      badges: [{ id: "moderator", label: "Mod" }],
+      badges: twitchBadges("moderator/1"),
       kind: "chat",
       content: "welcome to the stream Kappa",
       segments: [
@@ -112,6 +121,7 @@ export function demoActions(now = 0): FakeAction[] {
       platform: "twitch",
       channel: TW,
       author: "DancingBot",
+      badges: twitchBadges("vip/1"),
       kind: "action",
       content: "does a little dance",
     }),
@@ -135,7 +145,7 @@ export function demoActions(now = 0): FakeAction[] {
       platform: "twitch",
       channel: TW,
       author: "BitLord",
-      badges: [{ id: "subscriber", label: "Sub" }],
+      badges: twitchBadges("subscriber/3,bits/1000", "subscriber/4"),
       kind: "cheer",
       content: "take my bits!",
       amount: "1000 bits",
@@ -227,6 +237,7 @@ export function demoActions(now = 0): FakeAction[] {
       platform: "twitch",
       channel: TW,
       author: "TheBroadcaster",
+      badges: twitchBadges("broadcaster/1,partner/1"),
       kind: "system",
       accentColor: "#9147ff",
       eventText: "Chat is now in subscriber-only mode",
@@ -298,12 +309,19 @@ function parseBadges(x: unknown): Badge[] | undefined {
   if (!Array.isArray(x)) return undefined;
   const out: Badge[] = [];
   for (const b of x) {
-    if (isObj(b) && typeof b.id === "string") {
-      out.push({
-        id: b.id,
-        label: typeof b.label === "string" ? b.label : b.id,
-      });
+    if (!isObj(b) || typeof b.id !== "string") continue;
+    const badge: Badge = {
+      id: b.id,
+      label: typeof b.label === "string" ? b.label : b.id,
+    };
+    if (typeof b.version === "string") badge.version = b.version;
+    if (typeof b.info === "string") badge.info = b.info;
+    // Image URLs land in <img src> for every viewer: https only.
+    for (const k of ["url", "url2x", "url4x"] as const) {
+      const u = b[k];
+      if (typeof u === "string" && u.startsWith("https://")) badge[k] = u;
     }
+    out.push(badge);
   }
   return out.length ? out : undefined;
 }
