@@ -9,10 +9,11 @@ broadcaster, which pushes events to connected browsers over Server-Sent Events.
 | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `main.ts`              | Entry point — loads settings, creates the server, starts the platform clients, owns the runtime-key + EventSub managers and the CLI subcommands                                                    |
 | `src/types.ts`         | Shared interfaces: `Settings`, `ChatMessage`, `ServerEvent`, `Emitter`, `ChannelStatus`, `TwitchEventSubConfig`, EventSub frames                                                                   |
-| `src/twitch.ts`        | Twitch IRC over WebSocket (`wss://irc-ws.chat.twitch.tv`), with reconnect; suppresses events for EventSub-covered channels                                                                         |
+| `src/twitch.ts`        | Twitch IRC over WebSocket (`wss://irc-ws.chat.twitch.tv`), with reconnect; suppresses events for EventSub-covered channels; decorates badges with art via a `BadgeSource`                            |
 | `src/eventsub.ts`      | Twitch EventSub over WebSocket (`wss://eventsub.wss.twitch.tv`) — follow/cheer/sub/raid; pure mappers + socket client                                                                              |
-| `src/twitchauth.ts`    | Pure Twitch OAuth + EventSub request builders / response parsers + the `SUBSCRIPTIONS` table                                                                                                       |
-| `src/youtube.ts`       | YouTube Data API v3 polling — resolves channel → live video → live chat                                                                                                                            |
+| `src/twitchauth.ts`    | Pure Twitch OAuth + Helix/EventSub request builders / response parsers (incl. the app-token grant and chat-badge lists) + the `SUBSCRIPTIONS` table                                                  |
+| `src/badges.ts`        | Pure badge-art resolution (`resolveBadgeArt`, `badgeLabel`, `decorateBadge`) + `src/twitchbadges.ts`, a generated snapshot of Twitch's global badges                                                 |
+| `src/youtube.ts`       | YouTube Data API v3 polling — quota-aware live detection (uploads playlist + rationed search), chat polling paced by a per-day quota ledger                                                          |
 | `src/server.ts`        | `Deno.serve` HTTP server + the embedded viewer HTML/CSS/JS (`/`, `/overlay`, `/alerts`)                                                                                                            |
 | `src/control.ts`       | Pure control-plane helpers (loopback check, key-body parse, startup-key resolution, state paths)                                                                                                   |
 | `src/fake.ts`          | Fake-event demo sequence + wire (de)serialization/validation behind `POST /api/fake`                                                                                                               |
@@ -50,6 +51,15 @@ emitter-only commands (`PRIVMSG`, `USERNOTICE`, `CLEARMSG`, `CLEARCHAT`,
 socket. `handlePrivmsg` / `handleUsernotice` build the `ChatMessage` (badges,
 emote segments, cheers, sub/raid notices). Reconnect uses exponential backoff.
 
+Badges keep their version and `badge-info` (`parseBadges`) and are decorated
+with image URLs by an optional `BadgeSource`, keyed by the message's `room-id`
+(Shared Chat messages use `source-badges` against `source-room-id`). main.ts's
+`createTwitchBadgeManager` is that source: without Twitch app credentials it
+serves the built-in snapshot of global badges; with them it mints an app token
+(client-credentials grant) and loads Helix global badges plus each room's custom
+sub/bits badges as ROOMSTATE announces the room. `resolve` is synchronous and
+never throws, so badge loading can't stall or drop chat.
+
 When a channel is configured for EventSub, `handleCommand` is passed an
 `isCovered` predicate: for that channel it drops the IRC copies of
 cheer/sub/raid (they come from EventSub instead) but keeps the chat text, so
@@ -72,13 +82,19 @@ EventSub does not touch the sidebar status (IRC owns the Twitch dot).
 
 ## YouTube client
 
-One independent poll loop per channel. Each resolves handle/channelId → current
-live video → active live-chat id, then long-polls `liveChat/messages` at the
-interval the API suggests. `emitItem` maps each `snippet.type` to a
-`ChatMessage` (text, Super Chat, Super Sticker, membership) or a delete. The
-resolved channel id is cached so it isn't looked up again; an offline channel is
-rechecked every 5 minutes (the live-stream lookup is the expensive 100-unit
-call). See [Reliability & limits](#reliability--limits) for the quota handling.
+One independent poll loop per channel, all sharing one `YouTubeRuntime` (quota
+ledger + per-channel caches) that outlives key changes. Discovery checks the
+channel's uploads playlist + `videos.list` every 3 minutes (about 2 units);
+`search.list` is only a rationed fallback because its bucket is 100 calls a day.
+Once a live video with an `activeLiveChatId` is found, the loop polls
+`liveChat/messages` at the larger of the API's suggested interval and the quota
+governor's floor. `emitItem` maps each `snippet.type` to a `ChatMessage` (text,
+Super Chat, Super Sticker, membership) or a delete. The chat loop ends — and
+discovery resumes 30 seconds later, to catch a restarted stream — on
+`liveChatEnded`/`liveChatNotFound`, a confirmed `offlineAt`, a `chatEndedEvent`,
+or the periodic `videos.list` check. Page tokens and a seen-id set survive
+re-attaches, so a re-attach neither replays nor duplicates chat. See
+[Reliability & limits](#reliability--limits) for the quota handling.
 
 ## Design notes
 
@@ -115,10 +131,14 @@ Tuned for unattended multi-hour streams:
   waiting the maxed-out delay.
 - **Bounded parser buffer.** The IRC line buffer is discarded if it exceeds 64
   KB without a newline, so a misbehaving peer can't grow memory.
-- **YouTube quota handling.** `quotaExceeded`/rate-limit 403s raise a
-  `QuotaError` and back off 15 minutes; other transient errors back off
-  exponentially (15s→2m). Resolved channel ids are cached and offline channels
-  rechecked sparingly to conserve the 100-unit `search.list`. See
+- **YouTube quota handling.** `classifyYtError` reads the JSON error reason:
+  a spent daily pool (`quotaExceeded`) parks the channel until midnight Pacific,
+  a spent search bucket (`429 … Search Queries per day`) only stops searching
+  until then, "polled too fast" (`rateLimitExceeded`) waits briefly on the same
+  page token, and transient failures back off 5s→60s. A per-Pacific-day ledger
+  (persisted as `youtube-quota.json`) estimates spend and stretches the chat
+  poll interval so a `youtube.budgetHours` stream fits `youtube.dailyQuota`.
+  Every request is time-boxed (15s) and the key is redacted from logs. See
   [Configuration → Quota and long streams](../configuration.md#quota-and-long-streams).
 - **SSE client cap.** `/events` is capped at 50 concurrent connections (returns
   `503` beyond that) so an exposed port can't be flooded with open streams.
