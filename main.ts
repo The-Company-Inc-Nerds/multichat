@@ -27,7 +27,13 @@ import {
   startTwitchClient,
   type TwitchChatMessage,
 } from "./src/twitch.ts";
-import { startYouTubePoller } from "./src/youtube.ts";
+import {
+  createYouTubeRuntime,
+  keyFingerprint,
+  normalizeYouTubeConfig,
+  startYouTubePoller,
+  type YouTubeRuntime,
+} from "./src/youtube.ts";
 import { createServer } from "./src/server.ts";
 import { normalizeAlertsConfig } from "./src/alerts.ts";
 import {
@@ -157,6 +163,7 @@ import {
   stateTmpPath,
   twitchBroadcasterStatePath,
   twitchTokenStatePath,
+  youtubeQuotaStatePath,
 } from "./src/control.ts";
 import {
   activeTurn,
@@ -268,12 +275,10 @@ async function loadSettings(path: string): Promise<Settings> {
       // channels (parseEventSubConfig drops the block then).
       app: resolveAppCredentials(raw.twitch?.eventsub, readEnv),
     },
-    youtube: {
-      // The key is resolved separately at startup (persisted/env/settings) so the
-      // operator can also set it at runtime; see resolveStartupKey.
-      apiKey: raw.youtube?.apiKey ?? "",
-      channels: raw.youtube?.channels ?? [],
-    },
+    // The key is resolved separately at startup (persisted/env/settings) so the
+    // operator can also set it at runtime; see resolveStartupKey. The quota
+    // governor's dailyQuota / budgetHours are defaulted + clamped here.
+    youtube: normalizeYouTubeConfig(raw.youtube),
     alerts: normalizeAlertsConfig(raw.alerts),
     giveaway: normalizeGiveawayConfig(raw.giveaway),
     // Tokens may arrive from the environment instead of the file, so a
@@ -388,18 +393,86 @@ async function appendState(path: string, line: string): Promise<void> {
   }
 }
 
+/** How often, at most, the YouTube quota ledger is written to disk. */
+const YT_QUOTA_PERSIST_MS = 30_000;
+
 /**
  * Owns the live YouTube API key. Setting a key persists it (so it survives a
  * service restart), tears down any running poller, and starts a fresh one — so
  * the key can be supplied, replaced, or rotated while the server is running.
+ *
+ * Every poller generation shares ONE runtime: the quota ledger (today's
+ * estimated Data API spend, persisted to `quota.statePath` at most every 30s
+ * and on shutdown, so a restart can't reset the day's budget), resolved
+ * channel/uploads ids, seen message ids and page tokens — so a key change
+ * resumes the chat instead of replaying it. A key whose fingerprint differs
+ * from the ledger's may belong to another Google project: today restarts from
+ * zero for it.
  */
 function createYouTubeKeyManager(opts: {
   getEmitter: () => Emitter;
   channels: YouTubeChannelConfig[];
   statePath: string | null;
+  quota?: {
+    dailyQuota?: number;
+    budgetHours?: number;
+    statePath: string | null;
+  };
 }) {
   let current = "";
   let controller: AbortController | null = null;
+  let runtime: Promise<YouTubeRuntime> | null = null;
+
+  // Load (once) the persisted ledger and build the shared runtime. Writes are
+  // throttled to one per YT_QUOTA_PERSIST_MS, serialized, atomic, and flushed
+  // on SIGTERM/SIGINT. A missing/unreadable file just starts today at zero.
+  function getRuntime(): Promise<YouTubeRuntime> {
+    runtime ??= (async () => {
+      const path = opts.quota?.statePath ?? null;
+      let snapshot: unknown;
+      if (path) {
+        try {
+          snapshot = JSON.parse(await Deno.readTextFile(path));
+        } catch (e) {
+          if (!(e instanceof Deno.errors.NotFound)) {
+            console.error(
+              `[YouTube] Ignoring unreadable quota ledger ${path}: ${e}`,
+            );
+          }
+        }
+      }
+      let timer: number | undefined;
+      let chain: Promise<void> = Promise.resolve();
+      const write = () => {
+        if (!path) return chain;
+        chain = chain.then(() =>
+          persistStateAtomic(path, JSON.stringify(rt.ledger.snapshot()))
+        );
+        return chain;
+      };
+      const rt = createYouTubeRuntime({
+        dailyQuota: opts.quota?.dailyQuota,
+        budgetHours: opts.quota?.budgetHours,
+        snapshot,
+        onChange: () => {
+          if (!path || timer !== undefined) return;
+          timer = setTimeout(() => {
+            timer = undefined;
+            void write();
+          }, YT_QUOTA_PERSIST_MS);
+        },
+      });
+      if (path) {
+        flushOnShutdown(async () => {
+          if (timer !== undefined) clearTimeout(timer);
+          timer = undefined;
+          await write();
+        });
+      }
+      return rt;
+    })();
+    return runtime;
+  }
 
   async function persist(key: string): Promise<void> {
     if (!opts.statePath) return; // in-memory only (no StateDirectory)
@@ -426,19 +499,34 @@ function createYouTubeKeyManager(opts: {
 
     current = key;
     if (persistKey) await persist(key);
+    const rt = opts.channels.length ? await getRuntime() : null;
+    // A newer key arrived while we awaited: that call starts the poller.
+    if (key !== current) return { ok: true, message: "YouTube API key set" };
 
     controller?.abort(); // stop the previous poller generation
-    if (opts.channels.length === 0) {
+    if (!rt) {
       return {
         ok: true,
         message: "YouTube API key set (no channels configured)",
       };
     }
+    if (rt.ledger.adoptKey(keyFingerprint(key))) {
+      console.log(
+        "[YouTube] New API key — counting today's quota from zero (it may " +
+          "belong to a different Google project).",
+      );
+    }
     controller = new AbortController();
     startYouTubePoller(
-      { apiKey: key, channels: opts.channels },
+      {
+        apiKey: key,
+        channels: opts.channels,
+        dailyQuota: opts.quota?.dailyQuota,
+        budgetHours: opts.quota?.budgetHours,
+      },
       opts.getEmitter(),
       controller.signal,
+      rt,
     );
     const n = opts.channels.length;
     console.log(`[Control] YouTube poller (re)started for ${n} channel(s).`);
@@ -2805,12 +2893,18 @@ function warnChannelPointsSetup(
 /** Grace period for writing state on SIGTERM/SIGINT before exiting anyway. */
 const SHUTDOWN_FLUSH_MS = 3_000;
 
+const shutdownFlushes: Array<() => Promise<void>> = [];
+
 /**
  * On SIGTERM (systemd stop / deploy) or SIGINT (Ctrl-C), write the latest
  * state before exiting instead of dying mid-write, bounded so a stuck disk
- * can't hold the stop up. A second signal exits at once.
+ * can't hold the stop up. A second signal exits at once. Every registered
+ * flush runs under one set of listeners, so one finishing early can't exit
+ * the process while another is still writing.
  */
 function flushOnShutdown(flush: () => Promise<void>): void {
+  shutdownFlushes.push(flush);
+  if (shutdownFlushes.length > 1) return; // listeners already installed
   let stopping = false;
   const onSignal = (sig: "SIGTERM" | "SIGINT") => {
     const code = sig === "SIGINT" ? 130 : 0;
@@ -2818,9 +2912,8 @@ function flushOnShutdown(flush: () => Promise<void>): void {
     stopping = true;
     console.log(`[Control] ${sig} — saving state before exit.`);
     const deadline = new Promise<void>((r) => setTimeout(r, SHUTDOWN_FLUSH_MS));
-    void Promise.race([flush().catch(() => {}), deadline]).finally(() =>
-      Deno.exit(code)
-    );
+    const all = Promise.all(shutdownFlushes.map((f) => f().catch(() => {})));
+    void Promise.race([all, deadline]).finally(() => Deno.exit(code));
   };
   for (const sig of ["SIGTERM", "SIGINT"] as const) {
     try {
@@ -2843,6 +2936,11 @@ async function runServer(configPath: string): Promise<void> {
     getEmitter: () => emitter,
     channels: settings.youtube.channels,
     statePath,
+    quota: {
+      dailyQuota: settings.youtube.dailyQuota,
+      budgetHours: settings.youtube.budgetHours,
+      statePath: youtubeQuotaStatePath(stateDir),
+    },
   });
 
   // The giveaway engine (when enabled) needs the per-channel broadcaster token to

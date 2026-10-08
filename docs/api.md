@@ -447,6 +447,7 @@ are optional.
 | `accentColor` | string?                 | Highlight color for event rows / tiers                                                                            |
 | `eventText`   | string?                 | Notice line for event rows, e.g. "X subscribed for 3 months"                                                      |
 | `sub`         | object?                 | Structured detail for `kind: "sub"`: `{tier?: 1\|2\|3, variant: "new"\|"resub"\|"gift", count?}` (alert themes key off it; `tier` absent = unknown) |
+| `backlog`     | boolean?                | `true` on history YouTube replayed when the poller (re)attached to a chat — render it, but don't pop an alert for it (`/alerts` skips it). Absent on live messages |
 
 A `Badge`'s `id` is the bare set id (`moderator`, `subscriber`, `member`, …)
 and `label` is short human text. Twitch badges also carry `version` (e.g.

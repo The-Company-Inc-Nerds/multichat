@@ -199,10 +199,16 @@ held up by it. The images themselves are loaded by the browser straight from
 
 ## `youtube`
 
-| Field      | Type     | Description                                                                                    |
-| ---------- | -------- | ---------------------------------------------------------------------------------------------- |
-| `apiKey`   | string   | YouTube Data API v3 key (see below). Optional — may instead be supplied at runtime (see below) |
-| `channels` | object[] | One entry per channel; set at least one of the fields below                                    |
+| Field         | Type     | Description                                                                                    |
+| ------------- | -------- | ---------------------------------------------------------------------------------------------- |
+| `apiKey`      | string   | YouTube Data API v3 key (see below). Optional — may instead be supplied at runtime (see below) |
+| `channels`    | object[] | One entry per channel; set at least one of the fields below                                    |
+| `dailyQuota`  | number   | Main-pool API units your Google project may spend per day. Default `10000` (1,000–10,000,000)  |
+| `budgetHours` | number   | Hours of live chat per Pacific day the remaining quota is spread over. Default `4` (0.5–24)    |
+
+`dailyQuota` and `budgetHours` set how fast live chat is polled — see
+[Quota and long streams](#quota-and-long-streams). Leave them alone unless
+Google has granted you more quota or you stream longer than four hours a day.
 
 Each `youtube.channels` entry:
 
@@ -215,6 +221,45 @@ Each `youtube.channels` entry:
 Twitch works anonymously. YouTube requires an API key and resolves each channel
 to its current live stream, so a channel only produces messages while it is
 actually live.
+
+### How YouTube live detection works
+
+multichat finds a channel's live stream without leaning on `search.list`,
+whose own quota bucket allows only 100 calls a day per Google project (a
+search every few minutes, around the clock, used to run it dry by mid-morning
+Pacific and leave YouTube dark until midnight):
+
+1. **Once per channel:** a `handle` is resolved to its channel id, and the
+   channel's _uploads playlist_ is looked up (`channels.list`, 1 unit each,
+   remembered until the server restarts).
+2. **Every 3 minutes while offline:** the five newest uploads, plus the last
+   live video, are checked in a single `videos.list` (`playlistItems.list` +
+   `videos.list` ≈ 2 units). A video counts as live when YouTube marks it
+   `live`, with an active chat and no end time — an upcoming stream's waiting
+   room doesn't count. A stream scheduled to start within 15 minutes (or up to
+   2 hours late) tightens the check to once a minute.
+3. **Search, rationed:** some channels' streams only reach the uploads playlist
+   after they end, so when the playlist finds nothing multichat may also search
+   — at most 40 times per Pacific day across all channels, at least 20 minutes
+   apart, spread over what's left of the day. If Google says the search bucket
+   is spent (`429 … 'Search Queries per day'`), search pauses until midnight
+   Pacific and the playlist checks carry on.
+4. **While live:** chat is polled (see
+   [Quota and long streams](#quota-and-long-streams)), and every 10 minutes
+   `videos.list` confirms the broadcast is still live on the same chat. When
+   the chat ends — YouTube answers `liveChatEnded` / `liveChatNotFound`, sends
+   a chat-ended event, or reports the stream offline and `videos.list` agrees —
+   the channel turns `offline` and is rechecked 30 seconds later, which picks
+   up an encoder restart that came back as a new broadcast. (A brief encoder
+   drop that `videos.list` still calls live just slows polling down.)
+
+A pinned `videoId` skips steps 1–3: that one video is checked on each tick.
+
+Re-attaching to the same chat (after a key change, say) resumes where it left
+off, and messages already shown are dropped. A fresh attach makes YouTube
+replay recent history: it is shown in the chat, but anything older than five
+minutes is flagged `backlog` so the `/alerts` overlay doesn't re-announce old
+Super Chats and memberships.
 
 ## Setting the YouTube API key at runtime
 
@@ -947,24 +992,86 @@ touches Twitch, so it works without EventSub at all.
 4. Create an API key under _APIs & Services → Credentials_.
 5. Optionally restrict the key to the YouTube Data API v3.
 
-The free quota (10,000 units/day) is sufficient for casual use. Each chat poll
-costs 5 units.
+The free quota covers a few hours of live chat a day; the next section explains
+how multichat spends it.
 
 ### Quota and long streams
 
-The default quota is small relative to a multi-hour stream. At the API's typical
-~5s poll interval a single live chat burns ~3,600 units/hour, and the
-live-stream lookup (`search.list`, used to find a channel's current broadcast)
-costs **100 units per check** — so quota can run out partway through a long
-stream, after which YouTube chat stops until the quota resets (midnight
-Pacific). multichat reduces the burn by:
+Google gives each Cloud project two daily allowances, both reset at **00:00
+Pacific** (01:00 Mountain): **100 `search.list` calls**, and a **10,000-unit
+pool** for everything else. `channels.list`, `playlistItems.list` and
+`videos.list` cost 1 unit each; a live-chat poll (`liveChatMessages.list`) is
+budgeted at **5 units** — Google doesn't publish the figure, so check _APIs &
+Services → YouTube Data API v3 → Quotas_ in the Cloud Console for your
+project's real numbers.
 
-- caching the resolved channel id (no repeat lookup),
-- rechecking offline channels only every 5 minutes (not every minute),
-- detecting `quotaExceeded` and backing off 15 minutes instead of hammering the
-  API.
+Watching for a stream costs about 40 units an hour (≈1,000 a day, see
+[How YouTube live detection works](#how-youtube-live-detection-works)). The
+rest is for chat. Polling at YouTube's suggested pace (often 1–5 seconds)
+would burn 3,600–18,000 units an hour and empty the pool partway through a
+stream, so multichat keeps a ledger of today's estimated spend and stretches
+the poll interval until the remaining quota covers the rest of the day's
+planned streaming:
 
-For all-day streams, either pin a specific `videoId` (skips the 100-unit
-`search.list` entirely), use a dedicated API key per channel, or
-[request a quota increase](https://support.google.com/youtube/contact/yt_api_form).
-A channel whose quota is exhausted shows the `error` state in the sidebar.
+```
+remaining = dailyQuota − units spent today − 40 × hours until midnight PT
+planned   = max(budgetHours − hours of chat already polled today, 30 min)
+interval  = 5 units × planned ÷ (remaining ÷ chats live right now)
+```
+
+The result is never faster than YouTube's own suggested interval and is kept
+between 1 and 60 seconds. With the defaults (10,000 units, 4 hours) a fresh day
+polls about every 8 seconds — messages arrive in slightly larger batches, none
+are lost. Streaming past `budgetHours` keeps working: the interval keeps
+stretching instead of running the pool dry. The ledger is saved to
+`youtube-quota.json` in the [state directory](#state-directory) (at most every
+30 seconds, and on shutdown), so a restart doesn't forget what today has
+already cost.
+
+| Setting       | Default | Effect                                                                    |
+| ------------- | ------- | ------------------------------------------------------------------------- |
+| `dailyQuota`  | `10000` | Your project's main-pool units per day. Raise it after Google grants more |
+| `budgetHours` | `4`     | Hours of chat a day to plan for. Higher = fewer polls per hour            |
+
+If the pool runs out anyway (Google answers `quotaExceeded`), the channel shows
+`error` and the poller sleeps until a few minutes past midnight Pacific instead
+of retrying all day.
+
+**One poller per Google project.** Quota belongs to the Cloud project, not to
+the process or the key: a dev box running `deno task dev` with the production
+key (or any key from the same project) doubles the burn, and two pollers on one
+chat trip YouTube's "polled too soon" limit. Give development its own project.
+When the server is handed a different key from the one today's spend was
+counted against, it starts a fresh ledger for the day, since that key may
+belong to another project (only a fingerprint of the key is stored).
+
+**More quota.** Ask Google via the
+[YouTube API Services audit and quota extension form](https://support.google.com/youtube/contact/yt_api_form),
+then set `youtube.dailyQuota` to the granted daily limit so the poller uses it.
+
+#### Reading the YouTube logs
+
+Every status change is logged once, with its reason:
+
+```
+[YouTube] @channel: offline — not live
+[YouTube] @channel: live — polling live chat (video abc123, found via uploads playlist)
+[YouTube] @channel: offline — live chat ended (403 liveChatEnded) — rechecking in 30s
+[YouTube] @channel: error — daily YouTube API quota exhausted — resuming at 00:00 PT (in 6h12m)
+```
+
+and every failed request once, with the HTTP status, Google's reason, how
+multichat classified it, and Google's message (the API key is never logged):
+
+```
+[YouTube] GET /videos?part=snippet,liveStreamingDetails&id=abc123 → HTTP 403 quotaExceeded (quotaDaily): The request cannot be completed because you have exceeded your quota.
+```
+
+| Reason                                                     | What it means → what multichat does                                     |
+| ---------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `quotaExceeded` (403)                                      | Daily pool spent → `error` until midnight Pacific                       |
+| `rateLimitExceeded` (429, `Search Queries per day`)        | Search bucket spent → search pauses until midnight; detection continues |
+| `rateLimitExceeded` (403, or 429 per minute)               | Polled too fast → a short wait, then the same chat position             |
+| `liveChatEnded` / `liveChatDisabled` / `liveChatNotFound`  | The chat is over → `offline`, rechecked in 30s                          |
+| `badRequest` (`API_KEY_INVALID`), `forbidden`, `accessNotConfigured` | Key or project problem → `error`, retried every 10 minutes    |
+| `timeout` / `network` / HTTP 5xx                           | Transient → retried with back-off (`error` after 3 chat failures)       |

@@ -105,6 +105,7 @@ let
     youtube = {
       apiKey = "";
       channels = map (ch: { inherit (ch) channelId handle videoId; }) cfg.youtube.channels;
+      inherit (cfg.youtube) dailyQuota budgetHours;
     };
     alerts = {
       activeTheme = cfg.alerts.activeTheme;
@@ -379,6 +380,29 @@ in
         ]
       '';
       description = "YouTube channels to monitor. Set handle, channelId, or videoId.";
+    };
+
+    youtube.dailyQuota = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 10000;
+      example = 100000;
+      description = ''
+        YouTube Data API units the key's Google Cloud project may spend per day
+        (the main pool; it resets at 00:00 Pacific). The chat poller paces itself
+        so a stream fits in what's left. Raise it only after Google grants a
+        quota increase. Clamped to 1000..10000000.
+      '';
+    };
+
+    youtube.budgetHours = lib.mkOption {
+      type = lib.types.number;
+      default = 4;
+      example = 6;
+      description = ''
+        Hours of YouTube live chat per (Pacific) day the remaining quota is spread
+        over. Longer means slower polling (fewer units per hour); streaming past it
+        keeps working, just more slowly. Clamped to 0.5..24.
+      '';
     };
 
     alerts.activeTheme = lib.mkOption {

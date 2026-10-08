@@ -83,6 +83,9 @@ export interface ChatMessage {
   /** Structured sub detail (tier + new/resub/gift) for `kind: "sub"` rows. */
   sub?: SubDetail;
   timestamp: number;
+  /** History replayed when the poller (re)attached — render it, but overlays
+   *  shouldn't pop an alert for it. Absent on live messages. */
+  backlog?: boolean;
 }
 
 /** Frames pushed over SSE. The client switches on `type`. */
@@ -185,6 +188,12 @@ export interface YouTubeChannelConfig {
 export interface YouTubeConfig {
   apiKey: string;
   channels: YouTubeChannelConfig[];
+  /** Main-pool Data API units the Google project may spend per Pacific day
+   *  (default 10,000). Raise it after Google grants a quota increase. */
+  dailyQuota?: number;
+  /** Hours of live chat per Pacific day the remaining quota is spread over
+   *  (default 4); sets the chat poll-interval floor. See normalizeYouTubeConfig. */
+  budgetHours?: number;
 }
 
 /**

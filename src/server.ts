@@ -22,6 +22,7 @@ import { describeFakeAction, parseFakeAction } from "./fake.ts";
 import { parseGiveawayAction } from "./giveaway.ts";
 import { parseTurnReport } from "./integrations.ts";
 import { parseRewardsAction } from "./channelpoints.ts";
+import { youtubeLabel } from "./youtube.ts";
 
 const HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -1044,7 +1045,11 @@ const HTML = `<!DOCTYPE html>
       if (ev.type === 'message') {
         // In alerts mode only shoutout kinds are shown, one at a time; everything
         // else (plain chat, system notices) is ignored. Other modes render inline.
-        if (alertsMode) { if (ALERT_KINDS[ev.data.kind]) enqueueAlert(ev.data); }
+        // History replayed on a YouTube (re)attach carries backlog: true — it
+        // already happened, so it must not pop an alert again.
+        if (alertsMode) {
+          if (ALERT_KINDS[ev.data.kind] && !ev.data.backlog) enqueueAlert(ev.data);
+        }
         else addMsg(ev.data);
       }
       else if (ev.type === 'status') renderStatus(ev.data);
@@ -1738,7 +1743,7 @@ export function createServer(
     });
   }
   for (const ch of settings.youtube.channels) {
-    const name = ch.handle ?? ch.channelId ?? ch.videoId ?? "unknown";
+    const name = youtubeLabel(ch); // the same name the poller reports under
     statuses.set(key("youtube", name), {
       platform: "youtube",
       name,

@@ -17,8 +17,10 @@ status dot:
 
 Status is driven by the server's real connection state. Twitch flips to `live`
 on the per-channel `ROOMSTATE` line Twitch sends after a join; YouTube reflects
-resolving → live → offline as the poller finds (or fails to find) an active live
-chat. The panel collapses behind a ☰ toggle on narrow screens.
+resolving → live → offline as the poller finds an active live chat and sees it
+end; a YouTube `error` means the API refused the key or the day's quota is spent
+(see [Quota and long streams](configuration.md#quota-and-long-streams) — the
+log line says which). The panel collapses behind a ☰ toggle on narrow screens.
 
 ## Platform identity
 
