@@ -179,6 +179,16 @@ export function keyStatePath(
   return dir ? `${dir}/youtube-api-key` : null;
 }
 
+/** Where the YouTube quota ledger (today's estimated Data API spend, search
+ *  count, exhaustion flags — see src/youtube.ts) is persisted, so a restart
+ *  doesn't start the day's budget over. Null with no state dir. */
+export function youtubeQuotaStatePath(
+  stateDir: string | null | undefined,
+): string | null {
+  const dir = (stateDir ?? "").replace(/\/+$/, "");
+  return dir ? `${dir}/youtube-quota.json` : null;
+}
+
 /**
  * Where a channel's (rotating) Twitch refresh token is persisted, keyed by
  * broadcaster id so a login rename doesn't orphan it. Returns null with no state

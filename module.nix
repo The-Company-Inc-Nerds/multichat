@@ -105,6 +105,7 @@ let
     youtube = {
       apiKey = "";
       channels = map (ch: { inherit (ch) channelId handle videoId; }) cfg.youtube.channels;
+      inherit (cfg.youtube) dailyQuota budgetHours;
     };
     alerts = {
       activeTheme = cfg.alerts.activeTheme;
@@ -260,7 +261,7 @@ in
       type = lib.types.listOf lib.types.str;
       default = [ ];
       example = lib.literalExpression ''[ "streamer1" "streamer2" ]'';
-      description = "Twitch channel names (lowercase) to monitor. Chat works anonymously.";
+      description = "Twitch channel names to monitor (case and a leading # don't matter). Chat works anonymously.";
     };
 
     twitch.eventsub.clientId = lib.mkOption {
@@ -268,8 +269,10 @@ in
       default = "";
       description = ''
         Twitch application Client ID for EventSub alerts (follows, cheers, subs,
-        raids). Not a secret. Leave empty (and channels empty) to disable EventSub
-        and run Twitch chat anonymously.
+        raids). Not a secret. Together with clientSecretFile it also shows the
+        channel's own sub/bits badge art in chat, even with no EventSub channels
+        (global badges render without it). Leave empty (and channels empty) to
+        disable EventSub and run Twitch chat anonymously.
       '';
     };
 
@@ -379,6 +382,32 @@ in
         ]
       '';
       description = "YouTube channels to monitor. Set handle, channelId, or videoId.";
+    };
+
+    youtube.dailyQuota = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 10000;
+      example = 100000;
+      description = ''
+        YouTube Data API units the key's Google Cloud project may spend per day
+        (the main pool; it resets at 00:00 Pacific). The chat poller paces itself
+        so a stream fits in what's left. Raise it only after Google grants a
+        quota increase. Clamped to 1000..10000000.
+      '';
+    };
+
+    youtube.budgetHours = lib.mkOption {
+      type = lib.types.number;
+      default = 4;
+      example = 6;
+      description = ''
+        Hours of YouTube live chat per (Pacific) day the remaining quota is spread
+        over. Longer means slower polling (fewer units per hour). YouTube's own
+        suggested interval is capped at 60s, but past budgetHours the quota floor
+        stretches polling up to 10 minutes between polls, so streaming past it
+        keeps working, just more slowly; set it to your real daily stream length
+        to keep chat responsive. Clamped to 0.5..24.
+      '';
     };
 
     alerts.activeTheme = lib.mkOption {

@@ -440,12 +440,24 @@ are optional.
 | `timestamp`   | number                  | Epoch milliseconds                                                                                                |
 | `authorColor` | string?                 | CSS color; derived from the name if the platform gives none                                                       |
 | `segments`    | Segment[]?              | Tokenized body: `{type:"text",text}` or `{type:"emote",url,alt}`                                                  |
-| `badges`      | Badge[]?                | Role chips: `{id,label}`                                                                                          |
+| `badges`      | Badge[]?                | Badges: `{id,label,title?,version?,info?,url?,url2x?,url4x?}`; `url*` = Twitch badge art (1x/2x/4x), else a chip  |
 | `kind`        | MessageKind?            | `chat` (default), `action`, `cheer`, `sub`, `raid`, `follow`, `superchat`, `supersticker`, `membership`, `system` |
 | `amount`      | string?                 | e.g. `"500 bits"`, `"$5.00"`                                                                                      |
 | `quantity`    | number?                 | Numeric twin of `amount` where themed cards need it (cheer bits, raid viewers)                                    |
 | `accentColor` | string?                 | Highlight color for event rows / tiers                                                                            |
 | `eventText`   | string?                 | Notice line for event rows, e.g. "X subscribed for 3 months"                                                      |
 | `sub`         | object?                 | Structured detail for `kind: "sub"`: `{tier?: 1\|2\|3, variant: "new"\|"resub"\|"gift", count?}` (alert themes key off it; `tier` absent = unknown) |
+| `backlog`     | boolean?                | `true` on history older than 5 minutes that YouTube returns while the poller is catching up — a fresh attach, a resume after a gap (a quota park, a key change, an outage of more than 5 minutes), or a page-token reset. Render it, but don't pop an alert for it (`/alerts` skips it). Absent otherwise |
+
+A `Badge`'s `id` is the bare set id (`moderator`, `subscriber`, `member`, …)
+and `label` is always its short chip text (`"Mod"`, `"T2 Sub · 14 mo"`,
+`"Bits 1000"`), which the page draws when the badge has no art or its image
+fails to load. Twitch badges also carry `version` (e.g. `"3012"`, a Tier 3
+12-month subscriber badge) and `info` (the unescaped `badge-info` value, e.g.
+the exact months `"14"`). When the server resolved art for the badge, `url` /
+`url2x` / `url4x` are its 18/36/72px images and `title` is Twitch's title for
+it (e.g. `"Moderator"`, or `"Subscriber (14 months)"` with the months from
+`badge-info`), used as the image's alt and tooltip; `title` is absent when
+there is no art. YouTube badges are `{id,label}` only.
 
 See [Chat Features](features.md) for how these fields are rendered.

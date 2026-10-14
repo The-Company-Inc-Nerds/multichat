@@ -9,8 +9,28 @@ export interface ChannelStatus {
 }
 
 export interface Badge {
+  /** The bare badge set id ("moderator", "subscriber", "member", …). The page
+   *  keys its chip colours on it, so it never carries the version. */
   id: string;
+  /** Short chip text ("Mod", "T2 Sub · 14 mo", "Bits 1000"): the chip drawn
+   *  when there is no art or the art fails to load, so it stays terse. */
   label: string;
+  /** Twitch's own title for the resolved art, with the exact months for a
+   *  subscriber/founder badge ("Subscriber (14 months)"): the image's alt and
+   *  tooltip. Absent when there is no art or Twitch gave it no title. */
+  title?: string;
+  /** Twitch badge version from the `badges` tag, e.g. "3012" for a Tier 3
+   *  12-month subscriber badge or "1000" for bits. */
+  version?: string;
+  /** The unescaped `badge-info` value for this set, e.g. the exact months
+   *  subscribed ("14") or a prediction outcome. */
+  info?: string;
+  /** Badge image (18px, https); absent = render the text chip. */
+  url?: string;
+  /** The same image at 2x (36px). */
+  url2x?: string;
+  /** The same image at 4x (72px). */
+  url4x?: string;
 }
 
 export type Segment =
@@ -67,6 +87,10 @@ export interface ChatMessage {
   /** Structured sub detail (tier + new/resub/gift) for `kind: "sub"` rows. */
   sub?: SubDetail;
   timestamp: number;
+  /** History older than 5 minutes that YouTube returns while the poller is
+   *  catching up — a fresh attach, a resume after a gap, or a page-token
+   *  reset; render it, overlays shouldn't alert on it. Absent otherwise. */
+  backlog?: boolean;
 }
 
 /** Frames pushed over SSE. The client switches on `type`. */
@@ -121,6 +145,11 @@ export interface TwitchEventSubConfig {
 export interface TwitchConfig {
   channels: string[];
   eventsub?: TwitchEventSubConfig;
+  /** The Twitch application's credentials, for app-token Helix reads (badge
+   *  art). Taken from twitch.eventsub.clientId/clientSecret even when eventsub
+   *  has no channels, or from TWITCH_CLIENT_ID/TWITCH_CLIENT_SECRET; absent =
+   *  global badges come from the built-in snapshot only. */
+  app?: { clientId: string; clientSecret: string };
 }
 
 // ---- Twitch EventSub WebSocket frames (only the fields we read) ----------
@@ -164,6 +193,12 @@ export interface YouTubeChannelConfig {
 export interface YouTubeConfig {
   apiKey: string;
   channels: YouTubeChannelConfig[];
+  /** Main-pool Data API units the Google project may spend per Pacific day
+   *  (default 10,000). Raise it after Google grants a quota increase. */
+  dailyQuota?: number;
+  /** Hours of live chat per Pacific day the remaining quota is spread over
+   *  (default 4); sets the chat poll-interval floor. See normalizeYouTubeConfig. */
+  budgetHours?: number;
 }
 
 /**

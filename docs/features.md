@@ -17,8 +17,12 @@ status dot:
 
 Status is driven by the server's real connection state. Twitch flips to `live`
 on the per-channel `ROOMSTATE` line Twitch sends after a join; YouTube reflects
-resolving → live → offline as the poller finds (or fails to find) an active live
-chat. The panel collapses behind a ☰ toggle on narrow screens.
+resolving → live → offline as the poller finds an active live chat and sees it
+end; a YouTube `error` means the API refused the key, the day's quota is spent,
+or Google or the network failed three checks or chat polls in a row — a single
+blip is retried quietly (see
+[Quota and long streams](configuration.md#quota-and-long-streams) — the log
+line says which). The panel collapses behind a ☰ toggle on narrow screens.
 
 ## Platform identity
 
@@ -28,12 +32,35 @@ readable.
 
 ## Role badges
 
-| Platform | Badges                                                                        |
-| -------- | ----------------------------------------------------------------------------- |
-| Twitch   | broadcaster, moderator, VIP, subscriber, founder, staff, turbo, prime/partner |
-| YouTube  | owner, moderator, member, verified                                            |
+| Platform | Badges                                                              |
+| -------- | ------------------------------------------------------------------- |
+| Twitch   | every badge Twitch sends: broadcaster, moderator, VIP, sub, bits, … |
+| YouTube  | owner, moderator, member, verified                                  |
 
-Badges render as small colored chips before the author name.
+Twitch badges render as Twitch's own badge images, before the author name and
+in the head of highlighted event rows that carry them (cheers, subs, raids and
+announcements arriving over IRC; EventSub events have no badges). Hovering a
+badge shows Twitch's title for it, and a subscriber badge also shows the exact
+months from Twitch's `badge-info`: a 14-month sub reads "Subscriber (14
+months)" out of the box, or the channel's own title, such as "1-Year Subscriber
+(14 months)", once app credentials load its badge art. Images come from
+`static-cdn.jtvnw.net` at 1x/2x/4x: dense screens pick the larger art, and the
+bigger `/alerts` cards start on the 2x art, so badges stay sharp in OBS.
+
+- **Global badges** (moderator, VIP, broadcaster, verified, Prime, Turbo, the
+  standard bits and subscriber badges, …) work out of the box, from a built-in
+  copy of Twitch's global badge list.
+- **The channel's own subscriber and bits badges** need Twitch app credentials,
+  since Twitch only hands them out to an authenticated app. As on Twitch, a
+  Tier 2/3 sub in a channel with no art for that tier gets its Tier 1 badge.
+  See [Badge images](configuration.md#badge-images).
+
+A badge with no image (one Twitch's badge lists don't cover) or whose image
+fails to load (a blocked CDN, a retired image) falls back to a small colored
+text chip with a short label: `Mod`, `VIP`, `T2 Sub · 14 mo`, `Bits 1000`, and
+so on. Hovering the chip still shows Twitch's title when there was one. YouTube
+badges are always chips, because the YouTube API reports only yes/no flags with
+no badge art.
 
 ## Author colors
 

@@ -22,8 +22,18 @@ import type {
   TwitchEventSubConfig,
   YouTubeChannelConfig,
 } from "./src/types.ts";
-import { startTwitchClient, type TwitchChatMessage } from "./src/twitch.ts";
-import { startYouTubePoller } from "./src/youtube.ts";
+import {
+  normalizeChannels,
+  startTwitchClient,
+  type TwitchChatMessage,
+} from "./src/twitch.ts";
+import {
+  createYouTubeRuntime,
+  keyFingerprint,
+  normalizeYouTubeConfig,
+  startYouTubePoller,
+  type YouTubeRuntime,
+} from "./src/youtube.ts";
 import { createServer } from "./src/server.ts";
 import { normalizeAlertsConfig } from "./src/alerts.ts";
 import {
@@ -38,8 +48,11 @@ import {
   buildAuthCodeRequest,
   buildAuthorizeUrl,
   buildCheckFollowRequest,
+  buildClientCredentialsRequest,
   buildCreateCustomRewardRequest,
+  buildGetChannelChatBadgesRequest,
   buildGetCustomRewardsRequest,
+  buildGetGlobalChatBadgesRequest,
   buildGetRedemptionsRequest,
   buildRefreshRequest,
   buildSendChatMessageRequest,
@@ -50,6 +63,8 @@ import {
   type HelixResult,
   type HttpRequest,
   LOGIN_SCOPES,
+  parseAppTokenResponse,
+  parseChatBadgesResponse,
   parseCustomRewardsResponse,
   parseFollowersResponse,
   parseHelixResponse,
@@ -57,8 +72,15 @@ import {
   parseTokenResponse,
   parseUsersResponse,
   REDEMPTIONS_MANAGE_SCOPE,
+  resolveAppCredentials,
   type SubscriptionFeature,
 } from "./src/twitchauth.ts";
+import {
+  type BadgeArt,
+  type BadgeSource,
+  resolveBadgeArt,
+  SNAPSHOT_BADGES,
+} from "./src/badges.ts";
 import {
   admitRedemption,
   applyChannelPointsEnv,
@@ -141,6 +163,7 @@ import {
   stateTmpPath,
   twitchBroadcasterStatePath,
   twitchTokenStatePath,
+  youtubeQuotaStatePath,
 } from "./src/control.ts";
 import {
   activeTurn,
@@ -244,15 +267,18 @@ async function loadSettings(path: string): Promise<Settings> {
         raw.server?.controlToken ?? "").trim(),
     },
     twitch: {
-      channels: raw.twitch?.channels ?? [],
+      // Lowercased + deduped: IRC reports every channel by its lowercase
+      // login, so "TheCompanyInc" must not seed a sidebar entry of its own.
+      channels: normalizeChannels(raw.twitch?.channels),
       eventsub: parseEventSubConfig(raw.twitch?.eventsub),
+      // App-token credentials for badge art; kept even with no eventsub
+      // channels (parseEventSubConfig drops the block then).
+      app: resolveAppCredentials(raw.twitch?.eventsub, readEnv),
     },
-    youtube: {
-      // The key is resolved separately at startup (persisted/env/settings) so the
-      // operator can also set it at runtime; see resolveStartupKey.
-      apiKey: raw.youtube?.apiKey ?? "",
-      channels: raw.youtube?.channels ?? [],
-    },
+    // The key is resolved separately at startup (persisted/env/settings) so the
+    // operator can also set it at runtime; see resolveStartupKey. The quota
+    // governor's dailyQuota / budgetHours are defaulted + clamped here.
+    youtube: normalizeYouTubeConfig(raw.youtube),
     alerts: normalizeAlertsConfig(raw.alerts),
     giveaway: normalizeGiveawayConfig(raw.giveaway),
     // Tokens may arrive from the environment instead of the file, so a
@@ -357,6 +383,29 @@ async function persistStateAtomic(path: string, value: string): Promise<void> {
   }
 }
 
+/** Remove the temp files an interrupted persistStateAtomic of any of `paths`
+ *  left beside it (a SIGKILL or power loss between open and rename). Best
+ *  effort; each owner calls it once, before its first write, so a temp file
+ *  a live writer is still using can't be swept. */
+async function sweepStaleTmp(paths: (string | null)[]): Promise<void> {
+  const byDir = new Map<string, string[]>();
+  for (const p of paths) {
+    if (!p) continue;
+    const i = p.lastIndexOf("/");
+    const dir = i > 0 ? p.slice(0, i) : i === 0 ? "/" : ".";
+    byDir.set(dir, [...(byDir.get(dir) ?? []), p.slice(i + 1)]);
+  }
+  for (const [dir, bases] of byDir) {
+    try {
+      for await (const ent of Deno.readDir(dir)) {
+        if (ent.isFile && bases.some((b) => isStaleStateTmp(ent.name, b))) {
+          await Deno.remove(`${dir}/${ent.name}`).catch(() => {});
+        }
+      }
+    } catch { /* best-effort */ }
+  }
+}
+
 /** Best-effort append one line to a state file (0600) — the winners JSONL.
  *  Append-only means a crash can corrupt at most the trailing line. */
 async function appendState(path: string, line: string): Promise<void> {
@@ -367,18 +416,88 @@ async function appendState(path: string, line: string): Promise<void> {
   }
 }
 
+/** How often, at most, the YouTube quota ledger is written to disk. */
+const YT_QUOTA_PERSIST_MS = 30_000;
+
 /**
  * Owns the live YouTube API key. Setting a key persists it (so it survives a
  * service restart), tears down any running poller, and starts a fresh one — so
  * the key can be supplied, replaced, or rotated while the server is running.
+ *
+ * Every poller generation shares ONE runtime: the quota ledger (today's
+ * estimated Data API spend, persisted to `quota.statePath` at most every 30s
+ * and on shutdown, so a restart can't reset the day's budget), resolved
+ * channel/uploads ids, seen message ids and page tokens — so a key change
+ * resumes the chat instead of replaying it. A key whose fingerprint differs
+ * from the ledger's may belong to another Google project: today restarts from
+ * zero for it.
  */
 function createYouTubeKeyManager(opts: {
   getEmitter: () => Emitter;
   channels: YouTubeChannelConfig[];
   statePath: string | null;
+  quota?: {
+    dailyQuota?: number;
+    budgetHours?: number;
+    statePath: string | null;
+  };
 }) {
   let current = "";
   let controller: AbortController | null = null;
+  let runtime: Promise<YouTubeRuntime> | null = null;
+
+  // Load (once) the persisted ledger and build the shared runtime. Writes are
+  // throttled to one per YT_QUOTA_PERSIST_MS, serialized, atomic, and flushed
+  // on SIGTERM/SIGINT. A missing/unreadable file just starts today at zero;
+  // temp files an interrupted write left behind are swept first.
+  function getRuntime(): Promise<YouTubeRuntime> {
+    runtime ??= (async () => {
+      const path = opts.quota?.statePath ?? null;
+      let snapshot: unknown;
+      if (path) {
+        await sweepStaleTmp([path]);
+        try {
+          snapshot = JSON.parse(await Deno.readTextFile(path));
+        } catch (e) {
+          if (!(e instanceof Deno.errors.NotFound)) {
+            console.error(
+              `[YouTube] Ignoring unreadable quota ledger ${path}: ${e}`,
+            );
+          }
+        }
+      }
+      let timer: number | undefined;
+      let chain: Promise<void> = Promise.resolve();
+      const write = () => {
+        if (!path) return chain;
+        chain = chain.then(() =>
+          persistStateAtomic(path, JSON.stringify(rt.ledger.snapshot()))
+        );
+        return chain;
+      };
+      const rt = createYouTubeRuntime({
+        dailyQuota: opts.quota?.dailyQuota,
+        budgetHours: opts.quota?.budgetHours,
+        snapshot,
+        onChange: () => {
+          if (!path || timer !== undefined) return;
+          timer = setTimeout(() => {
+            timer = undefined;
+            void write();
+          }, YT_QUOTA_PERSIST_MS);
+        },
+      });
+      if (path) {
+        flushOnShutdown(async () => {
+          if (timer !== undefined) clearTimeout(timer);
+          timer = undefined;
+          await write();
+        });
+      }
+      return rt;
+    })();
+    return runtime;
+  }
 
   async function persist(key: string): Promise<void> {
     if (!opts.statePath) return; // in-memory only (no StateDirectory)
@@ -405,19 +524,34 @@ function createYouTubeKeyManager(opts: {
 
     current = key;
     if (persistKey) await persist(key);
+    const rt = opts.channels.length ? await getRuntime() : null;
+    // A newer key arrived while we awaited: that call starts the poller.
+    if (key !== current) return { ok: true, message: "YouTube API key set" };
 
     controller?.abort(); // stop the previous poller generation
-    if (opts.channels.length === 0) {
+    if (!rt) {
       return {
         ok: true,
         message: "YouTube API key set (no channels configured)",
       };
     }
+    if (rt.ledger.adoptKey(keyFingerprint(key))) {
+      console.log(
+        "[YouTube] New API key — counting today's quota from zero (it may " +
+          "belong to a different Google project).",
+      );
+    }
     controller = new AbortController();
     startYouTubePoller(
-      { apiKey: key, channels: opts.channels },
+      {
+        apiKey: key,
+        channels: opts.channels,
+        dailyQuota: opts.quota?.dailyQuota,
+        budgetHours: opts.quota?.budgetHours,
+      },
       opts.getEmitter(),
       controller.signal,
+      rt,
     );
     const n = opts.channels.length;
     console.log(`[Control] YouTube poller (re)started for ${n} channel(s).`);
@@ -428,6 +562,201 @@ function createYouTubeKeyManager(opts: {
   }
 
   return { apply };
+}
+
+/** How long a fetched badge list is trusted before it is refreshed, and the
+ *  floor between attempts after a failed fetch. */
+const BADGE_GLOBAL_REFRESH_MS = 24 * 60 * 60_000;
+const BADGE_ROOM_REFRESH_MS = 6 * 60 * 60_000;
+const BADGE_RETRY_MS = 5 * 60_000;
+
+/**
+ * Owns Twitch chat-badge art for the IRC client: a BadgeSource whose
+ * synchronous resolve() answers from whatever is loaded right now, while the
+ * Helix fetches happen lazily behind it. Without Twitch app credentials it is
+ * just the built-in global snapshot. With them: an app token (client
+ * credentials — no `multichat login` needed) cached until 5 min before it
+ * expires, minted single-flight and re-minted once on a 401; Helix global
+ * badges loaded at start and refreshed daily; each room's custom subscriber/
+ * bits badges loaded on its ROOMSTATE (or first message) and refreshed every
+ * 6h. A failed fetch keeps the last good list and is retried no sooner than
+ * 5 min later, on the next resolve/noteRoom. Every call is time-boxed and
+ * caught, so nothing here can throw into the IRC path.
+ */
+function createTwitchBadgeManager(app: TwitchConfig["app"]): BadgeSource {
+  if (!app) {
+    console.log(
+      "[Badges] Global Twitch badges (mod, VIP, Prime, …) render from the " +
+        "built-in set; the channel's own subscriber/bits badges need " +
+        "twitch.eventsub.clientId + clientSecret (or TWITCH_CLIENT_ID/" +
+        "TWITCH_CLIENT_SECRET) — see docs/configuration.md.",
+    );
+    return SNAPSHOT_BADGES;
+  }
+  const { clientId, clientSecret } = app;
+
+  let token = "";
+  let tokenExpiresAt = 0;
+  let minting: Promise<string | null> | null = null;
+
+  async function mintToken(): Promise<string | null> {
+    const req = buildClientCredentialsRequest(clientId, clientSecret);
+    let status = 0;
+    let json: unknown = null;
+    try {
+      const res = await fetch(req.url, {
+        method: req.method,
+        headers: req.headers,
+        body: req.body,
+        signal: AbortSignal.timeout(10_000),
+      });
+      status = res.status;
+      json = res.ok ? await res.json() : await res.json().catch(() => null);
+    } catch (e) {
+      console.error(`[Badges] app token request failed: ${e}`);
+      return null;
+    }
+    const parsed = status < 300 ? parseAppTokenResponse(json) : null;
+    if (!parsed) {
+      const r = parseHelixResponse(status, json);
+      console.error(
+        `[Badges] app token rejected (HTTP ${status}): ${
+          r.ok ? "no access_token in the response" : r.message
+        } — check the Twitch app's clientId/clientSecret`,
+      );
+      return null;
+    }
+    token = parsed.accessToken;
+    tokenExpiresAt = Date.now() +
+      Math.max(0, parsed.expiresInSec - 300) * 1000;
+    return token;
+  }
+
+  // Single-flight: badge lists loading together share one mint.
+  function getToken(): Promise<string | null> {
+    if (token && Date.now() < tokenExpiresAt) return Promise.resolve(token);
+    if (!minting) {
+      minting = mintToken().finally(() => {
+        minting = null;
+      });
+    }
+    return minting;
+  }
+
+  /** GET one Helix badge list; null on any failure (already logged). */
+  async function fetchBadges(
+    label: string,
+    build: (token: string) => HttpRequest,
+  ): Promise<Map<string, BadgeArt> | null> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const tok = await getToken();
+      if (!tok) return null; // mintToken logged why
+      const req = build(tok);
+      let status = 0;
+      let json: unknown = null;
+      try {
+        const res = await fetch(req.url, {
+          method: req.method,
+          headers: req.headers,
+          signal: AbortSignal.timeout(10_000),
+        });
+        status = res.status;
+        // A 2xx body that won't parse is a failure, not an empty list.
+        json = res.ok ? await res.json() : await res.json().catch(() => null);
+      } catch (e) {
+        console.error(`[Badges] ${label}: request failed: ${e}`);
+        return null;
+      }
+      const r = parseHelixResponse(status, json);
+      if (r.ok) return parseChatBadgesResponse(r.json);
+      // Revoked or expired early: drop the token (unless a concurrent load
+      // already replaced it) and mint a fresh one, once.
+      if (r.kind === "unauthorized" && attempt === 0) {
+        if (token === tok) token = "";
+        continue;
+      }
+      console.error(`[Badges] ${label}: HTTP ${r.status} — ${r.message}`);
+      return null;
+    }
+    return null;
+  }
+
+  interface BadgeList {
+    /** The last good list (undefined until one loads). */
+    art?: Map<string, BadgeArt>;
+    /** Start a fetch if one is due and none is running. */
+    poke: () => void;
+  }
+
+  function badgeList(
+    label: string,
+    noun: string,
+    refreshMs: number,
+    build: (token: string) => HttpRequest,
+  ): BadgeList {
+    let nextAt = 0;
+    let busy = false;
+    const list: BadgeList = {
+      poke() {
+        if (busy || Date.now() < nextAt) return;
+        busy = true;
+        fetchBadges(label, build)
+          .then((art) => {
+            if (art && !list.art) {
+              console.log(`[Badges] ${label}: ${art.size} ${noun}`);
+            }
+            if (art) list.art = art;
+            nextAt = Date.now() + (art ? refreshMs : BADGE_RETRY_MS);
+          })
+          .catch((e) => {
+            console.error(`[Badges] ${label}: ${e}`);
+            nextAt = Date.now() + BADGE_RETRY_MS;
+          })
+          .finally(() => {
+            busy = false;
+          });
+      },
+    };
+    return list;
+  }
+
+  const global = badgeList(
+    "global",
+    "badge version(s) from Helix",
+    BADGE_GLOBAL_REFRESH_MS,
+    (t) => buildGetGlobalChatBadgesRequest(clientId, t),
+  );
+  const rooms = new Map<string, BadgeList>();
+
+  // The room's list, created on first sight; room ids are numeric user ids.
+  function roomList(roomId: string | undefined): BadgeList | undefined {
+    if (!roomId || !/^\d+$/.test(roomId)) return undefined;
+    let list = rooms.get(roomId);
+    if (!list) {
+      list = badgeList(
+        `room ${roomId}`,
+        "custom badge version(s)",
+        BADGE_ROOM_REFRESH_MS,
+        (t) => buildGetChannelChatBadgesRequest(clientId, t, roomId),
+      );
+      rooms.set(roomId, list);
+    }
+    return list;
+  }
+
+  global.poke();
+  return {
+    resolve(roomId, set, version) {
+      global.poke();
+      const room = roomList(roomId);
+      room?.poke();
+      return resolveBadgeArt(set, version, room?.art, global.art);
+    },
+    noteRoom(roomId) {
+      global.poke();
+      roomList(roomId)?.poke();
+    },
+  };
 }
 
 /**
@@ -1580,26 +1909,10 @@ function createChannelPointsEngine(opts: {
     return { kind: "corrupt" };
   }
 
-  /** Remove temp files an interrupted atomic write left in the state dir. */
-  async function sweepStaleTmp(): Promise<void> {
-    const dir = opts.stateDir;
-    const bases = [ledgerPath, rewardsPath, controlPath]
-      .filter((p): p is string => !!p)
-      .map((p) => p.slice(p.lastIndexOf("/") + 1));
-    if (!dir || bases.length === 0) return;
-    try {
-      for await (const ent of Deno.readDir(dir)) {
-        if (ent.isFile && bases.some((b) => isStaleStateTmp(ent.name, b))) {
-          await Deno.remove(`${dir}/${ent.name}`).catch(() => {});
-        }
-      }
-    } catch { /* best-effort */ }
-  }
-
   /** Restore the ledger, reward map and manual pause. A corrupt file is moved
    *  aside and reported with what starting without it means. */
   async function init(): Promise<void> {
-    await sweepStaleTmp();
+    await sweepStaleTmp([ledgerPath, rewardsPath, controlPath]);
     const isObject = (v: unknown) =>
       typeof v === "object" && v !== null && !Array.isArray(v);
     if (ledgerPath) {
@@ -2589,12 +2902,18 @@ function warnChannelPointsSetup(
 /** Grace period for writing state on SIGTERM/SIGINT before exiting anyway. */
 const SHUTDOWN_FLUSH_MS = 3_000;
 
+const shutdownFlushes: Array<() => Promise<void>> = [];
+
 /**
  * On SIGTERM (systemd stop / deploy) or SIGINT (Ctrl-C), write the latest
  * state before exiting instead of dying mid-write, bounded so a stuck disk
- * can't hold the stop up. A second signal exits at once.
+ * can't hold the stop up. A second signal exits at once. Every registered
+ * flush runs under one set of listeners, so one finishing early can't exit
+ * the process while another is still writing.
  */
 function flushOnShutdown(flush: () => Promise<void>): void {
+  shutdownFlushes.push(flush);
+  if (shutdownFlushes.length > 1) return; // listeners already installed
   let stopping = false;
   const onSignal = (sig: "SIGTERM" | "SIGINT") => {
     const code = sig === "SIGINT" ? 130 : 0;
@@ -2602,9 +2921,8 @@ function flushOnShutdown(flush: () => Promise<void>): void {
     stopping = true;
     console.log(`[Control] ${sig} — saving state before exit.`);
     const deadline = new Promise<void>((r) => setTimeout(r, SHUTDOWN_FLUSH_MS));
-    void Promise.race([flush().catch(() => {}), deadline]).finally(() =>
-      Deno.exit(code)
-    );
+    const all = Promise.all(shutdownFlushes.map((f) => f().catch(() => {})));
+    void Promise.race([all, deadline]).finally(() => Deno.exit(code));
   };
   for (const sig of ["SIGTERM", "SIGINT"] as const) {
     try {
@@ -2627,6 +2945,11 @@ async function runServer(configPath: string): Promise<void> {
     getEmitter: () => emitter,
     channels: settings.youtube.channels,
     statePath,
+    quota: {
+      dailyQuota: settings.youtube.dailyQuota,
+      budgetHours: settings.youtube.budgetHours,
+      statePath: youtubeQuotaStatePath(stateDir),
+    },
   });
 
   // The giveaway engine (when enabled) needs the per-channel broadcaster token to
@@ -2715,6 +3038,9 @@ async function runServer(configPath: string): Promise<void> {
             console.error(`[Giveaway] handler error: ${e}`)
           )
         : undefined,
+      // Badge art: the built-in global set, plus Helix (global + each
+      // channel's custom sub/bits badges) when Twitch app creds exist.
+      createTwitchBadgeManager(twitch.app),
     );
   } else {
     console.log("No Twitch channels configured.");

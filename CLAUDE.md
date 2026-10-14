@@ -38,8 +38,8 @@ deno run --allow-net --allow-read --allow-write=/var/lib/multichat,/var/lib/priv
 their settings.json counterparts; the YouTube key is resolved as persisted
 runtime key → `YOUTUBE_API_KEY` → `youtube.apiKey`.
 
-`--allow-write` exists so state can be persisted: the runtime YouTube key, the
-rotated Twitch refresh tokens, the whole giveaway (entrant pool, campaign
+`--allow-write` exists so state can be persisted: the runtime YouTube key and
+its per-Pacific-day quota ledger, the rotated Twitch refresh tokens, the whole giveaway (entrant pool, campaign
 counters, append-only winners log, turn ledger, chat-cards pack reports,
 committed draw plan), and channel points (the redemption ledger, the catalogue
 key → Twitch reward id map, the manual pause). `resolveStateDir` in
@@ -111,12 +111,23 @@ Copy `settings.json.example` to `settings.json` and edit:
   pages have no auth either way. Both are env-overridable
   (`MULTICHAT_CONTROL_ACCESS`, `MULTICHAT_CONTROL_TOKEN`) so the NixOS module can
   carry the token via `LoadCredential`. See `src/control.ts`
-- `twitch.channels` — list of Twitch channel names (lowercase)
+- `twitch.channels` — list of Twitch channel names (normalized on load: case,
+  a leading `#` and duplicates don't matter — `normalizeChannels`)
 - `twitch.eventsub` — optional `{clientId, clientSecret, channels}` for follow/
-  cheer/sub/raid **alerts** via Twitch EventSub (chat alone works without it)
+  cheer/sub/raid **alerts** via Twitch EventSub (chat alone works without it).
+  Its `clientId` + `clientSecret` alone (no channels needed; or
+  `TWITCH_CLIENT_ID`/`TWITCH_CLIENT_SECRET`) also unlock the channel's own
+  sub/bits **badge art** via an app token (`TwitchConfig.app`); global badges
+  render from a built-in snapshot with no credentials at all
 - `youtube.apiKey` — YouTube Data API v3 key (get one at Google Cloud Console)
 - `youtube.channels` — list of `{handle, channelId, videoId}` objects; supply at
   least one field per entry
+- `youtube.dailyQuota` / `youtube.budgetHours` — optional quota pacing (default
+  10000 units/day, 4 live hours/day): the chat poll interval is stretched so a
+  `budgetHours` stream fits what's left of the Pacific day's quota; past
+  `budgetHours` the quota floor keeps stretching polling (YouTube's own interval
+  is capped at 60s, the floor at 10 min) instead of exhausting the pool — set
+  `budgetHours` to the real daily stream length for responsiveness
 - `alerts` — optional `{activeTheme, themes}` registry that skins the `/alerts`
   overlay (built-in styles `default` / `company-memo`); unset = default look.
   Under `company-memo`, three kinds get stamped Company documents: subs =
@@ -201,7 +212,14 @@ stickers/memberships need only the API key). Full reference:
 ```
 main.ts          entry point — loads settings, wires the emitter to server + clients;
                  also the `set-youtube-key` / `login` / `fake` / `giveaway` / `rewards` CLI
-                 subcommands + the runtime-key manager, the EventSub manager (per-channel token
+                 subcommands + the runtime-key manager (owns one YouTube runtime across key
+                 changes: quota ledger persisted to youtube-quota.json (stale temp files swept
+                 before it loads), throttled, reset when the
+                 key's fingerprint changes), the Twitch badge manager (createTwitchBadgeManager:
+                 a BadgeSource — snapshot-only without app creds; with them a lazily minted
+                 client-credentials app token, Helix global badges refreshed daily and each
+                 room's custom badges (room-id from IRC) every 6h, failures retried after 5 min,
+                 all fetches time-boxed, never throws into the IRC path), the EventSub manager (per-channel token
                  lifecycle + one WebSocket per broadcaster; exposes getChannelAuth, forwards
                  onFollow; captures the token's granted scopes and hands the channel-points
                  channel its redemption subscriptions + observers, warning loudly when its
@@ -223,9 +241,11 @@ main.ts          entry point — loads settings, wires the emitter to server + c
                  every EventSub session and every 5 min; auto-pause from GET /effects/health
                  every 15s with 2-check hysteresis on accepting && ready; a loud log every 5 min
                  while the channel's token never arrived; state files written atomically (tmp +
-                 fsync + rename), flushed on SIGTERM/SIGINT, a corrupt one moved aside loudly;
+                 fsync + rename; leftover temp files swept at init by the shared
+                 sweepStaleTmp), flushed on SIGTERM/SIGINT, a corrupt one moved aside loudly;
                  all outbound calls time-boxed)
-src/types.ts     shared TypeScript interfaces (Settings, ChatMessage w/ SubDetail, ServerEvent, Emitter,
+src/types.ts     shared TypeScript interfaces (Settings, ChatMessage w/ SubDetail + backlog flag,
+                 Badge w/ version/info/title/url/url2x/url4x, ServerEvent, Emitter, TwitchConfig.app,
                  TwitchEventSubConfig, EventSub frames, GiveawayConfig/State/Entrant/
                  CampaignState/CampaignSummary/Winner/Draw/Turn/Disposition/Plan, TermsAcceptance,
                  TurnAggregates, IntegrationsConfig/Subscriber, PackReport, ChannelPointsConfig/
@@ -234,7 +254,18 @@ src/twitch.ts    Twitch IRC over WebSocket (wss://irc-ws.chat.twitch.tv), with r
                  handleCommand takes an optional isCovered predicate so EventSub-covered
                  channels emit only chat text (their events come from EventSub instead), and
                  an optional onMessage callback that surfaces each PRIVMSG's raw user-id/login
-                 to the giveaway watcher (kept out of the rendered ChatMessage/SSE)
+                 to the giveaway watcher (kept out of the rendered ChatMessage/SSE), and an
+                 optional BadgeSource that decorates each badge with art by the message's
+                 room-id (Shared Chat: source-badges vs source-room-id; ROOMSTATE → noteRoom);
+                 parseBadges keeps version + badge-info; normalizeChannels for settings
+src/badges.ts    pure badge-art helpers: BadgeArt/BadgeArtMap, resolveBadgeArt (channel exact →
+                 channel nearest-lower sub in the same tier → the channel's Tier 1 art for a
+                 Tier 2/3 sub → Helix global → snapshot → channel nearest-lower bits →
+                 generic subscriber/founder), badgeLabel (short chip text, kept as
+                 Badge.label), decorateBadge (adds url/url2x/url4x + Twitch's title as
+                 Badge.title), the BadgeSource interface + SNAPSHOT_BADGES
+src/twitchbadges.ts generated snapshot of Twitch's global chat badges (set/version → CDN uuid +
+                 title); regenerate with tools/gen-global-badges.ts; live Helix data wins
 src/eventsub.ts  Twitch EventSub over WebSocket (wss://eventsub.wss.twitch.tv) — the source
                  of truth for follow/cheer/sub/raid on configured channels; pure
                  notification→ChatMessage mappers + classifyFrame are exported/tested, the
@@ -248,13 +279,31 @@ src/eventsub.ts  Twitch EventSub over WebSocket (wss://eventsub.wss.twitch.tv) �
 src/twitchauth.ts pure Twitch OAuth + EventSub request builders / response parsers
                  (refresh + auth-code grants incl. the granted `scope[]`, /users,
                  create-subscription, /channels/followers follow check + /chat/messages send,
-                 custom rewards GET/POST/PATCH + redemptions GET/PATCH + parseHelixResponse)
+                 custom rewards GET/POST/PATCH + redemptions GET/PATCH + parseHelixResponse,
+                 client-credentials app token + Helix chat badges global/channel builders +
+                 parseChatBadgesResponse, resolveAppCredentials)
                  + the SUBSCRIPTIONS table (source of truth for EventSub types/versions/scopes;
                  the redemption pair is tagged feature "channelPoints", see subscriptionsFor)
                  + LOGIN_SCOPES (EVENTSUB_SCOPES — now incl. channel:manage:redemptions — + the
                  user:write:chat action scope the login flow requests for giveaway replies)
-src/youtube.ts   YouTube Data API v3 polling — resolves channel → live video → live chat;
-                 startYouTubePoller takes an AbortSignal so it can be torn down/restarted
+src/youtube.ts   YouTube Data API v3 polling, quota-aware: live detection from the uploads
+                 playlist + videos.list (~2 units/check every 3 min) with a rationed search.list
+                 fallback (daily cap + spacing, parked until Pacific midnight on its 429);
+                 classifyYtError/ytFetch (JSON error reasons → quotaDaily/searchQuota/
+                 rateLimited/chatEnded/badPageToken/denied/transient; time-boxed, key
+                 redacted from URLs and error text by redactKey); the per-Pacific-day quota
+                 ledger + poll-interval governor (pollFloorMs holds back ≈40 units/h of
+                 discovery per watched channel; governedIntervalMs caps the API's ask at
+                 60s but lets the quota floor stretch to MAX_GOVERNED_POLL_MS = 10 min);
+                 the chat loop ends on liveChatEnded/offlineAt/chatEndedEvent/periodic
+                 videos.list check and rediscovers; a key/project rejection mid-chat is an
+                 `error` on the 10-min retry that keeps the chat's page token, so a new key
+                 resumes at once; discovery rides out transient failures (5s→60s back-off,
+                 `error` after 3 in a row); seen-id dedupe + page tokens survive
+                 re-attaches; while catching up (any attach, a pageTokenInvalid reset, an
+                 unplanned gap > 5 min) items older than 5 min are flagged backlog. createYouTubeRuntime
+                 (injectable clock/sleep/fetch for the scenario tests) is shared across poller
+                 generations; startYouTubePoller takes an AbortSignal so it can be torn down
 src/server.ts    Deno.serve HTTP server: GET / + GET /overlay + GET /alerts + GET /giveaway
                  (embedded HTML; overlay = transparent chat OBS source, alerts = animated
                  shoutout pop-ups with selectable themes, e.g. the "company-memo" redacted-memo
@@ -312,7 +361,7 @@ src/channelpoints.ts pure channel-points helpers: normalizeChannelPointsConfig /
 src/control.ts   pure control-plane helpers (loopback + private-range checks, the
                  controlAccess/controlToken policy behind POST /api/giveaway, key-body parse,
                  startup-key resolution, resolveStateDir + the state paths under it incl.
-                 Twitch token/broadcaster-id + giveaway
+                 YouTube quota ledger + Twitch token/broadcaster-id + giveaway
                  pool/campaign/winners-log/packs/turns/terms/plan + channel-points
                  ledger/rewards/control, the atomic-write temp / corrupt-file quarantine names,
                  browserRequestDenied) + the ServerHooks
@@ -321,6 +370,8 @@ src/control.ts   pure control-plane helpers (loopback + private-range checks, th
 src/fake.ts      pure fake-event helpers: the curated demo sequence + wire
                  (de)serialization/validation behind POST /api/fake
 tests/           one *_test.ts per source module; dependency-free assert shim in _assert.ts
+tools/           dev scripts (shot.ts screenshots, gen-global-badges.ts regenerates
+                 src/twitchbadges.ts) — not part of the server
 ```
 
 Pure helpers (`parseIRC`, `handleCommand`, `buildSegments`, `emitItem`,
@@ -336,7 +387,8 @@ a `Set<ReadableStreamDefaultController>`; the browser switches on `event.type`.
 `createServer` also keeps a per-channel status registry (seeded from settings)
 so it can push a roster snapshot to each newly connected client.
 
-The browser renders platform-specific richness: Twitch/YouTube role badges,
+The browser renders platform-specific richness: Twitch badge images (text chips
+when no art is known) and YouTube role badges,
 author colors, image emotes (Twitch only — see note), `/me` actions, highlighted
 event rows (cheers, subs, raids, Super Chats, Super Stickers, memberships), and
 live message deletions. A left sidebar lists every watched channel with a

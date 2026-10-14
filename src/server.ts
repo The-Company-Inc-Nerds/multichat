@@ -22,6 +22,7 @@ import { describeFakeAction, parseFakeAction } from "./fake.ts";
 import { parseGiveawayAction } from "./giveaway.ts";
 import { parseTurnReport } from "./integrations.ts";
 import { parseRewardsAction } from "./channelpoints.ts";
+import { youtubeLabel } from "./youtube.ts";
 
 const HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -184,10 +185,28 @@ const HTML = `<!DOCTYPE html>
       color: #d8d8e0;
     }
     .role.broadcaster, .role.owner { background: #eb0400; color: #fff; }
-    .role.moderator { background: #00ad03; color: #fff; }
+    .role.moderator, .role.lead_moderator { background: #00ad03; color: #fff; }
     .role.vip       { background: #e005b9; color: #fff; }
     .role.subscriber, .role.founder, .role.member { background: #6441a5; color: #fff; }
-    .role.verified  { background: #1d9bf0; color: #fff; }
+    .role.verified, .role.partner { background: #1d9bf0; color: #fff; }
+    .role.staff, .role.admin, .role.global_mod { background: #e6b400; color: #18181b; }
+    .role.premium   { background: #0e9dd9; color: #fff; }
+    .role.turbo     { background: #59399a; color: #fff; }
+
+    /* Twitch badge art (a badge with a url). Sized in px to match the 18px 1x
+       image; the srcset's x-descriptors only cover dense screens (OBS is 1x),
+       so badgeImg starts the ~27px alert-card badge on the 36px art itself.
+       Twitch's art is square, so aspect-ratio reserves a square box until the
+       image loads (then its own ratio applies): a late badge can't widen, and
+       re-wrap, an already-pinned row. Not .badge — that's the T/YT platform
+       chip. */
+    .tbadge {
+      height: 18px;
+      width: auto;
+      aspect-ratio: auto 1 / 1;
+      flex-shrink: 0;
+      align-self: center;
+    }
 
     .chan {
       font-size: 10px;
@@ -311,6 +330,9 @@ const HTML = `<!DOCTYPE html>
       mask-image: linear-gradient(to bottom, transparent 0, #000 56px);
     }
     body.overlay .chan { display: none; }   /* the T/YT badge already shows source */
+    /* Badges scale with the larger overlay font instead of staying desktop-small. */
+    body.overlay .tbadge { height: 1.15em; }
+    body.overlay .role { font-size: 0.65em; }
     /* The base .user is flex-shrink:0 with no width cap, so a long single-token
        name at a large overlay font would spill past the pill (clipped by #chat's
        overflow:hidden). In overlay, let it shrink and — only when a single token
@@ -422,6 +444,8 @@ const HTML = `<!DOCTYPE html>
     .alert-card .amount { font-size: 0.62em; }
     .alert-card .ebody { font-size: 0.66em; margin-top: 10px; }
     .alert-card .badge { font-size: 0.4em; }
+    .alert-card .role { font-size: 0.4em; }
+    .alert-card .tbadge { height: 0.9em; }
 
     /* ---- Theme: "company-memo" ("The Company, Inc") ----
        An opaque office-memo note on paper. Overrides the dark card look; the
@@ -624,6 +648,9 @@ const HTML = `<!DOCTYPE html>
       return e;
     }
 
+    var TWITCH_EMOTE_CDN = 'https://static-cdn.jtvnw.net/emoticons/';
+    var TWITCH_EMOTE_1X = '/default/dark/1.0';
+
     // Render a message body from segments (text + emote images) or plain content.
     function renderBody(el, m) {
       if (m.segments && m.segments.length) {
@@ -633,9 +660,23 @@ const HTML = `<!DOCTYPE html>
             var img = document.createElement('img');
             img.className = 'emote';
             img.src = s.url;
+            // Twitch's emote CDN also serves 2.0/3.0 scales: offer them so
+            // emotes stay crisp at the larger overlay/alert sizes.
+            if (s.url.indexOf(TWITCH_EMOTE_CDN) === 0 &&
+                s.url.slice(-TWITCH_EMOTE_1X.length) === TWITCH_EMOTE_1X) {
+              var base = s.url.slice(0, -3);
+              img.srcset = s.url + ' 1x, ' + base + '2.0 2x, ' + base + '3.0 4x';
+            }
             img.alt = s.alt;
             img.title = s.alt;
             img.loading = 'lazy';
+            // An unreachable CDN would leave a broken-image icon: show the
+            // emote's code as text instead, like a badge falls back to a chip.
+            img.onerror = function() {
+              if (this.parentNode) {
+                this.parentNode.replaceChild(document.createTextNode(this.alt), this);
+              }
+            };
             el.appendChild(img);
           } else {
             el.appendChild(document.createTextNode(s.text));
@@ -646,15 +687,62 @@ const HTML = `<!DOCTYPE html>
       }
     }
 
+    // Badge ids with their own chip colour (see .role.* in the CSS).
+    var ROLE_COLORS = ['broadcaster','owner','moderator','lead_moderator','vip','subscriber',
+                       'founder','member','verified','partner','staff','admin','global_mod',
+                       'premium','turbo'];
+
+    // The short label is the chip text; Twitch's title (when the art had one)
+    // is the fuller hover text.
+    function roleChip(b) {
+      var cls = ROLE_COLORS.indexOf(b.id) !== -1 ? 'role ' + b.id : 'role';
+      var chip = make('span', cls, b.label);
+      chip.title = b.title || b.label;
+      return chip;
+    }
+
+    // Twitch badge art at 1x/2x/4x, titled for hover and screen readers.
+    function badgeImg(b) {
+      var img = document.createElement('img');
+      img.className = 'tbadge';
+      // .tbadge reserves a square box up front; should the art (or the chip
+      // that replaces it) still change the row's height, keep a pinned feed
+      // on its newest row.
+      img.onload = function() {
+        if (pinned) scrollToNewest();
+      };
+      // Art that won't load (a retired image, a blocked CDN) becomes the chip.
+      img.onerror = function() {
+        if (!img.parentNode) return;
+        img.parentNode.replaceChild(roleChip(b), img);
+        if (pinned) scrollToNewest();
+      };
+      // x-descriptors pick by device pixel ratio only, and OBS renders at 1x:
+      // the alert card draws badges at ~27px (0.9em of 30px), so it starts one
+      // step up on the 36px art; elsewhere the 18px art is drawn at ~18px.
+      var set;
+      if (alertsMode && b.url2x) {
+        img.src = b.url2x;
+        set = [b.url2x + ' 1x'];
+        if (b.url4x) set.push(b.url4x + ' 2x');
+      } else {
+        img.src = b.url;
+        set = [b.url + ' 1x'];
+        if (b.url2x) set.push(b.url2x + ' 2x');
+        if (b.url4x) set.push(b.url4x + ' 4x');
+      }
+      img.srcset = set.join(', ');
+      img.alt = b.title || b.label;
+      img.title = b.title || b.label;
+      img.decoding = 'async';
+      return img;
+    }
+
     function badges(row, m) {
       if (!m.badges) return;
       for (var i = 0; i < m.badges.length; i++) {
         var b = m.badges[i];
-        var known = ['broadcaster','owner','moderator','vip','subscriber','founder','member','verified'];
-        var cls = known.indexOf(b.id) !== -1 ? 'role ' + b.id : 'role';
-        var chip = make('span', cls, b.label);
-        chip.title = b.label;
-        row.appendChild(chip);
+        row.appendChild(b.url ? badgeImg(b) : roleChip(b));
       }
     }
 
@@ -680,6 +768,7 @@ const HTML = `<!DOCTYPE html>
       var head = make('div', 'ehead');
       var badge = make('span', 'badge ' + m.platform, m.platform === 'twitch' ? 'T' : 'YT');
       head.appendChild(badge);
+      badges(head, m);
       head.appendChild(make('span', 'etitle', m.eventText || m.author));
       if (m.amount) head.appendChild(make('span', 'amount', m.amount));
       row.appendChild(head);
@@ -761,9 +850,12 @@ const HTML = `<!DOCTYPE html>
       if (ev.messageId) {
         removeMatching(function(r) { return r.getAttribute('data-id') === ev.messageId; });
       } else if (ev.author) {
+        // A ban/timeout (CLEARCHAT) names the user by lowercase login while
+        // rows carry the display name, so match case-insensitively.
+        var who = ev.author.toLowerCase();
         removeMatching(function(r) {
           return r.getAttribute('data-channel') === ev.channel &&
-                 r.getAttribute('data-author') === ev.author;
+                 (r.getAttribute('data-author') || '').toLowerCase() === who;
         });
       } else {
         removeMatching(function(r) { return r.getAttribute('data-channel') === ev.channel; });
@@ -985,7 +1077,11 @@ const HTML = `<!DOCTYPE html>
       if (ev.type === 'message') {
         // In alerts mode only shoutout kinds are shown, one at a time; everything
         // else (plain chat, system notices) is ignored. Other modes render inline.
-        if (alertsMode) { if (ALERT_KINDS[ev.data.kind]) enqueueAlert(ev.data); }
+        // History replayed on a YouTube (re)attach carries backlog: true — it
+        // already happened, so it must not pop an alert again.
+        if (alertsMode) {
+          if (ALERT_KINDS[ev.data.kind] && !ev.data.backlog) enqueueAlert(ev.data);
+        }
         else addMsg(ev.data);
       }
       else if (ev.type === 'status') renderStatus(ev.data);
@@ -1679,7 +1775,7 @@ export function createServer(
     });
   }
   for (const ch of settings.youtube.channels) {
-    const name = ch.handle ?? ch.channelId ?? ch.videoId ?? "unknown";
+    const name = youtubeLabel(ch); // the same name the poller reports under
     statuses.set(key("youtube", name), {
       platform: "youtube",
       name,

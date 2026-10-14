@@ -15,7 +15,9 @@
   },
   "youtube": {
     "apiKey": "",
-    "channels": []
+    "channels": [],
+    "dailyQuota": 10000,
+    "budgetHours": 4
   },
   "alerts": {
     "activeTheme": "",

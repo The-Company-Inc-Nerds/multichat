@@ -1,6 +1,7 @@
 import {
   buildSegments,
   handleCommand,
+  normalizeChannels,
   parseBadges,
   parseEmoteTag,
   parseIRC,
@@ -9,6 +10,7 @@ import {
   type TwitchChatMessage,
   unescapeTag,
 } from "../src/twitch.ts";
+import type { BadgeSource } from "../src/badges.ts";
 import { fakeEmitter } from "./_fake.ts";
 import { assert, assertEquals, assertExists } from "./_assert.ts";
 
@@ -78,7 +80,209 @@ Deno.test("parseBadges maps known ids to friendly labels", () => {
   ]);
   assertEquals(badges[0].label, "Broadcaster");
   assertEquals(badges[1].label, "Sub");
-  assertEquals(badges[3].label, "someunknown"); // unknown ids fall back to the raw id
+  assertEquals(badges[2].label, "VIP");
+  assertEquals(badges[3].label, "Someunknown"); // unknown ids are prettified
+});
+
+Deno.test("parseBadges keeps the version and the unescaped badge-info", () => {
+  const badges = parseBadges(
+    "broadcaster/1,subscriber/3012,partner/1",
+    "subscriber/14",
+  );
+  assertEquals(badges, [
+    { id: "broadcaster", label: "Broadcaster", version: "1" },
+    { id: "subscriber", label: "T3 Sub · 14 mo", version: "3012", info: "14" },
+    { id: "partner", label: "Verified", version: "1" },
+  ]);
+  // IRCv3 escapes and Twitch's U+2E1D comma stand-in are decoded.
+  const [pred] = parseBadges(
+    "predictions/blue-1",
+    "predictions/Blue\\sTeam\u2E1D\\sGo",
+  );
+  assertEquals(pred.info, "Blue Team, Go");
+  // A bare set id (no version) still parses; empties are skipped.
+  assertEquals(parseBadges("moderator,,vip/1").map((b) => b.id), [
+    "moderator",
+    "vip",
+  ]);
+  assertEquals(parseBadges("moderator")[0].version, undefined);
+});
+
+/** A BadgeSource that records its calls and has art for moderator/1 only. */
+function recordingSource(): BadgeSource & {
+  calls: Array<[string | undefined, string, string]>;
+  rooms: string[];
+} {
+  const calls: Array<[string | undefined, string, string]> = [];
+  const rooms: string[] = [];
+  return {
+    calls,
+    rooms,
+    resolve(roomId, set, version) {
+      calls.push([roomId, set, version]);
+      return set === "moderator" && version === "1"
+        ? {
+          title: "Moderator",
+          url: "https://cdn.test/mod/1",
+          url2x: "https://cdn.test/mod/2",
+          url4x: "https://cdn.test/mod/3",
+        }
+        : undefined;
+    },
+    noteRoom(roomId) {
+      rooms.push(roomId);
+    },
+  };
+}
+
+Deno.test("handleCommand: PRIVMSG badges are decorated by the BadgeSource, by room", () => {
+  const e = fakeEmitter();
+  const src = recordingSource();
+  const seen: TwitchChatMessage[] = [];
+  handleCommand(
+    parseIRC(
+      "@id=a;room-id=42;display-name=Mo;badges=moderator/1,subscriber/12;badge-info=subscriber/14 :mo!mo@x PRIVMSG #chan :hi",
+    )!,
+    e,
+    undefined,
+    (m) => seen.push(m),
+    src,
+  );
+  assertEquals(src.calls, [["42", "moderator", "1"], [
+    "42",
+    "subscriber",
+    "12",
+  ]]);
+  const [mod, sub] = e.captured.messages[0].badges ?? [];
+  // Art: Twitch's title for hover; the short label stays the fallback chip.
+  assertEquals(mod, {
+    id: "moderator",
+    label: "Mod",
+    version: "1",
+    url: "https://cdn.test/mod/1",
+    url2x: "https://cdn.test/mod/2",
+    url4x: "https://cdn.test/mod/3",
+    title: "Moderator",
+  });
+  // No art: the text chip, labelled from the version + badge-info.
+  assertEquals(sub, {
+    id: "subscriber",
+    label: "Sub · 14 mo",
+    version: "12",
+    info: "14",
+  });
+  // The observer sees the same decorated badges.
+  assertEquals(seen[0].badges[0].url, "https://cdn.test/mod/1");
+});
+
+Deno.test("handleCommand: USERNOTICE badges are decorated too", () => {
+  const e = fakeEmitter();
+  handleCommand(
+    parseIRC(
+      "@msg-id=resub;room-id=42;display-name=Mo;badges=moderator/1;system-msg=x USERNOTICE #chan :hi",
+    )!,
+    e,
+    undefined,
+    undefined,
+    recordingSource(),
+  );
+  assertEquals(
+    e.captured.messages[0].badges?.[0].url,
+    "https://cdn.test/mod/1",
+  );
+});
+
+Deno.test("handleCommand: Shared Chat shows the source channel's badges, resolved there", () => {
+  const e = fakeEmitter();
+  const src = recordingSource();
+  handleCommand(
+    parseIRC(
+      "@id=a;room-id=1;source-room-id=2;badges=vip/1;source-badges=moderator/1,subscriber/3;source-badge-info=subscriber/4 :x!x@x PRIVMSG #chan :hi",
+    )!,
+    e,
+    undefined,
+    undefined,
+    src,
+  );
+  assertEquals(src.calls, [["2", "moderator", "1"], ["2", "subscriber", "3"]]);
+  const badges = e.captured.messages[0].badges ?? [];
+  assertEquals(badges.map((b) => b.id), ["moderator", "subscriber"]);
+  assertEquals(badges[1].info, "4");
+
+  // The originating room's own copy (source-room-id == room-id) keeps `badges`.
+  const own = recordingSource();
+  handleCommand(
+    parseIRC(
+      "@id=b;room-id=1;source-room-id=1;badges=vip/1;source-badges=moderator/1 :x!x@x PRIVMSG #chan :hi",
+    )!,
+    fakeEmitter(),
+    undefined,
+    undefined,
+    own,
+  );
+  assertEquals(own.calls, [["1", "vip", "1"]]);
+});
+
+Deno.test("handleCommand: a throwing BadgeSource never drops the message", () => {
+  const e = fakeEmitter();
+  const boom: BadgeSource = {
+    resolve() {
+      throw new Error("boom");
+    },
+    noteRoom() {
+      throw new Error("boom");
+    },
+  };
+  handleCommand(
+    parseIRC("@id=a;badges=vip/1 :x!x@x PRIVMSG #chan :hi")!,
+    e,
+    undefined,
+    undefined,
+    boom,
+  );
+  handleCommand(
+    parseIRC("@room-id=1 ROOMSTATE #chan")!,
+    e,
+    undefined,
+    undefined,
+    boom,
+  );
+  assertEquals(e.captured.messages[0].badges, [
+    { id: "vip", label: "VIP", version: "1" },
+  ]);
+  assertEquals(e.captured.statuses.length, 1);
+});
+
+Deno.test("handleCommand: ROOMSTATE hands its room-id to the BadgeSource", () => {
+  const e = fakeEmitter();
+  const src = recordingSource();
+  handleCommand(
+    parseIRC("@room-id=123;emote-only=0 ROOMSTATE #chan")!,
+    e,
+    undefined,
+    undefined,
+    src,
+  );
+  handleCommand(
+    parseIRC("@emote-only=1 ROOMSTATE #chan")!,
+    e,
+    undefined,
+    undefined,
+    src,
+  );
+  assertEquals(src.rooms, ["123"]);
+  assertEquals(e.captured.statuses.map((s) => s.state), ["live", "live"]);
+});
+
+Deno.test("normalizeChannels: IRC's lowercase logins, trimmed, '#'-less, deduped", () => {
+  assertEquals(normalizeChannels(["TheCompanyInc"]), ["thecompanyinc"]);
+  assertEquals(
+    normalizeChannels([" #Foo ", "foo", "##bar", "", "  ", 42, null, "Baz"]),
+    ["foo", "bar", "baz"],
+  );
+  assertEquals(normalizeChannels("Solo"), ["solo"]);
+  assertEquals(normalizeChannels(undefined), []);
+  assertEquals(normalizeChannels({ a: 1 }), []);
 });
 
 Deno.test("parseEmoteTag returns spans sorted by start", () => {

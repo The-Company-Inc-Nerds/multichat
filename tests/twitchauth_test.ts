@@ -2,9 +2,12 @@ import {
   buildAuthCodeRequest,
   buildAuthorizeUrl,
   buildCheckFollowRequest,
+  buildClientCredentialsRequest,
   buildCreateCustomRewardRequest,
   buildCreateSubscriptionRequest,
+  buildGetChannelChatBadgesRequest,
   buildGetCustomRewardsRequest,
+  buildGetGlobalChatBadgesRequest,
   buildGetRedemptionsRequest,
   buildRefreshRequest,
   buildSendChatMessageRequest,
@@ -14,6 +17,8 @@ import {
   CHAT_WRITE_SCOPE,
   EVENTSUB_SCOPES,
   LOGIN_SCOPES,
+  parseAppTokenResponse,
+  parseChatBadgesResponse,
   parseCreateSubscriptionResponse,
   parseCustomRewardsResponse,
   parseFollowersResponse,
@@ -22,6 +27,7 @@ import {
   parseTokenResponse,
   parseUsersResponse,
   REDEMPTIONS_MANAGE_SCOPE,
+  resolveAppCredentials,
   SUBSCRIPTIONS,
   subscriptionsFor,
 } from "../src/twitchauth.ts";
@@ -529,4 +535,179 @@ Deno.test("parseRedemptionsResponse: page + cursor, reward id required", () => {
     cursor: "",
   });
   assertEquals(parseRedemptionsResponse(null).redemptions, []);
+});
+
+Deno.test("buildClientCredentialsRequest: form-encoded app-token grant", () => {
+  const req = buildClientCredentialsRequest("cid", "secret");
+  assertEquals(req.url, "https://id.twitch.tv/oauth2/token");
+  assertEquals(req.method, "POST");
+  assertEquals(
+    req.headers["content-type"],
+    "application/x-www-form-urlencoded",
+  );
+  const p = new URLSearchParams(req.body);
+  assertEquals(p.get("grant_type"), "client_credentials");
+  assertEquals(p.get("client_id"), "cid");
+  assertEquals(p.get("client_secret"), "secret");
+  assertEquals(p.get("refresh_token"), null);
+});
+
+Deno.test("parseAppTokenResponse: access token + lifetime, no refresh token needed", () => {
+  assertEquals(
+    parseAppTokenResponse({
+      access_token: "app-tok",
+      expires_in: 5011271,
+      token_type: "bearer",
+    }),
+    { accessToken: "app-tok", expiresInSec: 5011271 },
+  );
+  // A missing/garbled lifetime reads as 0 (re-mint next time), not a failure.
+  assertEquals(parseAppTokenResponse({ access_token: "t" }), {
+    accessToken: "t",
+    expiresInSec: 0,
+  });
+  assertEquals(
+    parseAppTokenResponse({ status: 400, message: "invalid client secret" }),
+    null,
+  );
+  assertEquals(parseAppTokenResponse({ access_token: "" }), null);
+  assertEquals(parseAppTokenResponse(null), null);
+});
+
+Deno.test("chat badge request builders: Helix global + per-broadcaster, bearer + client-id", () => {
+  const g = buildGetGlobalChatBadgesRequest("cid", "tok");
+  assertEquals(g.url, "https://api.twitch.tv/helix/chat/badges/global");
+  assertEquals(g.method, "GET");
+  assertEquals(g.headers["client-id"], "cid");
+  assertEquals(g.headers["authorization"], "Bearer tok");
+  const c = buildGetChannelChatBadgesRequest("cid", "tok", "135093069");
+  assertEquals(
+    c.url,
+    "https://api.twitch.tv/helix/chat/badges?broadcaster_id=135093069",
+  );
+  assertEquals(c.method, "GET");
+  assertEquals(c.headers["client-id"], "cid");
+  assertEquals(c.headers["authorization"], "Bearer tok");
+});
+
+Deno.test("parseChatBadgesResponse: set/version → art from the Helix shape", () => {
+  const base = "https://static-cdn.jtvnw.net/badges/v1/b817aba4";
+  const map = parseChatBadgesResponse({
+    data: [{
+      set_id: "vip",
+      versions: [{
+        id: "1",
+        image_url_1x: `${base}/1`,
+        image_url_2x: `${base}/2`,
+        image_url_4x: `${base}/3`,
+        title: "VIP",
+        description: "VIP",
+        click_action: "visit_url",
+        click_url: null,
+      }],
+    }, {
+      set_id: "subscriber",
+      versions: [
+        {
+          id: "0",
+          image_url_1x: "https://cdn.test/s0/1",
+          image_url_2x: "https://cdn.test/s0/2",
+          image_url_4x: "https://cdn.test/s0/3",
+          title: "Subscriber",
+        },
+        {
+          id: "3",
+          image_url_1x: "https://cdn.test/s3/1",
+          image_url_2x: "https://cdn.test/s3/2",
+          image_url_4x: "https://cdn.test/s3/3",
+          title: "3-Month Subscriber",
+        },
+      ],
+    }],
+  });
+  assertEquals([...map.keys()], ["vip/1", "subscriber/0", "subscriber/3"]);
+  assertEquals(map.get("vip/1"), {
+    title: "VIP",
+    url: `${base}/1`,
+    url2x: `${base}/2`,
+    url4x: `${base}/3`,
+  });
+  assertEquals(map.get("subscriber/3")?.title, "3-Month Subscriber");
+});
+
+Deno.test("parseChatBadgesResponse: malformed entries and non-https images are skipped", () => {
+  const ok = (id: string) => ({
+    id,
+    image_url_1x: `https://cdn.test/${id}/1`,
+    image_url_2x: `https://cdn.test/${id}/2`,
+    image_url_4x: `https://cdn.test/${id}/3`,
+  });
+  const map = parseChatBadgesResponse({
+    data: [
+      { set_id: "bits", versions: [ok("1"), { ...ok("100"), title: 7 }] },
+      { set_id: "", versions: [ok("1")] }, // no set id
+      { set_id: "nover", versions: "nope" }, // versions not a list
+      "junk",
+      {
+        set_id: "bad",
+        versions: [
+          { ...ok("1"), image_url_1x: "http://cdn.test/1" }, // not https
+          { ...ok("2"), image_url_2x: "javascript:alert(1)" },
+          { ...ok("3"), image_url_4x: "https://cdn.test/a b" }, // whitespace
+          { ...ok("4"), id: 4 }, // id not a string
+          { ...ok("5"), image_url_4x: undefined },
+          null,
+        ],
+      },
+    ],
+  });
+  assertEquals([...map.keys()], ["bits/1", "bits/100"]);
+  assertEquals(map.get("bits/100")?.title, ""); // a bad title is just empty
+  assertEquals(parseChatBadgesResponse({ data: [] }).size, 0);
+  assertEquals(parseChatBadgesResponse({ data: "nope" }).size, 0);
+  assertEquals(parseChatBadgesResponse(null).size, 0);
+});
+
+Deno.test("resolveAppCredentials: settings clientId, env secret, both required", () => {
+  const env = (vars: Record<string, string>) => (n: string) => vars[n];
+  // The NixOS shape: clientId in settings, secret blanked there and exported.
+  assertEquals(
+    resolveAppCredentials(
+      { clientId: "cid", clientSecret: "", channels: [] },
+      env({ TWITCH_CLIENT_SECRET: "env-secret" }),
+    ),
+    { clientId: "cid", clientSecret: "env-secret" },
+  );
+  // The env secret wins over the file; the file clientId over the env one.
+  assertEquals(
+    resolveAppCredentials(
+      { clientId: "cid", clientSecret: "file-secret" },
+      env({ TWITCH_CLIENT_ID: "env-cid", TWITCH_CLIENT_SECRET: "env-secret" }),
+    ),
+    { clientId: "cid", clientSecret: "env-secret" },
+  );
+  // No eventsub block at all: the environment alone is enough.
+  assertEquals(
+    resolveAppCredentials(
+      undefined,
+      env({ TWITCH_CLIENT_ID: "env-cid", TWITCH_CLIENT_SECRET: "s" }),
+    ),
+    { clientId: "env-cid", clientSecret: "s" },
+  );
+  // Settings alone, trimmed.
+  assertEquals(
+    resolveAppCredentials({ clientId: " cid ", clientSecret: " s " }, env({})),
+    { clientId: "cid", clientSecret: "s" },
+  );
+  // Either half missing → none.
+  assertEquals(resolveAppCredentials({ clientId: "cid" }, env({})), undefined);
+  assertEquals(
+    resolveAppCredentials({ clientSecret: "s" }, env({})),
+    undefined,
+  );
+  assertEquals(
+    resolveAppCredentials({ clientId: 5, clientSecret: "s" }, env({})),
+    undefined,
+  );
+  assertEquals(resolveAppCredentials(undefined, env({})), undefined);
 });

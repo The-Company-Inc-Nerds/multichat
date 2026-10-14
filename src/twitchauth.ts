@@ -11,6 +11,8 @@
 // refresh tokens rotate on every refresh, so the manager refreshes reactively on a
 // 401 and persists the new refresh token before using the new access token.
 
+import type { BadgeArt } from "./badges.ts";
+
 const OAUTH_BASE = "https://id.twitch.tv/oauth2";
 const HELIX_BASE = "https://api.twitch.tv/helix";
 
@@ -242,6 +244,67 @@ export function parseTokenResponse(json: unknown): TokenResult {
     ? o.error
     : "missing access_token/refresh_token";
   return { ok: false, message: msg };
+}
+
+// ---- App access token (client credentials) --------------------------------
+//
+// Reads that need no user — the chat-badge lists — run on an app access token
+// minted from the application's own Client ID + Secret, so badge art works
+// without `multichat login`. App tokens have no refresh token: mint a new one
+// when it expires or a Helix call answers 401.
+
+/** Client-credentials grant: mint an app access token. */
+export function buildClientCredentialsRequest(
+  clientId: string,
+  clientSecret: string,
+): HttpRequest {
+  const body = new URLSearchParams({
+    client_id: clientId,
+    client_secret: clientSecret,
+    grant_type: "client_credentials",
+  });
+  return {
+    url: `${OAUTH_BASE}/token`,
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: body.toString(),
+  };
+}
+
+/** Parse a client-credentials token response (parseTokenResponse insists on a
+ *  refresh_token, which an app token never has). `expiresInSec` is 0 when
+ *  Twitch gave no lifetime. Null = no usable token. */
+export function parseAppTokenResponse(
+  json: unknown,
+): { accessToken: string; expiresInSec: number } | null {
+  const o = asObj(json);
+  if (typeof o?.access_token !== "string" || !o.access_token) return null;
+  const exp = Number(o.expires_in);
+  return {
+    accessToken: o.access_token,
+    expiresInSec: Number.isFinite(exp) && exp > 0 ? Math.floor(exp) : 0,
+  };
+}
+
+/**
+ * The Twitch application's credentials for app-token reads, or undefined when
+ * either half is missing. The Client ID comes from twitch.eventsub.clientId,
+ * else TWITCH_CLIENT_ID; the secret from TWITCH_CLIENT_SECRET, else
+ * twitch.eventsub.clientSecret (the server's EventSub precedence). Read even
+ * when eventsub lists no channels — the NixOS module always writes clientId
+ * there and ships the secret via the environment.
+ */
+export function resolveAppCredentials(
+  rawEventsub: unknown,
+  readEnv: (name: string) => string | undefined,
+): { clientId: string; clientSecret: string } | undefined {
+  const o = asObj(rawEventsub);
+  const str = (x: unknown) => typeof x === "string" ? x.trim() : "";
+  const clientId = str(o?.clientId) || str(readEnv("TWITCH_CLIENT_ID"));
+  const clientSecret = str(
+    readEnv("TWITCH_CLIENT_SECRET") ?? o?.clientSecret,
+  );
+  return clientId && clientSecret ? { clientId, clientSecret } : undefined;
 }
 
 // ---- Helix: resolve a login to a broadcaster user id ----------------------
@@ -696,4 +759,79 @@ export function parseCreateSubscriptionResponse(
     ? o.message
     : `HTTP ${status}`;
   return { ok: false, status, message };
+}
+
+// ---- Helix: chat badge art -------------------------------------------------
+
+function badgesRequest(
+  url: string,
+  clientId: string,
+  accessToken: string,
+): HttpRequest {
+  return {
+    url,
+    method: "GET",
+    headers: {
+      "client-id": clientId,
+      "authorization": `Bearer ${accessToken}`,
+    },
+  };
+}
+
+/** Get Global Chat Badges. Any token works (an app token is enough). */
+export function buildGetGlobalChatBadgesRequest(
+  clientId: string,
+  accessToken: string,
+): HttpRequest {
+  return badgesRequest(
+    `${HELIX_BASE}/chat/badges/global`,
+    clientId,
+    accessToken,
+  );
+}
+
+/** Get Channel Chat Badges: the broadcaster's custom subscriber/bits art
+ *  (empty when they have none). `broadcasterId` is IRC's `room-id`. */
+export function buildGetChannelChatBadgesRequest(
+  clientId: string,
+  accessToken: string,
+  broadcasterId: string,
+): HttpRequest {
+  const q = new URLSearchParams({ broadcaster_id: broadcasterId });
+  return badgesRequest(
+    `${HELIX_BASE}/chat/badges?${q.toString()}`,
+    clientId,
+    accessToken,
+  );
+}
+
+const httpsUrl = (x: unknown): string =>
+  typeof x === "string" && /^https:\/\/\S+$/.test(x) ? x : "";
+
+/** A Get Global / Channel Chat Badges body as "set/version" → art. A version
+ *  without an id or with any image URL that isn't plain https is skipped (the
+ *  page puts these straight into <img>); a malformed body is an empty map. */
+export function parseChatBadgesResponse(json: unknown): Map<string, BadgeArt> {
+  const out = new Map<string, BadgeArt>();
+  const data = asObj(json)?.data;
+  if (!Array.isArray(data)) return out;
+  for (const s of data) {
+    const set = asObj(s);
+    const setId = set?.set_id;
+    if (typeof setId !== "string" || !setId || !Array.isArray(set?.versions)) {
+      continue;
+    }
+    for (const v of set.versions) {
+      const ver = asObj(v);
+      const id = ver?.id;
+      if (typeof id !== "string" || !id) continue;
+      const url = httpsUrl(ver?.image_url_1x);
+      const url2x = httpsUrl(ver?.image_url_2x);
+      const url4x = httpsUrl(ver?.image_url_4x);
+      if (!url || !url2x || !url4x) continue;
+      const title = typeof ver?.title === "string" ? ver.title.trim() : "";
+      out.set(`${setId}/${id}`, { title, url, url2x, url4x });
+    }
+  }
+  return out;
 }
