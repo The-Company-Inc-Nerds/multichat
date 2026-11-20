@@ -236,8 +236,9 @@ in
         Read-only surfaces (`/`, `/overlay`, `/alerts`, `/giveaway`, `/events`)
         are unauthenticated regardless — this option gates the buttons, not the
         pages. The other control endpoints (`/api/youtube-key`, `/api/fake`,
-        `/api/rewards`) stay loopback-only: they set a secret, forge events,
-        and move viewers' channel points.
+        `/api/rewards`, `/api/live`, `/api/status`) stay loopback-only: they
+        set a secret, forge events, move viewers' channel points, spend
+        YouTube quota and describe the deployment.
       '';
     };
 
@@ -325,9 +326,14 @@ in
             example = "/run/secrets/twitch-refresh-streamer1";
             description = ''
               Path to a file containing the raw seed refresh token. Staged via
-              LoadCredential and installed into the StateDirectory on first start
-              (only when not already present, so the rotated token is never clobbered).
-              Requires broadcasterId. Takes precedence over refreshToken.
+              LoadCredential and installed into the StateDirectory when no token
+              is persisted there yet (the file is missing or empty), or when the
+              token in this file is a different one than at the last start (its
+              hash is kept beside the token as `twitch-refresh-<id>.seed`) — so
+              putting a new token here after `multichat login` takes effect at
+              the next start, and replaces the persisted one. An unchanged seed
+              never replaces the token Twitch rotated to; a blank file is
+              ignored. Requires broadcasterId. Takes precedence over refreshToken.
             '';
           };
         };
@@ -1160,13 +1166,18 @@ in
           # and updating the secret is all a re-login takes. "Seen" is the
           # seed's hash, kept beside the token: a first start that finds a
           # token but no hash only records it, and never overwrites a working
-          # rotated token. An empty seed (a fetch that wrote a blank file) is
-          # ignored altogether. Written via rename, so a power cut here can't
-          # leave half a token either.
+          # rotated token. The hash is of the token, not of the file: the
+          # same token saved again with a trailing newline is not a
+          # replacement, and a blank seed — an empty file, or nothing but a
+          # newline, as a cleared secret is often written — is ignored
+          # altogether rather than installed over the token that works.
+          # Written via rename, so a power cut here can't leave half a token
+          # either.
           seed="$CREDENTIALS_DIRECTORY/twitch-refresh-${ch.broadcasterId}"
           state="$STATE_DIRECTORY/twitch-refresh-${ch.broadcasterId}"
-          if [ -s "$seed" ]; then
-            want="$(sha256sum < "$seed" | cut -d' ' -f1)"
+          tok="$(tr -d '[:space:]' 2>/dev/null < "$seed" || true)"
+          if [ -n "$tok" ]; then
+            want="$(printf '%s' "$tok" | sha256sum | cut -d' ' -f1)"
             seen="$(cat "$state.seed" 2>/dev/null || true)"
             if [ ! -s "$state" ] || { [ -n "$seen" ] && [ "$seen" != "$want" ]; }; then
               install -m600 "$seed" "$state.new" && mv -f "$state.new" "$state"
@@ -1176,7 +1187,7 @@ in
             fi
             # Also handed to the app: its fallback when the state file turns
             # out unreadable, or Twitch rejects the persisted token.
-            export ${seedEnv ch.broadcasterId}="$(cat "$seed")"
+            export ${seedEnv ch.broadcasterId}="$tok"
           fi
         '') esTokenFiles}
         exec ${cfg.package}/bin/multichat ${settingsFile}

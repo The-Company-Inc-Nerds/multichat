@@ -444,6 +444,13 @@ export interface QuotaSnapshot {
   boosts: number;
   /** When the latest boost started; it runs for BOOST_DURATION_MS. */
   boostAt: number | null;
+  /** When a boost's early search was made (see earlySearchDue). Kept apart
+   *  from lastSearchAt: it is an extra look that counts toward the cap, and
+   *  must not push back the regular slot the spacing is measured from. */
+  earlySearchAt: number | null;
+  /** Today's numbers for the key used before this one, in case it comes back
+   *  (see adoptKey). Never more than one deep; dropped with the day. */
+  shelved: Omit<QuotaSnapshot, "shelved"> | null;
 }
 
 export function freshQuota(
@@ -461,6 +468,8 @@ export function freshQuota(
     keyFp,
     boosts: 0,
     boostAt: null,
+    earlySearchAt: null,
+    shelved: null,
   };
 }
 
@@ -476,8 +485,20 @@ export function normalizeQuotaSnapshot(
   >;
   const num = (v: unknown) =>
     typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0;
+  const time = (v: unknown) =>
+    typeof v === "number" && Number.isFinite(v) ? v : null;
   const keyFp = typeof r.keyFp === "string" ? r.keyFp : null;
   if (r.day !== today) return freshQuota(today, keyFp);
+  // The shelved numbers are only worth keeping while they are today's and
+  // name the key they belong to.
+  const sh =
+    (r.shelved && typeof r.shelved === "object" ? r.shelved : {}) as Record<
+      string,
+      unknown
+    >;
+  const shelved = sh.day === today && typeof sh.keyFp === "string"
+    ? withoutShelf(normalizeQuotaSnapshot({ ...sh, shelved: null }, today))
+    : null;
   return {
     day: today,
     units: num(r.units),
@@ -488,10 +509,15 @@ export function normalizeQuotaSnapshot(
     lastSearchAt: typeof r.lastSearchAt === "number" ? r.lastSearchAt : null,
     keyFp,
     boosts: num(r.boosts),
-    boostAt: typeof r.boostAt === "number" && Number.isFinite(r.boostAt)
-      ? r.boostAt
-      : null,
+    boostAt: time(r.boostAt),
+    earlySearchAt: time(r.earlySearchAt),
+    shelved,
   };
+}
+
+function withoutShelf(q: QuotaSnapshot): Omit<QuotaSnapshot, "shelved"> {
+  const { shelved: _shelved, ...own } = q;
+  return own;
 }
 
 /**
@@ -569,12 +595,22 @@ export function boostActive(q: QuotaSnapshot, nowMs: number): boolean {
 }
 
 /** Whether the running boost still holds its one early search: it becomes due
- *  BOOST_SEARCH_DELAY_MS in, and any search from then on uses it up. Derived
- *  from the ledger alone, so a restart mid-boost can't grant it twice. */
+ *  BOOST_SEARCH_DELAY_MS in, and any search from then on — the early one or a
+ *  regular slot that happened to fall there — uses it up. Derived from the
+ *  ledger alone, so a restart mid-boost can't grant it twice. */
 export function earlySearchDue(q: QuotaSnapshot, nowMs: number): boolean {
   if (q.boostAt === null || !boostActive(q, nowMs)) return false;
   const from = q.boostAt + BOOST_SEARCH_DELAY_MS;
-  return nowMs >= from && (q.lastSearchAt === null || q.lastSearchAt < from);
+  const since = (at: number | null) => at !== null && at >= from;
+  return nowMs >= from && !since(q.lastSearchAt) && !since(q.earlySearchAt);
+}
+
+/** Whether a regular search slot is open: the first search of the day, or the
+ *  spacing since the last regular one has passed. */
+function searchSlotOpen(q: QuotaSnapshot, nowMs: number): boolean {
+  return q.lastSearchAt === null ||
+    nowMs - q.lastSearchAt >=
+      searchSpacingMs(q.searches, msUntilPacificMidnight(nowMs));
 }
 
 /** Whether the shared search gate is open at `nowMs`. A boost's early search
@@ -583,9 +619,7 @@ export function searchGateOpen(q: QuotaSnapshot, nowMs: number): boolean {
   if (q.searchBlocked || q.exhausted || q.searches >= SEARCH_DAILY_CAP) {
     return false;
   }
-  if (q.lastSearchAt === null || earlySearchDue(q, nowMs)) return true;
-  return nowMs - q.lastSearchAt >=
-    searchSpacingMs(q.searches, msUntilPacificMidnight(nowMs));
+  return searchSlotOpen(q, nowMs) || earlySearchDue(q, nowMs);
 }
 
 export interface QuotaLedger {
@@ -611,7 +645,9 @@ export interface QuotaLedger {
     watching?: number,
   ): number;
   /** Record which key is spending. A different key than the stored one may
-   *  belong to another Google project, so today restarts from zero (→ true). */
+   *  belong to another Google project, so today restarts from zero (→ true) —
+   *  unless it is the key used just before, whose numbers for today are taken
+   *  up where they stopped (→ false). */
   adoptKey(fp: string): boolean;
 }
 
@@ -650,8 +686,15 @@ export function createQuotaLedger(opts: {
     },
     noteSearch() {
       const s = cur();
+      const at = now();
+      // A search the spacing alone would not have allowed yet is a boost's
+      // early one: it spends one of the day's searches, but the spacing keeps
+      // running from the last regular one. Were it to restart there, a stream
+      // the early search was too early for would be found a whole slot later
+      // than with no hint at all.
+      if (searchSlotOpen(s, at)) s.lastSearchAt = at;
+      else s.earlySearchAt = at;
       s.searches++;
-      s.lastSearchAt = now();
       changed();
     },
     blockSearch() {
@@ -696,10 +739,20 @@ export function createQuotaLedger(opts: {
     adoptKey(fp) {
       const s = cur();
       if (s.keyFp === fp) return false;
-      const reset = s.keyFp !== null;
-      q = reset ? freshQuota(s.day, fp) : { ...s, keyFp: fp };
+      if (s.keyFp === null) {
+        q = { ...s, keyFp: fp };
+        changed();
+        return false;
+      }
+      // The numbers of the key being left are shelved, not dropped, and taken
+      // up again if that key comes back today: a stale runtime key that is
+      // tried first at every start and refused (see the key manager in
+      // main.ts) must not cost the working key its day — the search count, the
+      // parks and the boosts would all restart with each restart.
+      const back = s.shelved?.keyFp === fp ? s.shelved : null;
+      q = { ...(back ?? freshQuota(s.day, fp)), shelved: withoutShelf(s) };
       changed();
-      return reset;
+      return back === null;
     },
   };
 }
@@ -1018,8 +1071,12 @@ export interface YouTubeRuntime {
   readonly chatWakers: Set<() => void>;
   /** Labels whose attached chat an "offline" hint asked to verify now. */
   readonly verifyNow: Set<string>;
-  /** When an "offline" hint last asked for that (rate limit), else null. */
-  readonly hint: { verifyAt: number | null };
+  /** When an "offline" hint last asked for that (rate limit), else null; and
+   *  what the last hint of either kind said (null: none yet on this run). */
+  readonly hint: {
+    verifyAt: number | null;
+    state: "live" | "offline" | null;
+  };
   /** Told when the API refuses `key` itself (see YtFailure.keyRefused). */
   readonly onKeyRefused?: (key: string, failure: YtFailure) => void;
 }
@@ -1065,7 +1122,7 @@ export function createYouTubeRuntime(
     discoveryWakers: new Set(),
     chatWakers: new Set(),
     verifyNow: new Set(),
-    hint: { verifyAt: null },
+    hint: { verifyAt: null, state: null },
     onKeyRefused: opts.onKeyRefused,
   };
 }
@@ -1129,7 +1186,7 @@ async function hintableSleep(
 
 export type LiveHintEffect =
   | "boost" // discovery woken; ticking fast for BOOST_DURATION_MS
-  | "coalesced" // already inside a boost / a verify was just asked for
+  | "coalesced" // inside a boost / a repeated re-sync / a verify just asked for
   | "capped" // the day's boosts are used up
   | "parked" // quota exhausted, or the key is refused: nothing to speed up
   | "attached" // every watched channel is already on its live chat
@@ -1157,6 +1214,13 @@ function wakeAll(wakers: Set<() => void>): void {
  * cap survives a restart). "offline" makes the attached chats ask videos.list
  * now instead of at their next periodic check.
  *
+ * `resync` marks a hint that reports the state rather than a change of it — a
+ * sender's periodic "still streaming". One that repeats what the last hint
+ * said starts no boost: a stream nothing here can find (Twitch-only, an
+ * unlisted test) would otherwise chain boosts back to back and use up the
+ * day's allowance in its first hour. The first one after a start, or after an
+ * "offline", is news and counts like any other.
+ *
  * Neither marks a channel live or detaches a chat by itself, wakes a channel
  * out of the quota or key park, opens a blocked or capped search, resets the
  * ledger, or restarts the poller generation.
@@ -1165,9 +1229,12 @@ export function liveHint(
   rt: YouTubeRuntime,
   state: "live" | "offline",
   source = "",
+  opts: { resync?: boolean } = {},
 ): LiveHintResult {
   const now = rt.now();
   const from = source ? ` (${source})` : "";
+  const repeat = opts.resync === true && rt.hint.state === state;
+  rt.hint.state = state;
   const done = (effect: LiveHintEffect, message: string): LiveHintResult => ({
     state,
     effect,
@@ -1238,6 +1305,13 @@ export function liveHint(
       }s`,
     );
   }
+  if (repeat) {
+    return done(
+      "coalesced",
+      "a re-sync that repeats the last hint — a boost starts when the " +
+        "stream state changes, not each time it is reported",
+    );
+  }
   if (q.boosts >= BOOST_DAILY_CAP) {
     return done(
       "capped",
@@ -1257,7 +1331,9 @@ export function liveHint(
 /** The poller's state as GET /api/status reports it (no key material: the
  *  ledger's `keyFp` is the one-way keyFingerprint). */
 export interface YouTubeRuntimeStatus {
-  quota: QuotaSnapshot & {
+  /** Today's numbers for the key in use (the ledger's own bookkeeping — the
+   *  early-search stamp, another key's shelved numbers — stays out). */
+  quota: Omit<QuotaSnapshot, "earlySearchAt" | "shelved"> & {
     dailyQuota: number;
     budgetHours: number;
     /** Epoch ms of the next 00:00 PT — when both buckets reset. */
@@ -1285,6 +1361,7 @@ export interface YouTubeRuntimeStatus {
 export function youtubeRuntimeStatus(rt: YouTubeRuntime): YouTubeRuntimeStatus {
   const now = rt.now();
   const q = rt.ledger.snapshot();
+  const { earlySearchAt: _early, shelved: _shelved, ...counts } = q;
   const resetsAt = now + msUntilPacificMidnight(now);
   const channels = [...rt.reports].map(([name, r]) => ({ name, ...r }));
   const denied = channels.filter((c) => c.parked === "denied");
@@ -1313,7 +1390,7 @@ export function youtubeRuntimeStatus(rt: YouTubeRuntime): YouTubeRuntimeStatus {
   const active = boostActive(q, now);
   return {
     quota: {
-      ...q,
+      ...counts,
       dailyQuota: rt.ledger.dailyQuota,
       budgetHours: rt.ledger.budgetHours,
       resetsAt,
@@ -1814,9 +1891,12 @@ async function pollChat(
           lastOfflineCheck = now;
         }
       }
-      if (verify) {
+      // A hint that lands while a check is in flight asks for one of its
+      // own: the answer on its way may predate what the hint knows.
+      while (verify) {
         const end = await verifyNow();
         if (end) return end;
+        verify = rt.verifyNow.delete(ctx.label);
       }
       // Sleep the interval out. An "offline" hint cuts in to verify, then the
       // rest of the interval is slept: the chat itself is never polled early

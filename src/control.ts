@@ -107,6 +107,10 @@ export interface LiveSignal {
   state: "live" | "offline";
   /** Who sent it — only ever used in a log line. */
   source: string;
+  /** Set when the sender reported the state rather than a change of it (a
+   *  webhook event other than stream.started / stream.stopped, read by its
+   *  `data.streaming`): it may be repeated for as long as the state holds. */
+  resync?: true;
 }
 
 /** What a go-live hint did. `effect` is the machine-readable outcome (the
@@ -193,7 +197,9 @@ function cleanSource(raw: unknown, fallback: string): string {
  * The second is the `{event, ts, data}` envelope a webhook sender uses (the
  * same one this server's own `webhook` integration adapter emits):
  * `stream.started` means live and `stream.stopped` offline; any other event
- * goes by `data.streaming`, so a periodic `stream.state` re-sync counts too.
+ * goes by `data.streaming`, so a periodic `stream.state` re-sync counts too —
+ * flagged `resync`, because it reports the state rather than a change of it
+ * and a sender repeats it for as long as the stream runs (see liveHint).
  * An event that says nothing about the stream is "ignored" — well-formed, so
  * the sender is told 200 rather than an error it would keep retrying. Only a
  * body that is neither shape is "bad".
@@ -240,30 +246,86 @@ export function parseLiveSignalBody(
   const data = typeof o.data === "object" && o.data !== null
     ? o.data as Record<string, unknown>
     : {};
-  const state = event === "stream.started"
+  const edge = event === "stream.started"
     ? "live"
     : event === "stream.stopped"
     ? "offline"
-    : data.streaming === true
-    ? "live"
-    : data.streaming === false
-    ? "offline"
     : null;
+  const state = edge ??
+    (data.streaming === true
+      ? "live"
+      : data.streaming === false
+      ? "offline"
+      : null);
   if (!state) {
     return {
       kind: "ignored",
       reason: `event "${cleanSource(event, "?")}" carries no stream state`,
     };
   }
+  const source = `${cleanSource(data.source, "webhook")} ${
+    cleanSource(event, "")
+  }`;
   return {
     kind: "signal",
-    signal: {
-      state,
-      source: `${cleanSource(data.source, "webhook")} ${
-        cleanSource(event, "")
-      }`,
-    },
+    signal: edge ? { state, source } : { state, source, resync: true },
   };
+}
+
+const LIVE_VERBS: Record<string, "live" | "offline" | "status"> = {
+  on: "live",
+  live: "live",
+  off: "offline",
+  offline: "offline",
+  status: "status",
+};
+
+/**
+ * Parse what follows `multichat live` (the host/port options already taken
+ * out): a verb — `on`/`live`, `off`/`offline`, `status`, or none, which means
+ * status — plus `--source NAME` for a hint and `--json` for the status. An
+ * argument that could be read two ways is refused rather than guessed at:
+ * `--source on` would otherwise take the verb for the sender's name, print the
+ * status and exit 0 with no hint sent.
+ */
+export function parseLiveArgs(args: string[]):
+  | {
+    ok: true;
+    verb: "live" | "offline" | "status";
+    source: string;
+    json: boolean;
+  }
+  | { ok: false; message: string } {
+  let verb: "live" | "offline" | "status" | null = null;
+  let source = "cli";
+  let json = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--source") {
+      const name = args[++i];
+      if (name === undefined || name.startsWith("-")) {
+        return { ok: false, message: "--source needs a name" };
+      }
+      if (Object.hasOwn(LIVE_VERBS, name)) {
+        return {
+          ok: false,
+          message: `--source needs a name, and "${name}" is a verb — ` +
+            `say which: live ${name} --source NAME`,
+        };
+      }
+      source = name;
+    } else if (a === "--json") {
+      json = true;
+    } else if (Object.hasOwn(LIVE_VERBS, a)) {
+      verb = LIVE_VERBS[a];
+    } else {
+      return { ok: false, message: `Unknown argument: ${a}` };
+    }
+  }
+  if (json && verb !== null && verb !== "status") {
+    return { ok: false, message: "--json only goes with the status" };
+  }
+  return { ok: true, verb: verb ?? "status", source, json };
 }
 
 /** Where a startup YouTube key came from (null: there is none). */
@@ -304,6 +366,20 @@ export function resolveStartupKeySource(sources: {
     source: declared?.source ?? null,
     declared,
   };
+}
+
+/**
+ * Whether a key sent to the running server must still be stored when it is the
+ * very key the server is running on, from `source`. Not when that is the
+ * runtime key: the state directory holds it already. But a server on its
+ * declared key may have fallen back to it from a runtime key the API refused —
+ * a key that stays in the state directory and is tried first at every start.
+ * Storing the key sent is what "set" promises, and what ends that.
+ */
+export function resentKeyNeedsStoring(
+  source: KeySource | "runtime" | null,
+): boolean {
+  return source === "environment" || source === "settings";
 }
 
 /** The key half of resolveStartupKeySource. */
@@ -477,31 +553,38 @@ export function createStateWriter(
   persist: (value: string) => Promise<void>,
   snapshot: () => string,
 ): { (): void; flush: () => Promise<void> } {
-  let running: Promise<void> | null = null;
+  let busy = false;
   let again = false;
   let used = false;
+  let last: Promise<void> = Promise.resolve();
   const schedule = () => {
     used = true;
-    if (running) {
+    if (busy) {
       again = true;
       return;
     }
-    running = (async () => {
-      do {
-        again = false;
-        try {
-          await persist(snapshot());
-        } catch { /* best-effort */ }
-      } while (again);
-    })().finally(() => {
-      running = null;
-    });
+    busy = true;
+    // `busy` is dropped in the same step as the last `again` check — a tick
+    // later, and a change landing in between would set `again` on a writer
+    // that has already decided to stop, and never reach the disk.
+    last = (async () => {
+      try {
+        do {
+          again = false;
+          try {
+            await persist(snapshot());
+          } catch { /* best-effort */ }
+        } while (again);
+      } finally {
+        busy = false;
+      }
+    })();
   };
   return Object.assign(schedule, {
     flush: async () => {
       if (!used) return;
       schedule();
-      if (running) await running;
+      await last;
     },
   });
 }

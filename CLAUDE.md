@@ -40,7 +40,11 @@ runtime key → `YOUTUBE_API_KEY` → `youtube.apiKey`, and the winner's source 
 fingerprint are logged at start (`resolveStartupKeySource`). One exception to
 that order: when the API refuses a runtime key itself (`YtFailure.keyRefused`)
 and a different declared key (env, else settings) exists, the key manager
-switches to the declared one, loudly, without touching the persisted file.
+switches to the declared one, loudly, without touching the persisted file. The
+quota ledger counts per key and shelves the numbers of the key being left
+(`adoptKey`), so the refused key tried first at every start does not reset the
+declared key's day; `set-youtube-key` with the declared key itself stores it as
+the runtime key and ends the fallback (`resentKeyNeedsStoring`).
 
 `--allow-write` exists so state can be persisted: the runtime YouTube key and
 its per-Pacific-day quota ledger, the rotated Twitch refresh tokens, the whole
@@ -56,15 +60,16 @@ can't be created; persistence must never cost someone their stream. Deno's
 `build.nix`; a custom `MULTICHAT_STATE_DIR` outside them is denied by Deno.
 
 Every state file is written through `persistStateAtomic` (temp file + fsync +
-rename; a power cut leaves the old file or the new one, never a torn one). The
-frequently changing ones — the giveaway's pool/campaign/packs/turns/plan and the
-channel-points files — go through `createStateWriter` (src/control.ts): one
-single-flight writer per file that folds overlapping changes into one follow-up
-write and is flushed on SIGTERM/SIGINT; a writer that was never called writes
-nothing on flush. On load, a file of the wrong JSON shape (`decodeStateFile`,
-`GIVEAWAY_FILE_SHAPE`) is moved aside to `<name>.corrupt-<timestamp>` and
-reported loudly, never read as "empty" and overwritten. The winners log stays
-append-only JSONL.
+rename + an fsync of the directory; a power cut leaves the old file or the new
+one, never a torn one). The frequently changing ones — the giveaway's
+pool/campaign/packs/turns/plan and the channel-points files — go through
+`createStateWriter` (src/control.ts): one single-flight writer per file that
+folds overlapping changes into one follow-up write and is flushed on
+SIGTERM/SIGINT; a writer that was never called writes nothing on flush. On load,
+a file of the wrong JSON shape (`decodeStateFile`, `GIVEAWAY_FILE_SHAPE`), or
+one that exists but cannot be read, is moved aside to
+`<name>.corrupt-<timestamp>` and reported loudly, never read as "empty" and
+overwritten. The winners log stays append-only JSONL.
 
 The same binary is also a small CLI client:
 
@@ -114,15 +119,19 @@ The same binary is also a small CLI client:
   `/api/rewards`): `on` wakes the offline YouTube discovery sleep, ticks it
   every 20s for 5 minutes (a _boost_; coalesced while one runs, at most 12 per
   Pacific day, counted in the persisted quota ledger) and allows one early
-  rationed search a minute in; `off` verifies the attached chat with
-  `videos.list` now. It is only ever a hint — it never marks a channel live,
-  detaches a chat, bypasses the quota/denied parks or the search cap, resets the
-  ledger, restarts the poller generation or touches Twitch. The endpoint also
-  accepts a webhook's `{event, ts, data}` envelope (`stream.started` /
-  `stream.stopped` / `data.streaming`; unknown events → `200` ignored), and
-  Twitch's `stream.online` / `stream.offline` EventSub events feed the same
-  nudge. With no verb it prints the status. See
-  `docs/configuration.md#go-live-hints`.
+  rationed search a minute in (counted toward the 40 a day, but it never
+  restarts the spacing of the regular search slots); `off` verifies the attached
+  chat with `videos.list` now. It is only ever a hint — it never marks a channel
+  live, detaches a chat, bypasses the quota/denied parks or the search cap,
+  resets the ledger, restarts the poller generation or touches Twitch. The
+  endpoint also accepts a webhook's `{event, ts, data}` envelope
+  (`stream.started` / `stream.stopped` / `data.streaming`; unknown events →
+  `200` ignored — an event read by its `data.streaming` is a state report, and a
+  `live` one that repeats the last hint starts no new boost), and Twitch's
+  `stream.online` / `stream.offline` EventSub events feed the same nudge. With
+  no verb (or `status`, optionally `--json`) it prints the status. Every control
+  CLI verb treats a response without the `X-Multichat` header as "not multichat"
+  and exits 1, whatever its status. See `docs/configuration.md#go-live-hints`.
 - `multichat status [--json]` prints a running server's loopback-only
   `GET /api/status`: version/uptime, the YouTube key's source + fingerprint
   (never the key), the quota ledger, why detection is parked (keyless /
@@ -258,7 +267,8 @@ main.ts          entry point — loads settings, wires the emitter to server + c
                  subcommands + the runtime-key manager (owns one YouTube runtime across key
                  changes: quota ledger persisted to youtube-quota.json (stale temp files swept
                  before it loads), throttled, reset when the
-                 key's fingerprint changes; knows the key's source — start() logs it with the
+                 key's fingerprint changes — the numbers of the key being left are shelved
+                 and taken up again if it returns the same day; knows the key's source — start() logs it with the
                  fingerprint, fallBack() leaves a refused runtime key for the declared one;
                  liveSignal() hands go-live hints to liveHint and status() builds the YouTube
                  half of GET /api/status, both synchronous), the Twitch badge manager (createTwitchBadgeManager:
@@ -374,7 +384,9 @@ src/youtube.ts   YouTube Data API v3 polling, quota-aware: live detection from t
                  boosts in the ledger, BOOST_DAILY_CAP a day; wakes the offline discovery sleeps
                  via hintableSleep, which then tick every BOOST_TICK_MS for BOOST_DURATION_MS;
                  earlySearchDue lets one search skip the spacing — never the block, the
-                 exhausted pool or the cap), "offline" makes the attached chats verify now
+                 exhausted pool or the cap; noteSearch records it as earlySearchAt so the
+                 regular slots keep running from lastSearchAt; a `resync` hint that repeats
+                 rt.hint.state starts no boost), "offline" makes the attached chats verify now
                  (rt.verifyNow, at most once per HINT_VERIFY_SPACING_MS) without polling the
                  chat early; only the plain offline wait and the chat interval are hintable, so
                  the quota park, the denied retry and the back-offs keep their pace. Each
@@ -443,9 +455,10 @@ src/channelpoints.ts pure channel-points helpers: normalizeChannelPointsConfig /
                  wire
 src/control.ts   pure control-plane helpers (loopback + private-range checks, the
                  controlAccess/controlToken policy behind POST /api/giveaway, key-body parse,
-                 parseLiveSignalBody (both POST /api/live body shapes),
+                 parseLiveSignalBody (both POST /api/live body shapes; flags a state
+                 report as `resync`), parseLiveArgs (the `multichat live` arguments),
                  startup-key resolution (resolveStartupKeySource: the key, its source and the
-                 declared fallback), createStateWriter (the single-flight writer every
+                 declared fallback; resentKeyNeedsStoring), createStateWriter (the single-flight writer every
                  frequently-written state file uses) + decodeStateFile, resolveStateDir + the state paths under it incl.
                  YouTube quota ledger + Twitch token/broadcaster-id + giveaway
                  pool/campaign/winners-log/packs/turns/terms/plan + channel-points
@@ -537,10 +550,11 @@ store, emits a warning). Full options + secrets + hardening table:
 
 Two things in the unit are behaviour, not just packaging. The start script seeds
 each `refreshTokenFile` channel's persisted token: it installs the seed when the
-state file is missing or empty, or when the seed's content changed since it was
-last seen (a SHA-256 kept beside the token as `twitch-refresh-<id>.seed`; a
-first start that finds a token but no hash only records it), and exports the
-seed as `MULTICHAT_TWITCH_SEED_<id>` for the app's own fallback.
+state file is missing or empty, or when the seed is a different token than the
+one last seen (a SHA-256 of the token, whitespace removed, kept beside it as
+`twitch-refresh-<id>.seed`; a first start that finds a token but no hash only
+records it; a blank or whitespace-only seed is ignored), and exports the seed as
+`MULTICHAT_TWITCH_SEED_<id>` for the app's own fallback.
 `checks.x86_64-linux.twitch-seed` runs that rendered script through every case
 without a VM. And restarts back off (`RestartSec=5s`, `RestartSteps=4`,
 `RestartMaxDelaySec=30s`, start limit off): a `LoadCredential` file that isn't

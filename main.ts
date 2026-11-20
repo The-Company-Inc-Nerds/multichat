@@ -171,7 +171,9 @@ import {
   type LiveSignal,
   type LiveSignalResult,
   normalizeControlAccess,
+  parseLiveArgs,
   quarantinePath,
+  resentKeyNeedsStoring,
   resolveStartupKeySource,
   resolveStateDir,
   stateTmpPath,
@@ -369,9 +371,12 @@ let atomicWriteSeq = 0;
  * and an empty Twitch token file used to switch EventSub off for good. Write a
  * uniquely named temp file beside `path`, fsync it, then rename it over `path`:
  * a reader, or the next boot after a SIGKILL or power loss mid-write, sees the
- * old file or the new one, never half of one. Best-effort like all
- * persistence: never throws; a failure is logged, the temp file removed, and
- * the value just won't survive a restart.
+ * old file or the new one, never half of one. The directory is fsynced after
+ * the rename, which otherwise only reaches the disk with the filesystem's next
+ * commit — seconds in which a power cut would bring the old file back (an
+ * entrant already told their number, a refresh token already rotated away).
+ * Best-effort like all persistence: never throws; a failure is logged, the
+ * temp file removed, and the value just won't survive a restart.
  */
 async function persistStateAtomic(path: string, value: string): Promise<void> {
   const tmp = stateTmpPath(
@@ -397,6 +402,18 @@ async function persistStateAtomic(path: string, value: string): Promise<void> {
   } catch (e) {
     console.error(`[Control] Could not persist ${path}: ${e}`);
     await Deno.remove(tmp).catch(() => {});
+    return;
+  }
+  try {
+    const i = path.lastIndexOf("/");
+    const dir = await Deno.open(i > 0 ? path.slice(0, i) : i === 0 ? "/" : ".");
+    try {
+      await dir.sync();
+    } finally {
+      dir.close();
+    }
+  } catch {
+    /* the file is in place; only how soon it is durable is at stake */
   }
 }
 
@@ -443,10 +460,13 @@ function stateWriter(
 /**
  * Read one JSON state file back: "missing" on a first run; "corrupt" for
  * anything that isn't the expected JSON shape (a torn or empty file from a
- * crash, a hand edit gone wrong) — that file is moved aside, kept for
- * inspection instead of being overwritten by the next write, and reported
- * loudly under `tag`, so the caller falls back on purpose rather than silently
- * starting empty.
+ * crash, a hand edit gone wrong) and for a file that is there but cannot be
+ * read (restored under another owner or mode) — that file is moved aside,
+ * kept for inspection instead of being replaced by the next write, and
+ * reported loudly under `tag`, so the caller falls back on purpose rather
+ * than silently starting empty. The move needs the directory, not the file,
+ * so an unreadable file can be set aside too; left in place, its intact
+ * contents would be renamed over by the first change.
  */
 async function readState(
   tag: string,
@@ -456,20 +476,18 @@ async function readState(
 ): Promise<
   { kind: "ok"; value: unknown } | { kind: "missing" } | { kind: "corrupt" }
 > {
-  let raw: string;
+  let problem = "is corrupt";
   try {
-    raw = await Deno.readTextFile(path);
+    const decoded = decodeStateFile(await Deno.readTextFile(path), shapeOk);
+    if (decoded) return { kind: "ok", value: decoded.value };
   } catch (e) {
     if (e instanceof Deno.errors.NotFound) return { kind: "missing" };
-    console.error(`[${tag}] !!! could not read the ${what} (${path}): ${e}`);
-    return { kind: "corrupt" };
+    problem = `could not be read (${e})`;
   }
-  const decoded = decodeStateFile(raw, shapeOk);
-  if (decoded) return { kind: "ok", value: decoded.value };
   const aside = quarantinePath(path, Date.now());
   const moved = await Deno.rename(path, aside).then(() => true, () => false);
   console.error(
-    `[${tag}] !!! the ${what} (${path}) is corrupt${
+    `[${tag}] !!! the ${what} (${path}) ${problem}${
       moved ? ` — moved aside to ${aside}` : " and could not be moved aside"
     }.`,
   );
@@ -500,7 +518,8 @@ const YT_QUOTA_PERSIST_MS = 30_000;
  * channel/uploads ids, seen message ids and page tokens — so a key change
  * resumes the chat instead of replaying it. A key whose fingerprint differs
  * from the ledger's may belong to another Google project: today restarts from
- * zero for it.
+ * zero for it, and the numbers of the key it replaces are kept in case that
+ * one comes back (see adoptKey) — which is what the fallback below does.
  *
  * It also knows where the key came from. A runtime key (persisted, or set on
  * this run) outranks the one the deployment declares, which is right until the
@@ -606,6 +625,18 @@ function createYouTubeKeyManager(opts: {
     const key = rawKey.trim();
     if (!key) return { ok: false, message: "Empty API key" };
     if (key === current) {
+      // The key in use, sent again. Worth storing all the same while it is
+      // only the declared one: the state directory may hold a runtime key the
+      // API refused, which would be tried first at every start.
+      if (persistKey && resentKeyNeedsStoring(source)) {
+        source = "runtime";
+        note = null;
+        await persist(key);
+        return {
+          ok: true,
+          message: "YouTube API key unchanged — stored as the runtime key",
+        };
+      }
       return { ok: true, message: "YouTube API key unchanged" };
     }
 
@@ -670,8 +701,9 @@ function createYouTubeKeyManager(opts: {
         `${to}.` +
         (opts.statePath
           ? ` The refused key stays in ${opts.statePath} and is tried first ` +
-            "again at the next start — delete that file, or set a working " +
-            "key with `multichat set-youtube-key`, to end this."
+            "again at the next start — delete that file, or send a working " +
+            "key with `multichat set-youtube-key` (the one just switched to " +
+            "will do), to end this."
           : ""),
     );
     note = `the ${what} (fingerprint ${fp}) was refused (${failure.reason}); ` +
@@ -778,7 +810,10 @@ function createYouTubeKeyManager(opts: {
     if (!live || !controller) {
       return say("idle", "the YouTube poller is still starting");
     }
-    return { ok: true, ...liveHint(live, sig.state, sig.source) };
+    return {
+      ok: true,
+      ...liveHint(live, sig.state, sig.source, { resync: sig.resync }),
+    };
   }
 
   return { apply, start, status, liveSignal };
@@ -3572,10 +3607,12 @@ async function controlRequest(
   }
 
   const text = (await res.text()).trim();
-  // No X-Multichat header on a failure => we reached some *other* server on this
-  // port (another app, or multichat on a different port). Say so plainly instead
-  // of surfacing that server's opaque error (e.g. a 401 from a neighbour).
-  if (!res.ok && res.headers.get("x-multichat") === null) {
+  // No X-Multichat header => we reached some *other* server on this port
+  // (another app, or multichat on a different port). Say so plainly instead of
+  // surfacing that server's opaque error (e.g. a 401 from a neighbour) — or,
+  // worse, taking its 200 for ours: a hook wired to the wrong port would
+  // report success for a hint that never arrived.
+  if (res.headers.get("x-multichat") === null) {
     console.error(
       `The server at ${target}:${port} does not look like multichat ` +
         `(HTTP ${res.status}, no X-Multichat header). Is multichat listening on ` +
@@ -4335,31 +4372,24 @@ async function runStatus(args: string[]): Promise<void> {
  */
 async function runLive(args: string[]): Promise<void> {
   const { host, port, rest } = controlTarget(args);
-  const VERBS: Record<string, "live" | "offline" | "status"> = {
-    on: "live",
-    live: "live",
-    off: "offline",
-    offline: "offline",
-    status: "status",
-  };
-  let verb: "live" | "offline" | "status" = "status";
-  let source = "cli";
-  for (let i = 0; i < rest.length; i++) {
-    const a = rest[i];
-    if (a === "--source") {
-      source = rest[++i] ?? source;
-    } else if (Object.hasOwn(VERBS, a)) {
-      verb = VERBS[a];
-    } else {
-      console.error(`Unknown argument: ${a}`);
-      console.error(
-        "Usage: multichat live [on|off|status] [--source NAME] [--port P] [--host H]",
-      );
-      Deno.exit(2);
-    }
+  const parsed = parseLiveArgs(rest);
+  if (!parsed.ok) {
+    console.error(parsed.message);
+    console.error(
+      "Usage: multichat live [on|off|status] [--source NAME] [--json] " +
+        "[--port P] [--host H]",
+    );
+    Deno.exit(2);
   }
+  const { verb, source } = parsed;
   if (verb === "status") {
-    return await runStatus(["-p", String(port), "-h", host]);
+    return await runStatus([
+      "-p",
+      String(port),
+      "-h",
+      host,
+      ...(parsed.json ? ["--json"] : []),
+    ]);
   }
 
   const { res, text } = await postControl(

@@ -11,9 +11,11 @@ import {
   isStaleStateTmp,
   keyStatePath,
   normalizeControlAccess,
+  parseLiveArgs,
   parseLiveSignalBody,
   parseYouTubeKeyBody,
   quarantinePath,
+  resentKeyNeedsStoring,
   resolveStartupKey,
   resolveStartupKeySource,
   resolveStateDir,
@@ -408,6 +410,17 @@ Deno.test("resolveStartupKeySource: names the winner and keeps the declared key"
   });
 });
 
+Deno.test("resentKeyNeedsStoring: only a key that is not the runtime key yet", () => {
+  // Running on the declared key — possibly after falling back from a refused
+  // runtime key that is still on disk: sending it must replace that file.
+  assert(resentKeyNeedsStoring("environment"));
+  assert(resentKeyNeedsStoring("settings"));
+  // Already the runtime key (read back at start, or set on this run).
+  assert(!resentKeyNeedsStoring("persisted"));
+  assert(!resentKeyNeedsStoring("runtime"));
+  assert(!resentKeyNeedsStoring(null));
+});
+
 Deno.test("parseLiveSignalBody: the plain {state} shape", () => {
   assertEquals(parseLiveSignalBody('{"state":"live"}'), {
     kind: "signal",
@@ -456,6 +469,51 @@ Deno.test("parseLiveSignalBody: the {event, ts, data} webhook envelope", () => {
   const r = env("stream.started", { streaming: true, source: "mailroom" });
   assert(r.kind === "signal");
   assertEquals(r.signal.source, "mailroom stream.started");
+  // started/stopped are changes; a state read off data.streaming is a report
+  // the sender may repeat, and is flagged so (whatever its own data says).
+  assertEquals(r.signal.resync, undefined);
+  assertEquals(env("stream.stopped", { resync: true }), {
+    kind: "signal",
+    signal: { state: "offline", source: "webhook stream.stopped" },
+  });
+  assertEquals(env("stream.state", { streaming: true, source: "mailroom" }), {
+    kind: "signal",
+    signal: { state: "live", source: "mailroom stream.state", resync: true },
+  });
+  assertEquals(env("scene.changed", { streaming: false }), {
+    kind: "signal",
+    signal: { state: "offline", source: "webhook scene.changed", resync: true },
+  });
+});
+
+Deno.test("parseLiveArgs: verbs, --source, --json — and nothing read two ways", () => {
+  const ok = (args: string[]) => {
+    const r = parseLiveArgs(args);
+    assert(r.ok, JSON.stringify(r));
+    return [r.verb, r.source, r.json];
+  };
+  assertEquals(ok(["on"]), ["live", "cli", false]);
+  assertEquals(ok(["live"]), ["live", "cli", false]);
+  assertEquals(ok(["off", "--source", "obs"]), ["offline", "obs", false]);
+  assertEquals(ok(["--source", "obs", "offline"]), ["offline", "obs", false]);
+  // No verb prints the status, as `status` does — raw with --json.
+  assertEquals(ok([]), ["status", "cli", false]);
+  assertEquals(ok(["status", "--json"]), ["status", "cli", true]);
+  assertEquals(ok(["--json"]), ["status", "cli", true]);
+
+  const bad = (args: string[]) => {
+    const r = parseLiveArgs(args);
+    assert(!r.ok, `${args.join(" ")} was accepted`);
+    return r.message;
+  };
+  // `--source on` used to swallow the verb: status printed, exit 0, no hint.
+  assert(bad(["--source", "on"]).includes('"on" is a verb'));
+  assert(bad(["--source", "off", "on"]).includes('"off" is a verb'));
+  assertEquals(bad(["on", "--source"]), "--source needs a name");
+  assertEquals(bad(["on", "--source", "--json"]), "--source needs a name");
+  assertEquals(bad(["on", "--json"]), "--json only goes with the status");
+  assertEquals(bad(["up"]), "Unknown argument: up");
+  assertEquals(bad(["__proto__"]), "Unknown argument: __proto__");
 });
 
 Deno.test("parseLiveSignalBody: malformed bodies are bad requests", () => {
@@ -493,6 +551,40 @@ Deno.test("createStateWriter: coalesces overlapping changes into one follow-up w
   await tick();
   assertEquals(writes, ["1", "3"]); // nothing further was asked for
   assertEquals(gates.length, 0);
+});
+
+Deno.test("createStateWriter: a change landing right as a write finishes is still written", async () => {
+  // The narrowest window: the change arrives in the very microtask after the
+  // write resolved — once the writer has decided nothing more was asked for.
+  const writes: string[] = [];
+  let state = 1;
+  let finish = () => {};
+  const w = createStateWriter(
+    (v) =>
+      new Promise<void>((resolve) => {
+        writes.push(v);
+        finish = resolve;
+      }),
+    () => String(state),
+  );
+  w();
+  assertEquals(writes, ["1"]);
+  finish();
+  await Promise.resolve().then(() => {
+    state = 2;
+    w();
+  });
+  await new Promise((r) => setTimeout(r, 0));
+  assertEquals(writes, ["1", "2"]);
+  // …and a flush in that same spot waits for the latest state too.
+  finish();
+  await Promise.resolve();
+  state = 3;
+  const flushed = w.flush();
+  await new Promise((r) => setTimeout(r, 0));
+  assertEquals(writes, ["1", "2", "3"]);
+  finish();
+  await flushed;
 });
 
 Deno.test("createStateWriter: flush writes the latest state, and nothing for an untouched writer", async () => {
@@ -537,6 +629,17 @@ Deno.test("createStateWriter: a failing persist neither wedges the writer nor es
   w();
   await w.flush();
   assertEquals(writes.at(-1), "2");
+  // Nor does one that throws before it ever returns a promise.
+  let thrown = 0;
+  const sync = createStateWriter((v) => {
+    if (thrown++ === 0) throw new Error("no such directory");
+    writes.push(`sync ${v}`);
+    return Promise.resolve();
+  }, () => "s");
+  sync();
+  sync();
+  await sync.flush();
+  assertEquals(writes.at(-1), "sync s");
 });
 
 Deno.test("decodeStateFile: shape-checked JSON, else null", () => {

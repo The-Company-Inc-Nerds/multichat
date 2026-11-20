@@ -128,11 +128,22 @@ _when_ the loops look:
   offline wait is `BOOST_TICK_MS` instead of the 3 minute tick, and
   `searchGateOpen` lets one search through early (`earlySearchDue`:
   `BOOST_SEARCH_DELAY_MS` into the boost, skipping only the spacing — never the
-  block, the exhausted pool or the 40-a-day cap).
+  block, the exhausted pool or the 40-a-day cap). The ledger records that search
+  as `earlySearchAt`, not `lastSearchAt`: it counts toward the cap, but the
+  spacing keeps running from the last regular search, so an early search that
+  was too early does not restart it. The gate is shared, so with several
+  channels the early search goes to whichever ticks first.
+- A hint flagged `resync` — `parseLiveSignalBody` sets it for a webhook event
+  that is read by its `data.streaming` rather than being `stream.started` /
+  `stream.stopped` — reports the state instead of a change. `rt.hint.state`
+  remembers what the last hint said; a `live` re-sync that repeats it starts no
+  boost, so a sender's once-a-minute "still streaming" cannot chain boosts until
+  the day's allowance is gone.
 - `offline` marks the attached chats in `rt.verifyNow` and wakes the chat
   sleeps; each chat runs its ordinary `videos.list` verification at once and
   then sleeps the rest of its interval, so the chat itself is never polled
-  early.
+  early. A hint that lands while a poll or a verification is in flight is picked
+  up before the chat goes to sleep.
 
 The wake is `hintableSleep`: each sleeper registers one callback in
 `rt.discoveryWakers` / `rt.chatWakers` and removes it (and its abort listener)
@@ -146,7 +157,12 @@ of the last transition, the attached video, the park) that
 A failure Google attributes to the key itself is flagged `keyRefused`
 (`classifyYtError`) and reported through the runtime's `onKeyRefused`; the key
 manager in `main.ts` uses it to fall back from a refused runtime key to the
-declared one (`resolveStartupKeySource` keeps both).
+declared one (`resolveStartupKeySource` keeps both). The quota ledger counts per
+key: `adoptKey` shelves the numbers of the key being left (`shelved`, one deep,
+persisted with the rest) and takes them up again when that key returns the same
+Pacific day — otherwise a stale runtime key, tried first and refused at every
+start, would reset the working key's day (search count, parks, boosts) with each
+restart.
 
 ## Design notes
 
@@ -198,15 +214,17 @@ Tuned for unattended multi-hour streams:
   See
   [Configuration → Quota and long streams](../configuration.md#quota-and-long-streams).
 - **State that survives a power cut.** Every state file goes through
-  `persistStateAtomic` (temp file + fsync + rename), and the files that change
-  often — the giveaway's pool, campaign, packs, turns and plan, the
-  channel-points ledger, reward map and pause — through `createStateWriter`, a
-  single-flight writer that folds overlapping changes into one follow-up write
-  and is flushed on SIGTERM/SIGINT. On load, a file that is not the expected
-  JSON shape (`decodeStateFile` + a shape check such as `GIVEAWAY_FILE_SHAPE`)
-  is moved aside to `<name>.corrupt-<timestamp>` and reported, never read as
-  "empty" and overwritten; a writer that was never called writes nothing on
-  flush, so the empty state doesn't replace the file either.
+  `persistStateAtomic` (temp file + fsync + rename, then an fsync of the
+  directory so the rename itself is on disk), and the files that change often —
+  the giveaway's pool, campaign, packs, turns and plan, the channel-points
+  ledger, reward map and pause — through `createStateWriter`, a single-flight
+  writer that folds overlapping changes into one follow-up write and is flushed
+  on SIGTERM/SIGINT. On load, a file that is not the expected JSON shape
+  (`decodeStateFile` + a shape check such as `GIVEAWAY_FILE_SHAPE`), or that
+  exists but cannot be read, is moved aside to `<name>.corrupt-<timestamp>` and
+  reported, never read as "empty" and overwritten; a writer that was never
+  called writes nothing on flush, so the empty state doesn't replace the file
+  either.
 - **SSE client cap.** `/events` is capped at 50 concurrent connections (returns
   `503` beyond that) so an exposed port can't be flooded with open streams.
 - **Bounded browser memory.** The viewer keeps at most 500 messages, removing

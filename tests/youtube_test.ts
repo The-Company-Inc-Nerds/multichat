@@ -835,10 +835,16 @@ Deno.test("searchGateOpen: a boost's early search skips the spacing, nothing els
   // Not before the playlist path has had its minute…
   assert(!earlySearchDue(q, now - 1));
   assert(!searchGateOpen(q, now - 1));
-  // …and only once: a search since it became due used it up.
-  const spent = { ...q, searches: 2, lastSearchAt: now };
+  // …and only once: a search since it became due used it up — the early
+  // one itself, or a regular slot that fell there.
+  const spent = { ...q, searches: 2, earlySearchAt: now };
   assert(!earlySearchDue(spent, now + MIN));
   assert(!searchGateOpen(spent, now + MIN));
+  const slot = { ...q, searches: 2, lastSearchAt: now };
+  assert(!earlySearchDue(slot, now + MIN));
+  assert(!searchGateOpen(slot, now + MIN));
+  // An earlier boost's early search says nothing about this one's.
+  assert(earlySearchDue({ ...q, earlySearchAt: q.boostAt - MIN }, now));
   // Never past the block, the exhausted pool or the daily cap.
   assert(!searchGateOpen({ ...q, searchBlocked: true }, now));
   assert(!searchGateOpen({ ...q, exhausted: true }, now));
@@ -958,6 +964,121 @@ Deno.test("the quota ledger counts go-live boosts, restores them, and forgets th
   t += 24 * HOUR;
   assertEquals(restored.snapshot().boosts, 0);
   assertEquals(restored.snapshot().boostAt, null);
+});
+
+Deno.test("the quota ledger: a boost's early search spends one of the day's searches but keeps the regular slot", () => {
+  let t = Date.parse("2026-10-09T02:00:00Z"); // 19:00 PDT: 20 min spacing
+  const l = createQuotaLedger({ now: () => t });
+  l.noteSearch(); // a regular slot
+  const regular = t;
+  assertEquals(l.snapshot().lastSearchAt, regular);
+  assertEquals(l.snapshot().earlySearchAt, null);
+
+  t += 4 * MIN;
+  l.noteBoost();
+  t += BOOST_SEARCH_DELAY_MS;
+  assert(l.searchAllowed(), "the early search is due");
+  l.noteSearch();
+  const early = t;
+  const q = l.snapshot();
+  assertEquals(q.searches, 2); // it counts toward the 40 a day…
+  assertEquals(q.earlySearchAt, early);
+  // …but the spacing still runs from the regular search: an early search
+  // that found nothing must not push the next slot back.
+  assertEquals(q.lastSearchAt, regular);
+  assert(!l.searchAllowed(), "one early search per boost");
+  t = regular + SEARCH_MIN_SPACING_MS - 1;
+  assert(!l.searchAllowed());
+  t = regular + SEARCH_MIN_SPACING_MS;
+  assert(l.searchAllowed(), "the regular slot is where it was");
+
+  // A restart mid-boost can't grant the early search twice.
+  t = early + MIN;
+  const restarted = createQuotaLedger({ now: () => t, snapshot: l.snapshot() });
+  assertEquals(restarted.snapshot().earlySearchAt, early);
+  assert(!restarted.searchAllowed());
+  // A file written before the field existed, or a damaged one, reads as none.
+  for (const earlySearchAt of [undefined, "soon", NaN]) {
+    assertEquals(
+      normalizeQuotaSnapshot({ day: "2026-10-08", earlySearchAt }, "2026-10-08")
+        .earlySearchAt,
+      null,
+    );
+  }
+});
+
+Deno.test("the quota ledger: a key that comes back the same day takes up its numbers again", () => {
+  let t = Date.parse("2026-10-08T20:00:00Z");
+  // The working key's day so far, as the last run left it on disk.
+  const l = createQuotaLedger({
+    now: () => t,
+    snapshot: {
+      day: "2026-10-08",
+      units: 9000,
+      searches: SEARCH_DAILY_CAP,
+      searchBlocked: true,
+      liveMs: 3 * HOUR,
+      lastSearchAt: t - HOUR,
+      keyFp: "declared",
+      boosts: BOOST_DAILY_CAP,
+      boostAt: t - HOUR,
+    },
+  });
+  const day = (x: typeof l) => {
+    const q = x.snapshot();
+    return [q.keyFp, q.units, q.searches, q.searchBlocked, q.liveMs, q.boosts];
+  };
+  const declared = ["declared", 9000, SEARCH_DAILY_CAP, true, 3 * HOUR, 12];
+
+  // A stale runtime key is tried first: unknown, so it counts from zero…
+  assert(l.adoptKey("stale"));
+  assertEquals(day(l), ["stale", 0, 0, false, 0, 0]);
+  l.charge(1); // …its one refused call…
+  // …and the fallback to the declared key finds that key's day as it was.
+  assert(!l.adoptKey("declared"), "not counted from zero again");
+  assertEquals(day(l), declared);
+  assert(!l.searchAllowed(), "the search block was not forgotten");
+
+  // The same at the next start, from what was persisted — whichever key the
+  // file was last written under (a power cut can land before the fallback).
+  for (const written of ["declared", "stale"]) {
+    const next = createQuotaLedger({ now: () => t });
+    next.adoptKey("declared");
+    next.charge(9000);
+    next.adoptKey("stale");
+    next.charge(1);
+    if (written === "declared") next.adoptKey("declared");
+    const restored = createQuotaLedger({
+      now: () => t,
+      snapshot: JSON.parse(JSON.stringify(next.snapshot())),
+    });
+    assert(!restored.adoptKey("stale"), `stale, file under ${written}`);
+    assertEquals(restored.snapshot().units, 1);
+    assert(!restored.adoptKey("declared"), `declared, file under ${written}`);
+    assertEquals(restored.snapshot().units, 9000);
+  }
+
+  // Only the key used just before is remembered; any other starts from zero.
+  assert(l.adoptKey("third"));
+  assert(l.adoptKey("stale"));
+  assert(!l.adoptKey("third"));
+  // Shelved numbers are worthless on a new Pacific day, and so is a shelf
+  // from another day or without a key in a file read back.
+  t += 24 * HOUR;
+  assertEquals(l.snapshot().shelved, null);
+  assert(l.adoptKey("stale"));
+  for (
+    const shelved of [{ day: "2026-10-07", keyFp: "k", units: 5 }, {
+      day: "2026-10-08",
+      units: 5,
+    }, "garbage"]
+  ) {
+    assertEquals(
+      normalizeQuotaSnapshot({ day: "2026-10-08", shelved }, "2026-10-08")
+        .shelved,
+      null,
+    );
+  }
 });
 
 // ---- live detection / dedupe -----------------------------------------------------
@@ -2281,10 +2402,12 @@ Deno.test("scenario: a go-live hint wakes discovery, ticks every 20s for 5 min, 
   assertEquals(after[0].t, hintAt + BOOST_DURATION_MS);
 
   // One early search a minute in — inside the ≥20 min spacing the first
-  // search of the day would otherwise impose — and no second one.
+  // search of the day would otherwise impose — and no second early one; the
+  // regular slot then comes when it would have without the boost.
   assertEquals(h.callsTo("search").map((c) => c.t - t0), [
     0,
     10 * MIN + BOOST_SEARCH_DELAY_MS,
+    21 * MIN,
   ]);
 
   // ≈2 units a tick, as ever; the boost is counted in the ledger.
@@ -2354,6 +2477,57 @@ Deno.test("scenario: a hinted stream that is only findable by search attaches a 
   assert(h.logs.some((l) => l.includes("found via search")), h.logs.join("\n"));
 });
 
+Deno.test("scenario: a stream the early search was too early for is found at the regular search slot, as with no hint", async () => {
+  const t0 = Date.parse("2026-10-08T18:00:00Z");
+  const hintAt = t0 + 4 * MIN;
+  // The encoder starts at `hintAt`; search.list only lists the broadcast 90s
+  // later — after the boost's early search has come and gone.
+  const detect = async (hinted: boolean) => {
+    const h = harness({
+      start: "2026-10-08T18:00:00Z",
+      route: (c, h) => {
+        switch (c.path) {
+          case "videos":
+            return videosFrom({
+              v1: plainVideo("v1"),
+              vLive: liveVideo("vLive", "c9", hintAt),
+            })(c);
+          case "search":
+            return json({
+              items: h.clock.t >= hintAt + 90_000
+                ? [{ id: { videoId: "vLive" } }]
+                : [],
+            });
+          case "liveChat/messages":
+            h.controller.abort();
+            return json({ items: [] });
+        }
+        return offlineRoute(c, h);
+      },
+      events: hinted
+        ? [{ at: hintAt, run: (h) => liveHint(h.rt, "live") }]
+        : [],
+    });
+    await h.run({ channelId: "UCchan" });
+    return {
+      attached: h.callsTo("liveChat/messages")[0].t - t0,
+      searches: h.callsTo("search").map((c) => c.t - t0),
+    };
+  };
+  const plain = await detect(false);
+  const hinted = await detect(true);
+
+  assertEquals(plain.searches, [0, 21 * MIN]);
+  // The early search came up empty, and cost nothing but itself: the next
+  // regular slot — and with it the attach — is where it is without a hint.
+  assertEquals(hinted.searches, [
+    0,
+    hintAt - t0 + BOOST_SEARCH_DELAY_MS,
+    21 * MIN,
+  ]);
+  assertEquals(hinted.attached, plain.attached);
+});
+
 Deno.test("liveHint: hints inside a boost coalesce; the daily cap and a running boost survive a restart", () => {
   const clock = { t: Date.parse("2026-10-08T18:00:00Z") };
   const rt = hintRuntime(clock);
@@ -2393,6 +2567,49 @@ Deno.test("liveHint: hints inside a boost coalesce; the daily cap and a running 
   clock.t += 24 * HOUR;
   assertEquals(liveHint(next, "live").effect, "boost");
   assertEquals(next.ledger.snapshot().boosts, 1);
+});
+
+Deno.test("liveHint: a re-sync that repeats the last hint starts no boost; a change does", () => {
+  const clock = { t: Date.parse("2026-10-08T18:00:00Z") };
+  const rt = hintRuntime(clock);
+  let woken = 0;
+  rt.discoveryWakers.add(() => woken++);
+  const resync = (state: "live" | "offline") =>
+    liveHint(rt, state, "mailroom stream.state", { resync: true });
+
+  // The first report after a start is news: nothing said so before.
+  assertEquals(resync("live").effect, "boost");
+  // A sender repeating "still streaming" once a minute, to a server that
+  // cannot find the stream, used to chain boosts until the day's 12 were gone.
+  const effects: string[] = [];
+  for (let m = 1; m <= 3 * 60; m++) {
+    clock.t += MIN;
+    effects.push(resync("live").effect);
+  }
+  assertEquals([...new Set(effects)], ["coalesced"]);
+  assertEquals(rt.ledger.snapshot().boosts, 1);
+  assertEquals(woken, 1);
+  const repeat = resync("live");
+  assert(repeat.message.includes("repeats the last hint"), repeat.message);
+
+  // A change of state is news again, however it is reported…
+  assertEquals(resync("offline").effect, "idle"); // no chat attached
+  assertEquals(resync("live").effect, "boost");
+  // …and a sender's own "started" (no resync flag) never needed one.
+  clock.t += BOOST_DURATION_MS;
+  assertEquals(liveHint(rt, "live", "mailroom stream.started").effect, "boost");
+  clock.t += BOOST_DURATION_MS;
+  assertEquals(liveHint(rt, "live", "twitch chan").effect, "boost");
+  clock.t += BOOST_DURATION_MS;
+  assertEquals(resync("live").effect, "coalesced");
+  assertEquals(rt.ledger.snapshot().boosts, 4);
+
+  // A restart forgets what was last said: the next report counts once.
+  const restarted = hintRuntime(clock, rt.ledger.snapshot());
+  const again = () => liveHint(restarted, "live", "", { resync: true }).effect;
+  assertEquals([again(), again()], ["boost", "coalesced"]);
+  clock.t += BOOST_DURATION_MS;
+  assertEquals(again(), "coalesced");
 });
 
 Deno.test("liveHint: nothing to speed up while parked, attached or unwatched — and the ledger is left alone", () => {
@@ -2565,6 +2782,62 @@ Deno.test("scenario: an offline hint ends the chat only when videos.list agrees"
   assertEquals(h.rt.active.size, 0);
 });
 
+Deno.test("scenario: an offline hint that lands mid-request is honoured before the next sleep, and never outlives its chat", async () => {
+  const t0 = Date.parse("2026-10-08T18:00:00Z");
+  // While the third chat poll is in flight: verified right after it, not one
+  // interval later (the sleeper it would have woken is not asleep yet).
+  const midPoll = harness({
+    start: "2026-10-08T18:00:00Z",
+    route: liveRoute((n, _c, h) => {
+      if (n === 3) liveHint(h.rt, "offline");
+      return json({ items: [], nextPageToken: `t${n}` });
+    }),
+    stop: (h) => h.callsTo("liveChat/messages").length >= 5,
+  });
+  await midPoll.run({ channelId: "UCchan" });
+  const polls = midPoll.callsTo("liveChat/messages").map((c) => c.t);
+  assertEquals(midPoll.callsTo("videos").map((c) => c.t), [t0, polls[2]]);
+  assertEquals(midPoll.rt.verifyNow.size, 0);
+
+  // While a verification is itself in flight (the periodic one, ten minutes
+  // in): that answer may be older than the hint, so it is asked again at
+  // once — not after the next chat poll, which the quota floor can put ten
+  // minutes away.
+  let verifies = 0;
+  const midVerify = harness({
+    start: "2026-10-08T18:00:00Z",
+    route: (c, h) => {
+      if (c.path === "videos" && ++verifies === 2) liveHint(h.rt, "offline");
+      return liveRoute((n) => json({ items: [], nextPageToken: `t${n}` }))(
+        c,
+        h,
+      );
+    },
+    stop: () => verifies >= 3,
+  });
+  await midVerify.run({ channelId: "UCchan" });
+  const checks = midVerify.callsTo("videos").map((c) => c.t - t0);
+  assertEquals(checks.length, 3);
+  assert(checks[1] >= 10 * MIN, `periodic check at ${checks[1]}`);
+  assertEquals(checks[2], checks[1]);
+  assertEquals(midVerify.states(), ["connecting", "live"]);
+
+  // The chat ends with a hint still pending: the request must not survive it
+  // to verify whatever is attached under that name next.
+  const ending = harness({
+    start: "2026-10-08T18:00:00Z",
+    route: liveRoute((n, _c, h) => {
+      if (n < 2) return json({ items: [], nextPageToken: "t1" });
+      liveHint(h.rt, "offline");
+      return new Response(CHAT_ENDED_403, { status: 403 });
+    }),
+    stop: (_h, ms) => ms === RESTART_RECHECK_MS,
+  });
+  await ending.run({ channelId: "UCchan" });
+  assertEquals(ending.states(), ["connecting", "live", "offline"]);
+  assertEquals(ending.rt.verifyNow.size, 0);
+});
+
 Deno.test("a go-live hint cuts a real discovery sleep short and leaves no listener behind", async () => {
   // The generation's signal can live for months: count what stays attached.
   const ac = new AbortController();
@@ -2703,6 +2976,8 @@ Deno.test("youtubeRuntimeStatus: the attached video, the ledger and the reset �
     Date.parse("2026-10-09T07:00:00Z"), // 00:00 PDT
   );
   assertEquals(mid.boost.active, false);
+  // The ledger's own bookkeeping is not part of the report.
+  assert(!("shelved" in mid.quota) && !("earlySearchAt" in mid.quota));
   assert(!JSON.stringify(mid).includes("SECRETKEY"));
 
   // Detached again once the generation is gone.

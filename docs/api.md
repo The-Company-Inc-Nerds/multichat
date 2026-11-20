@@ -340,7 +340,9 @@ Detection works without it.
     integration adapter emits). `stream.started` means live and `stream.stopped`
     offline, whatever `data` says; any other event goes by `data.streaming`
     (`true` = live, `false` = offline), so a periodic `stream.state` re-sync
-    works too. `data.source`, if a string, names the sender in the log.
+    works too — as a report of the state rather than a change of it: a `live`
+    one that repeats what the last hint said starts no new boost (`coalesced`).
+    `data.source`, if a string, names the sender in the log.
 - **Response.** `200` with JSON for every well-formed body — including one this
   server has no use for, so a sender that retries on errors is never sent into a
   loop:
@@ -354,18 +356,18 @@ Detection works without it.
   }
   ```
 
-  | `effect`       | Meaning                                                                                     |
-  | -------------- | ------------------------------------------------------------------------------------------- |
-  | `boost`        | `live`: discovery was woken and ticks every 20s for 5 minutes                               |
-  | `coalesced`    | `live`: already inside a boost · `offline`: the chat was re-verified less than a minute ago |
-  | `capped`       | `live`: today's 12 boosts are used; discovery stays on its normal tick                      |
-  | `parked`       | `live`: the daily quota is spent, or the key is refused — nothing to speed up               |
-  | `attached`     | `live`: every watched channel is already on its live chat                                   |
-  | `verify`       | `offline`: the attached chat(s) are being checked with `videos.list` now                    |
-  | `idle`         | no YouTube channel is being watched yet / no chat is attached to verify                     |
-  | `keyless`      | there is no YouTube API key yet                                                             |
-  | `unconfigured` | no YouTube channels are configured                                                          |
-  | `ignored`      | an envelope whose event says nothing about the stream (no `state` field in the response)    |
+  | `effect`       | Meaning                                                                                                                           |
+  | -------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+  | `boost`        | `live`: discovery was woken and ticks every 20s for 5 minutes                                                                     |
+  | `coalesced`    | `live`: already inside a boost, or a re-sync repeating the last hint · `offline`: the chat was re-verified less than a minute ago |
+  | `capped`       | `live`: today's 12 boosts are used; discovery stays on its normal tick                                                            |
+  | `parked`       | `live`: the daily quota is spent, or the key is refused — nothing to speed up                                                     |
+  | `attached`     | `live`: every watched channel is already on its live chat                                                                         |
+  | `verify`       | `offline`: the attached chat(s) are being checked with `videos.list` now                                                          |
+  | `idle`         | no YouTube channel is being watched yet / no chat is attached to verify                                                           |
+  | `keyless`      | there is no YouTube API key yet                                                                                                   |
+  | `unconfigured` | no YouTube channels are configured                                                                                                |
+  | `ignored`      | an envelope whose event says nothing about the stream (no `state` field in the response)                                          |
 
 | Status | Meaning                                                            |
 | ------ | ------------------------------------------------------------------ |

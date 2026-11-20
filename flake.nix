@@ -239,12 +239,17 @@
                 "-H 'Authorization: Bearer control-secret'"
             ) == "403", "/api/live must stay loopback-only"
             assert code(
-                f"curl http://{lan}:8080/api/status"
+                f"curl http://{lan}:8080/api/status "
+                "-H 'Authorization: Bearer control-secret'"
             ) == "403", "/api/status must stay loopback-only"
             assert code(
                 f"curl -X POST http://127.0.0.1:8080/api/live {live_body} "
                 "-H 'Origin: http://evil.test'"
             ) == "403", "/api/live must refuse a web page"
+            assert code(
+                "curl http://127.0.0.1:8080/api/status "
+                "-H 'Origin: http://evil.test'"
+            ) == "403", "/api/status must refuse a web page"
 
             # From loopback both answer, and the packaged CLI reaches them with
             # the wrapper's permission flags as they are. A webhook's
@@ -269,6 +274,12 @@
             ) == "400", "a malformed hint is a bad request"
             assert "unconfigured" in machine.succeed("multichat live on -p 8080")
             assert "Twitch chat" in machine.succeed("multichat status -p 8080")
+            # Pointed at the wrong port — the effects stand-in answers any POST
+            # with 200 — the CLI must not take that for multichat's answer: a
+            # hook would report success for a hint that never arrived.
+            assert "does not look like multichat" in machine.fail(
+                "multichat live on -p 8082 2>&1"
+            )
 
             # The gates the module emits conditionally: present and switched on,
             # with the operator's own values rather than the app's defaults.
@@ -371,17 +382,24 @@
             after = json.loads(giveaway("status"))["state"]["entrants"]
             assert after == before, (before, after)
 
+            # The same goes for a file that is intact but not the service's to
+            # read (a restore that got the mode wrong): left in place, the first
+            # change would rename an empty ledger over it.
             machine.succeed("systemctl stop multichat.service")
             machine.succeed(
                 f"printf '%s' '{{\"open\": true, \"entr' > {state_dir}/giveaway-pool"
             )
+            turns = machine.succeed(f"cat {state_dir}/giveaway-turns")
+            assert drawn["winner"]["login"] in turns, turns
+            machine.succeed(f"chmod 000 {state_dir}/giveaway-turns")
             machine.succeed("systemctl start multichat.service")
             machine.wait_for_open_port(8080)
             assert json.loads(giveaway("status"))["state"]["entrants"] == []
             machine.succeed(f"ls {state_dir}/giveaway-pool.corrupt-*")
-            assert "EMPTY entrant pool" in machine.succeed(
-                "journalctl -u multichat.service --no-pager"
-            )
+            assert machine.succeed(f"cat {state_dir}/giveaway-turns.corrupt-*") == turns
+            journal = machine.succeed("journalctl -u multichat.service --no-pager")
+            assert "EMPTY entrant pool" in journal
+            assert "turn ledger" in journal and "could not be read" in journal
             # Every write went through a temp file; none is left behind.
             leftovers = machine.succeed(f"ls {state_dir}")
             assert ".tmp" not in leftovers, leftovers
@@ -394,7 +412,8 @@
         # renders — with a stand-in for the binary it execs — through every
         # case: first start, a rotated token, a state file emptied by a power
         # cut, a replaced seed, the first start of this logic over an existing
-        # token, and a blank seed. No VM, so it also runs without KVM.
+        # token, the same token saved again with other whitespace, and a blank
+        # seed. No VM, so it also runs without KVM.
         twitch-seed =
           let
             # Records what the app would be handed as its seed fallback.
@@ -477,14 +496,28 @@
             ${start}
             holds "$state" SEED-4 "the next replacement"
 
-            # A blank seed (a fetch that wrote an empty file) is ignored: not
-            # installed, not exported, and not remembered as "the seed".
+            # The same token saved again without its trailing newline, or
+            # with more of them, is not a replacement.
             echo ROTATED-4 > "$state"
-            : > "$seed"
-            rm "$STATE_DIRECTORY/exported"
+            printf 'SEED-4' > "$seed"
             ${start}
-            holds "$state" ROTATED-4 "blank seed"
-            [ ! -s "$STATE_DIRECTORY/exported" ]
+            holds "$state" ROTATED-4 "same seed, no trailing newline"
+            printf 'SEED-4\r\n\n' > "$seed"
+            ${start}
+            holds "$state" ROTATED-4 "same seed, other whitespace"
+            holds "$STATE_DIRECTORY/exported" SEED-4 "seed handed over trimmed"
+
+            # A blank seed — a fetch that wrote an empty file, or a cleared
+            # secret written as a lone newline — is ignored: not installed
+            # over the working token, not exported, and not remembered as
+            # "the seed".
+            for blank in "" '\n' ' \n\n'; do
+              printf "$blank" > "$seed"
+              rm -f "$STATE_DIRECTORY/exported"
+              ${start}
+              holds "$state" ROTATED-4 "blank seed"
+              [ ! -s "$STATE_DIRECTORY/exported" ]
+            done
             echo SEED-4 > "$seed"
             ${start}
             holds "$state" ROTATED-4 "the same seed back after a blank one"

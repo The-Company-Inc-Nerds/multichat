@@ -112,19 +112,21 @@ redemption ledger (`channelpoints-ledger.json`), the reward-id map
 runtime, and each EventSub channel's rotated Twitch refresh token.
 
 Every one of those files is written **atomically** — a temp file, fsynced, then
-renamed into place — so a crash, a deploy or a power cut mid-write leaves the
-previous contents, never half a file. Changes that arrive while a write is in
-flight are folded into one follow-up write of the latest state, and whatever is
-pending is flushed on SIGTERM/SIGINT before the process exits. (The winners log
-is append-only instead: a cut can cost at most its last line.)
+renamed into place, and the directory fsynced after it — so a crash, a deploy or
+a power cut mid-write leaves the previous contents, never half a file. Changes
+that arrive while a write is in flight are folded into one follow-up write of
+the latest state, and whatever is pending is flushed on SIGTERM/SIGINT before
+the process exits. (The winners log is append-only instead: a cut can cost at
+most its last line.)
 
 A giveaway or channel-points file that is corrupt anyway — a file torn by an
-older version, a bad restore, a hand edit gone wrong — is **moved aside** to
-`<name>.corrupt-<timestamp>` rather than read as "empty" and overwritten, with a
-loud `!!!` log line saying what starting without it means (an empty entrant
-pool; campaign counters at zero; a lost manual pause, which is treated as
-paused). To recover, stop the server, repair the file that was moved aside, move
-it back under its own name and start again. A server that is stopped before
+older version, a bad restore, a hand edit gone wrong — or that is intact but not
+the server's to read (restored under the wrong owner or mode) is **moved aside**
+to `<name>.corrupt-<timestamp>` rather than read as "empty" and overwritten,
+with a loud `!!!` log line saying what starting without it means (an empty
+entrant pool; campaign counters at zero; a lost manual pause, which is treated
+as paused). To recover, stop the server, repair the file that was moved aside,
+move it back under its own name and start again. A server that is stopped before
 anything changed does not write the empty state back.
 
 The directory is resolved in this order:
@@ -335,8 +337,12 @@ says so loudly
 (`[YouTube] !!! The persisted runtime key … was refused … Switching to the key from …`).
 It does not touch the persisted file, so the same thing happens at the next
 start until you delete `$STATE_DIRECTORY/youtube-api-key` or set a working key
-with `multichat set-youtube-key`. A declared key that is refused too is simply
-retried every 10 minutes, as before.
+with `multichat set-youtube-key` — the declared key itself will do: sent to a
+server that is running on it, it is stored as the runtime key and replaces the
+refused one. Meanwhile each such start costs one refused call and that log line,
+nothing else: the day's quota count belongs to the key it was spent on, and the
+declared key takes its own up again when the server falls back to it. A declared
+key that is refused too is simply retried every 10 minutes, as before.
 
 ## Go-live hints
 
@@ -372,16 +378,28 @@ one multichat's own `webhook` integration emits), so a tool that POSTs
 `stream.started` / `stream.stopped` / `stream.state` webhooks — an OBS
 controller, a stream deck — can be pointed straight at
 `http://127.0.0.1:<port>/api/live`. Events that say nothing about the stream are
-answered `200` and ignored.
+answered `200` and ignored. `stream.started` and `stream.stopped` are taken as
+the stream changing state; any other event that carries `data.streaming` — a
+periodic `stream.state` re-sync — is a report of the state it is in, and only
+acts when it differs from the last hint (see below).
 
 What a hint does:
 
 - **`live`** — discovery looks **now**, then every 20 seconds for 5 minutes (a
   _boost_), and one rationed search may run a minute into the boost instead of
-  waiting for its slot. Hints that arrive during a boost are folded into it, and
-  at most 12 boosts start per Pacific day (≈30 units each per channel — under 4%
-  of the default quota even if every one is used). The count is kept in the
-  quota ledger, so a restart doesn't reset it.
+  waiting for its slot. That early search is one of the day's 40 and is shared
+  by every watched channel — whichever offline channel ticks first takes it —
+  but it does not restart the spacing of the regular search slots: if YouTube
+  had not listed the stream yet, the next slot still comes when it was due (the
+  day's remaining searches are only spread one thinner). Hints that arrive
+  during a boost are folded into it, and at most 12 boosts start per Pacific day
+  (≈30 units each per channel — under 4% of the default quota even if every one
+  is used). The count is kept in the quota ledger, so a restart doesn't reset
+  it. A sender that keeps reporting "still streaming" (a webhook's periodic
+  re-sync) starts one boost, not one after another: a re-sync that repeats what
+  the last hint said is folded away, so a stream multichat cannot find — a
+  Twitch-only one, an unlisted test — does not use up the day's boosts. The
+  first re-sync after a restart, or after an `offline`, counts.
 - **`offline`** — the attached chat is verified with `videos.list` now, instead
   of at the next 10-minute check (at most once a minute).
 

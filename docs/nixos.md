@@ -280,15 +280,17 @@ persists is never clobbered by an unchanged seed:
 | ---------------------------------------------------------- | ----------------------------------------------------- |
 | no token file yet (first start)                            | installs the seed                                     |
 | the token file is empty (a write cut short by a power cut) | installs the seed                                     |
-| the seed's content changed since it was last seen          | installs the new seed                                 |
+| the seed is a different token than the one last seen       | installs the new seed                                 |
 | a token is there and the seed is unchanged                 | nothing — the persisted token wins                    |
 | a token is there, but no seed hash was ever recorded       | records the hash, leaves the token alone              |
-| the seed file is empty                                     | nothing (a blank secret is never installed or hashed) |
+| the seed file is empty, or holds only whitespace           | nothing (a blank secret is never installed or hashed) |
 
-"Last seen" is a SHA-256 of the seed, kept beside the token as
-`twitch-refresh-<broadcasterId>.seed` (a hash, not a secret). The seed is also
-handed to the app as `MULTICHAT_TWITCH_SEED_<broadcasterId>`, its fallback when
-the persisted token turns out unreadable or Twitch rejects it (see
+"Last seen" is a SHA-256 of the seed token, kept beside the token as
+`twitch-refresh-<broadcasterId>.seed` (a hash, not a secret). It is taken of the
+token with its whitespace removed, so saving the same token again with or
+without a trailing newline is not a change. The seed is also handed to the app
+as `MULTICHAT_TWITCH_SEED_<broadcasterId>`, its fallback when the persisted
+token turns out unreadable or Twitch rejects it (see
 [Token persistence & rotation](configuration.md#3-token-persistence--rotation)).
 Obtain the token and id with `multichat login` (see
 [Configuration](configuration.md#twitch-eventsub-alerts)). Inline `clientSecret`
