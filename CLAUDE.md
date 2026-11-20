@@ -36,20 +36,35 @@ deno run --allow-net --allow-read --allow-write=/var/lib/multichat,/var/lib/priv
 
 `config-path` defaults to `./settings.json`. Env vars `PORT` and `HOST` override
 their settings.json counterparts; the YouTube key is resolved as persisted
-runtime key → `YOUTUBE_API_KEY` → `youtube.apiKey`.
+runtime key → `YOUTUBE_API_KEY` → `youtube.apiKey`, and the winner's source +
+fingerprint are logged at start (`resolveStartupKeySource`). One exception to
+that order: when the API refuses a runtime key itself (`YtFailure.keyRefused`)
+and a different declared key (env, else settings) exists, the key manager
+switches to the declared one, loudly, without touching the persisted file.
 
 `--allow-write` exists so state can be persisted: the runtime YouTube key and
-its per-Pacific-day quota ledger, the rotated Twitch refresh tokens, the whole giveaway (entrant pool, campaign
-counters, append-only winners log, turn ledger, chat-cards pack reports,
-committed draw plan), and channel points (the redemption ledger, the catalogue
-key → Twitch reward id map, the manual pause). `resolveStateDir` in
-`src/control.ts` picks the directory — `$STATE_DIRECTORY` (systemd) →
-`$MULTICHAT_STATE_DIR` → `$XDG_STATE_HOME/multichat` →
+its per-Pacific-day quota ledger, the rotated Twitch refresh tokens, the whole
+giveaway (entrant pool, campaign counters, append-only winners log, turn ledger,
+chat-cards pack reports, committed draw plan), and channel points (the
+redemption ledger, the catalogue key → Twitch reward id map, the manual pause).
+`resolveStateDir` in `src/control.ts` picks the directory — `$STATE_DIRECTORY`
+(systemd) → `$MULTICHAT_STATE_DIR` → `$XDG_STATE_HOME/multichat` →
 `$HOME/.local/state/multichat`, never the working tree — and `ensureStateDir` in
 main.ts creates it 0700. Everything degrades to in-memory (with a warning) if it
 can't be created; persistence must never cost someone their stream. Deno's
 `--allow-write` is an allow-list, so those default paths are in `deno.json` and
 `build.nix`; a custom `MULTICHAT_STATE_DIR` outside them is denied by Deno.
+
+Every state file is written through `persistStateAtomic` (temp file + fsync +
+rename; a power cut leaves the old file or the new one, never a torn one). The
+frequently changing ones — the giveaway's pool/campaign/packs/turns/plan and the
+channel-points files — go through `createStateWriter` (src/control.ts): one
+single-flight writer per file that folds overlapping changes into one follow-up
+write and is flushed on SIGTERM/SIGINT; a writer that was never called writes
+nothing on flush. On load, a file of the wrong JSON shape (`decodeStateFile`,
+`GIVEAWAY_FILE_SHAPE`) is moved aside to `<name>.corrupt-<timestamp>` and
+reported loudly, never read as "empty" and overwritten. The winners log stays
+append-only JSONL.
 
 The same binary is also a small CLI client:
 
@@ -71,17 +86,17 @@ The same binary is also a small CLI client:
   server via its loopback `POST /api/giveaway` endpoint (`status` / `open` /
   `close` / `draw` / `reset` / `demo` / `winners [--csv]` / `packs` / `turns` /
   `report [--csv]` / `plan [N] [--reseed] [--csv]` / `plan-clear` /
-  `campaign-reset --yes` / `remove <who>` (a login, display name, `#entry-number`
-  or userId — resolved server-side, refusing a miss or an ambiguous name rather
-  than dropping the wrong person); `demo` injects sample entrants +
-  follower progress to preview the reel, `winners` prints the recorded mailing
-  list, `packs` the pack reports pushed back by chat-cards, `turns` the turn
-  ledger + disposition totals, `report` the compiled per-user list (turn-start
-  in Mountain Time, cards pulled, value, disposition), `plan` commits/shows a
-  seeded next-N draw order for off-stream prep) — the terminal equivalent of the
-  `/giveaway` page (a CS2-style case reel; `?overlay` is a transparent OBS
-  source, `?overlay&progress` adds a follower-milestone pill). See
-  `docs/configuration.md#giveaway-mode`.
+  `campaign-reset --yes` / `remove <who>` (a login, display name,
+  `#entry-number` or userId — resolved server-side, refusing a miss or an
+  ambiguous name rather than dropping the wrong person); `demo` injects sample
+  entrants + follower progress to preview the reel, `winners` prints the
+  recorded mailing list, `packs` the pack reports pushed back by chat-cards,
+  `turns` the turn ledger + disposition totals, `report` the compiled per-user
+  list (turn-start in Mountain Time, cards pulled, value, disposition), `plan`
+  commits/shows a seeded next-N draw order for off-stream prep) — the terminal
+  equivalent of the `/giveaway` page (a CS2-style case reel; `?overlay` is a
+  transparent OBS source, `?overlay&progress` adds a follower-milestone pill).
+  See `docs/configuration.md#giveaway-mode`.
 - `multichat rewards <verb>` drives channel-point chaos on a running server via
   its loopback-only `POST /api/rewards` endpoint (`status` / `sync` / `pause` /
   `resume` / `pending` / `refund <id>` / `simulate <key> [--user NAME]`; it also
@@ -94,6 +109,26 @@ The same binary is also a small CLI client:
   (refund + effect withdrawn, retried until the overlay confirms); `simulate`
   injects a `sim-<uuid>` redemption through the whole overlay → mod pipeline
   without touching Twitch. See `docs/configuration.md#channel-points`.
+- `multichat live on|off [--source NAME]` sends a **go-live hint** to a running
+  server's loopback-only `POST /api/live` (also refused from a browser, like
+  `/api/rewards`): `on` wakes the offline YouTube discovery sleep, ticks it
+  every 20s for 5 minutes (a _boost_; coalesced while one runs, at most 12 per
+  Pacific day, counted in the persisted quota ledger) and allows one early
+  rationed search a minute in; `off` verifies the attached chat with
+  `videos.list` now. It is only ever a hint — it never marks a channel live,
+  detaches a chat, bypasses the quota/denied parks or the search cap, resets the
+  ledger, restarts the poller generation or touches Twitch. The endpoint also
+  accepts a webhook's `{event, ts, data}` envelope (`stream.started` /
+  `stream.stopped` / `data.streaming`; unknown events → `200` ignored), and
+  Twitch's `stream.online` / `stream.offline` EventSub events feed the same
+  nudge. With no verb it prints the status. See
+  `docs/configuration.md#go-live-hints`.
+- `multichat status [--json]` prints a running server's loopback-only
+  `GET /api/status`: version/uptime, the YouTube key's source + fingerprint
+  (never the key), the quota ledger, why detection is parked (keyless /
+  exhausted / denied / search-blocked), each channel's last transition +
+  attached video, the boost, Twitch IRC state, and per-EventSub-channel token +
+  subscription state. See `docs/api.md#get-apistatus`.
 
 ## Configuration
 
@@ -104,21 +139,27 @@ Copy `settings.json.example` to `settings.json` and edit:
   buttons and `multichat giveaway <verb>`): `"loopback"` (default, host only),
   `"lan"` (also private/link-local peers — the setting for "anyone in the room
   can press Draw"), `"any"` (no address check). `server.controlToken` optionally
-  requires a shared secret of non-loopback callers, presented as a bearer header,
-  `?token=`, or the cookie `GET /giveaway?token=…` mints. Loopback is never asked
-  for the token, so the CLI keeps working. Scoped to `/api/giveaway` — the
-  youtube-key and fake-event endpoints stay loopback-only, and the read-only
-  pages have no auth either way. Both are env-overridable
-  (`MULTICHAT_CONTROL_ACCESS`, `MULTICHAT_CONTROL_TOKEN`) so the NixOS module can
-  carry the token via `LoadCredential`. See `src/control.ts`
-- `twitch.channels` — list of Twitch channel names (normalized on load: case,
-  a leading `#` and duplicates don't matter — `normalizeChannels`)
+  requires a shared secret of non-loopback callers, presented as a bearer
+  header, `?token=`, or the cookie `GET /giveaway?token=…` mints. Loopback is
+  never asked for the token, so the CLI keeps working. Scoped to `/api/giveaway`
+  — the youtube-key, fake-event, rewards, live-hint and status endpoints stay
+  loopback-only, and the read-only pages have no auth either way. Both are
+  env-overridable (`MULTICHAT_CONTROL_ACCESS`, `MULTICHAT_CONTROL_TOKEN`) so the
+  NixOS module can carry the token via `LoadCredential`. See `src/control.ts`
+- `twitch.channels` — list of Twitch channel names (normalized on load: case, a
+  leading `#` and duplicates don't matter — `normalizeChannels`)
 - `twitch.eventsub` — optional `{clientId, clientSecret, channels}` for follow/
   cheer/sub/raid **alerts** via Twitch EventSub (chat alone works without it).
   Its `clientId` + `clientSecret` alone (no channels needed; or
   `TWITCH_CLIENT_ID`/`TWITCH_CLIENT_SECRET`) also unlock the channel's own
   sub/bits **badge art** via an app token (`TwitchConfig.app`); global badges
-  render from a built-in snapshot with no credentials at all
+  render from a built-in snapshot with no credentials at all. A channel's
+  `refreshToken` is only the **seed**: the rotated token persisted in the state
+  dir wins, but an empty/unreadable persisted file falls back to the seed, and
+  Twitch's `Invalid refresh token` is retried once with a different seed
+  (`chooseRefreshToken` / `shouldRetryWithSeed`). The NixOS module hands a
+  `refreshTokenFile` seed over as `MULTICHAT_TWITCH_SEED_<broadcasterId>`
+  (`twitchSeedEnvVar`, mirrored in module.nix — keep the two in sync)
 - `youtube.apiKey` — YouTube Data API v3 key (get one at Google Cloud Console)
 - `youtube.channels` — list of `{handle, channelId, videoId}` objects; supply at
   least one field per entry
@@ -130,13 +171,12 @@ Copy `settings.json.example` to `settings.json` and edit:
   `budgetHours` to the real daily stream length for responsiveness
 - `alerts` — optional `{activeTheme, themes}` registry that skins the `/alerts`
   overlay (built-in styles `default` / `company-memo`); unset = default look.
-  Under `company-memo`, three kinds get stamped Company documents: subs =
-  hiring paperwork (tier → job title, Tier 1/2/3 = INTERN/ASSOCIATE/EXECUTIVE;
-  resub = contract renewal; gift = referrals) driven by the structured
-  `ChatMessage.sub` detail (`{tier?, variant, count?}`), raids = an FBI search
-  warrant (viewers as agents, police-light glow), cheers = a petty-cash
-  receipt ("OFF THE BOOKS") — the latter two driven by `ChatMessage.quantity`
-  (the numeric twin of `amount`)
+  Under `company-memo`, three kinds get stamped Company documents: subs = hiring
+  paperwork (tier → job title, Tier 1/2/3 = INTERN/ASSOCIATE/EXECUTIVE; resub =
+  contract renewal; gift = referrals) driven by the structured `ChatMessage.sub`
+  detail (`{tier?, variant, count?}`), raids = an FBI search warrant (viewers as
+  agents, police-light glow), cheers = a petty-cash receipt ("OFF THE BOOKS") —
+  the latter two driven by `ChatMessage.quantity` (the numeric twin of `amount`)
 - `giveaway` — optional Twitch-only `!enter` prize draw
   `{enabled, channel,
   prefix, command, requireFollow, replies, firstN, followerStep, milestoneDraws,
@@ -146,20 +186,20 @@ Copy `settings.json.example` to `settings.json` and edit:
   mode: `firstN` = guaranteed first-N queue (draws pick who's next),
   `followerStep`/`milestoneDraws` = advisory draw credits per N new followers,
   winners logged append-only (JSONL mailing list). `terms`
-  `{required, command, version, url}` is an informational terms command — viewers
-  type `!terms` and the bot replies with a link to `url`. It does NOT gate entry
-  (`required`/`version` are retained for config compatibility only); `disposition`
-  `{enabled, mail, donate, destroy, pass}` are
-  winner-only chat words deciding a pull's fate (`pass` carries the cards to the
-  next person's turn + auto-advances the draw); `timezone` (default
-  `America/Denver`) is what the compiled `report` renders turn-start times in.
-  Draw on `/giveaway` (a CS2-style case reel; `?overlay` = transparent OBS
-  source). `terms`/`disposition` are only honoured when the block is PRESENT —
-  module.nix therefore emits each one only when its `enable` is set, rather than
-  writing a disabled block. The terms command needs `replies`: the response is a
-  chat reply, so with replies off the command is silently inert. There is no
-  `/terms` HTTP route — `terms.url` is substituted into the reply as `{terms}`
-  and nothing more. See `docs/configuration.md`
+  `{required, command, version, url}` is an informational terms command —
+  viewers type `!terms` and the bot replies with a link to `url`. It does NOT
+  gate entry (`required`/`version` are retained for config compatibility only);
+  `disposition` `{enabled, mail, donate, destroy, pass}` are winner-only chat
+  words deciding a pull's fate (`pass` carries the cards to the next person's
+  turn + auto-advances the draw); `timezone` (default `America/Denver`) is what
+  the compiled `report` renders turn-start times in. Draw on `/giveaway` (a
+  CS2-style case reel; `?overlay` = transparent OBS source).
+  `terms`/`disposition` are only honoured when the block is PRESENT — module.nix
+  therefore emits each one only when its `enable` is set, rather than writing a
+  disabled block. The terms command needs `replies`: the response is a chat
+  reply, so with replies off the command is silently inert. There is no `/terms`
+  HTTP route — `terms.url` is substituted into the reply as `{terms}` and
+  nothing more. See `docs/configuration.md`
 - `integrations` — optional outbound event bus
   `{callbackToken, subscribers:
   [{name, adapter, baseUrl, token, events, enabled, packSize}]}`.
@@ -172,10 +212,10 @@ Copy `settings.json.example` to `settings.json` and edit:
   a subscriber outage never blocks or rolls back a draw. Both tokens can come
   from the environment instead of the file (`MULTICHAT_CALLBACK_TOKEN`,
   `MULTICHAT_INTEGRATION_TOKEN_<NAME>` — see `subscriberTokenEnvVar`), which is
-  how the NixOS module keeps them out of the store. Note that `--allow-net` is an
-  allow-list: a subscriber host must be passed to `build.nix`'s `extraNetHosts`
-  (module.nix derives it from `baseUrl`) or every delivery is denied. See
-  `docs/configuration.md`
+  how the NixOS module keeps them out of the store. Note that `--allow-net` is
+  an allow-list: a subscriber host must be passed to `build.nix`'s
+  `extraNetHosts` (module.nix derives it from `baseUrl`) or every delivery is
+  denied. See `docs/configuration.md`
 - `channelPoints` — optional channel-point chaos
   `{enabled, channel, overlayUrl, overlayToken, ttlSec, autoPause, announce,
   rewards}`:
@@ -196,8 +236,10 @@ Copy `settings.json.example` to `settings.json` and edit:
   `kind:"system"` chat row per redemption. Needs the channel in
   `twitch.eventsub.channels` with a token carrying `channel:manage:redemptions`
   — a pre-existing token needs the re-login procedure (new login + replace the
-  seed + delete the persisted `twitch-refresh-<broadcasterId>`); startup warns
-  loudly when the scope is missing. See `docs/configuration.md#channel-points`
+  seed + delete the persisted `twitch-refresh-<broadcasterId>`; under the NixOS
+  module the unit reinstalls a replaced seed by itself once it has recorded the
+  seed's hash in `twitch-refresh-<broadcasterId>.seed`); startup warns loudly
+  when the scope is missing. See `docs/configuration.md#channel-points`
 
 YouTube channels require an API key, but it need not be in `settings.json` — it
 can be set on the running server with `multichat set-youtube-key` (see above).
@@ -211,24 +253,36 @@ stickers/memberships need only the API key). Full reference:
 
 ```
 main.ts          entry point — loads settings, wires the emitter to server + clients;
-                 also the `set-youtube-key` / `login` / `fake` / `giveaway` / `rewards` CLI
+                 also the `set-youtube-key` / `login` / `fake` / `giveaway` / `rewards` /
+                 `live` / `status` CLI
                  subcommands + the runtime-key manager (owns one YouTube runtime across key
                  changes: quota ledger persisted to youtube-quota.json (stale temp files swept
                  before it loads), throttled, reset when the
-                 key's fingerprint changes), the Twitch badge manager (createTwitchBadgeManager:
+                 key's fingerprint changes; knows the key's source — start() logs it with the
+                 fingerprint, fallBack() leaves a refused runtime key for the declared one;
+                 liveSignal() hands go-live hints to liveHint and status() builds the YouTube
+                 half of GET /api/status, both synchronous), the Twitch badge manager (createTwitchBadgeManager:
                  a BadgeSource — snapshot-only without app creds; with them a lazily minted
                  client-credentials app token, Helix global badges refreshed daily and each
                  room's custom badges (room-id from IRC) every 6h, failures retried after 5 min,
                  all fetches time-boxed, never throws into the IRC path), the EventSub manager (per-channel token
-                 lifecycle + one WebSocket per broadcaster; exposes getChannelAuth, forwards
-                 onFollow; captures the token's granted scopes and hands the channel-points
+                 lifecycle + one WebSocket per broadcaster; exposes getChannelAuth + a
+                 per-channel status record (token / session / subscriptions / last stream
+                 event), forwards onFollow and onStream (stream.online/offline → the go-live
+                 hint); the refresh token is persisted atomically, an empty/unreadable
+                 persisted file starts from the seed (settings, or MULTICHAT_TWITCH_SEED_<id>)
+                 and an "Invalid refresh token" is retried once with it; captures the token's
+                 granted scopes and hands the channel-points
                  channel its redemption subscriptions + observers, warning loudly when its
                  token lacks channel:manage:redemptions; a channel's first token refresh /
                  broadcaster-id lookup is retried with back-off instead of skipping it), and
                  the giveaway engine (follow check + chat replies + entrant pool + campaign:
                  guaranteed-queue draws, follower-milestone counter fed by onFollow, append-only
                  winners JSONL; the turn lifecycle: per-draw turns, winner-only
-                 mail/donate/destroy/pass disposition, seeded draw plan; driving the /giveaway page)
+                 mail/donate/destroy/pass disposition, seeded draw plan; driving the /giveaway
+                 page; its pool/campaign/packs/turns/plan files go through one single-flight
+                 atomic writer each (stateWriter → createStateWriter), are flushed on
+                 SIGTERM/SIGINT, and a corrupt one is moved aside loudly by the shared readState)
                  + the integration dispatcher (fires giveaway.turn.* events to configured subscribers)
                  + the channel-points engine (createChannelPointsEngine: persisted redemption
                  ledger fed by onRedemption; a 2s pump — retry owed overlay withdrawals
@@ -250,6 +304,11 @@ src/types.ts     shared TypeScript interfaces (Settings, ChatMessage w/ SubDetai
                  CampaignState/CampaignSummary/Winner/Draw/Turn/Disposition/Plan, TermsAcceptance,
                  TurnAggregates, IntegrationsConfig/Subscriber, PackReport, ChannelPointsConfig/
                  RewardSpec/RewardParams, RedemptionEntry/State/Outcome)
+src/status.ts    pure GET /api/status helpers: the response shapes (ServerStatus, YouTubeStatus,
+                 EventSubStatus/EventSubChannelStatus, StatusSources), buildServerStatus (adds
+                 version/uptime + the IRC roster to what main.ts supplies), formatStatus (the
+                 text `multichat status` prints; problems in capitals), keySourceText, and
+                 VERSION — the one package version (build.nix reads it from this file)
 src/twitch.ts    Twitch IRC over WebSocket (wss://irc-ws.chat.twitch.tv), with reconnect;
                  handleCommand takes an optional isCovered predicate so EventSub-covered
                  channels emit only chat text (their events come from EventSub instead), and
@@ -275,7 +334,11 @@ src/eventsub.ts  Twitch EventSub over WebSocket (wss://eventsub.wss.twitch.tv) �
                  optional onRedemption callback surfaces channel-point redemption .add/.update
                  (mapRedemption; nothing rendered), a per-channel `features` list gates the
                  redemption subscriptions, and onSessionReady fires once a session's
-                 subscriptions are live (the reconcile trigger)
+                 subscriptions are live (the reconcile trigger); stream.online/offline
+                 render nothing and reach an optional onStream observer (StreamEvent;
+                 isLiveBroadcast filters reruns/playlists); onSession reports the socket's
+                 own state (connecting/connected/subscribed/retrying — applySessionEvent
+                 folds it into what GET /api/status shows)
 src/twitchauth.ts pure Twitch OAuth + EventSub request builders / response parsers
                  (refresh + auth-code grants incl. the granted `scope[]`, /users,
                  create-subscription, /channels/followers follow check + /chat/messages send,
@@ -283,7 +346,10 @@ src/twitchauth.ts pure Twitch OAuth + EventSub request builders / response parse
                  client-credentials app token + Helix chat badges global/channel builders +
                  parseChatBadgesResponse, resolveAppCredentials)
                  + the SUBSCRIPTIONS table (source of truth for EventSub types/versions/scopes;
-                 the redemption pair is tagged feature "channelPoints", see subscriptionsFor)
+                 the redemption pair is tagged feature "channelPoints", see subscriptionsFor;
+                 stream.online/offline need no scope and go to every channel)
+                 + the refresh-token seed fallback (twitchSeedEnvVar, chooseRefreshToken,
+                 isInvalidRefreshToken, shouldRetryWithSeed)
                  + LOGIN_SCOPES (EVENTSUB_SCOPES — now incl. channel:manage:redemptions — + the
                  user:write:chat action scope the login flow requests for giveaway replies)
 src/youtube.ts   YouTube Data API v3 polling, quota-aware: live detection from the uploads
@@ -303,7 +369,18 @@ src/youtube.ts   YouTube Data API v3 polling, quota-aware: live detection from t
                  re-attaches; while catching up (any attach, a pageTokenInvalid reset, an
                  unplanned gap > 5 min) items older than 5 min are flagged backlog. createYouTubeRuntime
                  (injectable clock/sleep/fetch for the scenario tests) is shared across poller
-                 generations; startYouTubePoller takes an AbortSignal so it can be torn down
+                 generations; startYouTubePoller takes an AbortSignal so it can be torn down.
+                 Go-live hints: liveHint(rt, "live"|"offline") — "live" starts a boost (boostAt +
+                 boosts in the ledger, BOOST_DAILY_CAP a day; wakes the offline discovery sleeps
+                 via hintableSleep, which then tick every BOOST_TICK_MS for BOOST_DURATION_MS;
+                 earlySearchDue lets one search skip the spacing — never the block, the
+                 exhausted pool or the cap), "offline" makes the attached chats verify now
+                 (rt.verifyNow, at most once per HINT_VERIFY_SPACING_MS) without polling the
+                 chat early; only the plain offline wait and the chat interval are hintable, so
+                 the quota park, the denied retry and the back-offs keep their pace. Each
+                 poller keeps a ChannelReport (state, last transition reason, park, attached
+                 video) that youtubeRuntimeStatus exposes; a failure that is the key's own
+                 (keyRefused) is reported through the runtime's onKeyRefused
 src/server.ts    Deno.serve HTTP server: GET / + GET /overlay + GET /alerts + GET /giveaway
                  (embedded HTML; overlay = transparent chat OBS source, alerts = animated
                  shoutout pop-ups with selectable themes, e.g. the "company-memo" redacted-memo
@@ -313,6 +390,10 @@ src/server.ts    Deno.serve HTTP server: GET / + GET /overlay + GET /alerts + GE
                  giveaway pool on connect), POST /api/youtube-key + POST /api/fake +
                  POST /api/rewards (always loopback-only, and refuses browser-originated
                  requests: any Origin / cross-site Sec-Fetch-Site → 403) +
+                 POST /api/live (the go-live hint — same two guards; takes {state} or a
+                 webhook {event, ts, data} envelope, answers at once, 200/"ignored" for an
+                 event with no stream state) + GET /api/status (same two guards; the roster
+                 with per-entry "since" + whatever hooks.status supplies) +
                  POST /api/giveaway (operator control; loopback-only unless server.controlAccess
                  widens it — see checkControlAccess) + POST /api/turn-report (the inbound
                  integration callback: chat-cards pushes back pack/card summaries; bearer
@@ -331,7 +412,9 @@ src/giveaway.ts  pure giveaway helpers: normalizeGiveawayConfig (incl. terms/dis
                  (recordFollower dedupe + milestone crossing, winnerTier, campaignSummary), the
                  winners JSONL/CSV helpers, the seeded draw-plan primitives (mulberry32,
                  seededShuffle, buildDrawPlan, nextPlannedUserId, consumePlan, normalizePlan),
-                 decideEligibility, and the POST /api/giveaway wire (de)serialization
+                 decideEligibility, GIVEAWAY_FILE_SHAPE (what each persisted file must look
+                 like to be trusted — no stricter than the normalizers, so old files load),
+                 and the POST /api/giveaway wire (de)serialization
 src/turns.ts     pure turn-lifecycle helpers: the terms-acceptance ledger (hasAccepted/
                  recordAcceptance), matchDisposition (mail/donate/destroy/pass), the turn
                  reducers (newTurn/recordTurnDisposition/activeTurn), computeAggregates +
@@ -360,12 +443,15 @@ src/channelpoints.ts pure channel-points helpers: normalizeChannelPointsConfig /
                  wire
 src/control.ts   pure control-plane helpers (loopback + private-range checks, the
                  controlAccess/controlToken policy behind POST /api/giveaway, key-body parse,
-                 startup-key resolution, resolveStateDir + the state paths under it incl.
+                 parseLiveSignalBody (both POST /api/live body shapes),
+                 startup-key resolution (resolveStartupKeySource: the key, its source and the
+                 declared fallback), createStateWriter (the single-flight writer every
+                 frequently-written state file uses) + decodeStateFile, resolveStateDir + the state paths under it incl.
                  YouTube quota ledger + Twitch token/broadcaster-id + giveaway
                  pool/campaign/winners-log/packs/turns/terms/plan + channel-points
                  ledger/rewards/control, the atomic-write temp / corrupt-file quarantine names,
                  browserRequestDenied) + the ServerHooks
-                 (setYouTubeKey + giveaway + channelPoints) / GiveawayHooks (draw/turnReport/
+                 (setYouTubeKey + liveSignal + status + giveaway + channelPoints) / GiveawayHooks (draw/turnReport/
                  packs/turns/report/plan/…) / ChannelPointsHooks / KeyUpdateResult types
 src/fake.ts      pure fake-event helpers: the curated demo sequence + wire
                  (de)serialization/validation behind POST /api/fake
@@ -388,11 +474,11 @@ a `Set<ReadableStreamDefaultController>`; the browser switches on `event.type`.
 so it can push a roster snapshot to each newly connected client.
 
 The browser renders platform-specific richness: Twitch badge images (text chips
-when no art is known) and YouTube role badges,
-author colors, image emotes (Twitch only — see note), `/me` actions, highlighted
-event rows (cheers, subs, raids, Super Chats, Super Stickers, memberships), and
-live message deletions. A left sidebar lists every watched channel with a
-live/offline/connecting/error dot.
+when no art is known) and YouTube role badges, author colors, image emotes
+(Twitch only — see note), `/me` actions, highlighted event rows (cheers, subs,
+raids, Super Chats, Super Stickers, memberships), and live message deletions. A
+left sidebar lists every watched channel with a live/offline/connecting/error
+dot.
 
 > YouTube custom emoji cannot be rendered as images: the Data API v3 returns
 > `displayMessage` as plain text only (no emoji image URLs or runs), so YouTube
@@ -448,6 +534,19 @@ start so it needs no world/group-read permissions (compatible with
 agenix/sops-nix); `youtube.apiKey` is the convenience path (stored in the Nix
 store, emits a warning). Full options + secrets + hardening table:
 `docs/nixos.md`.
+
+Two things in the unit are behaviour, not just packaging. The start script seeds
+each `refreshTokenFile` channel's persisted token: it installs the seed when the
+state file is missing or empty, or when the seed's content changed since it was
+last seen (a SHA-256 kept beside the token as `twitch-refresh-<id>.seed`; a
+first start that finds a token but no hash only records it), and exports the
+seed as `MULTICHAT_TWITCH_SEED_<id>` for the app's own fallback.
+`checks.x86_64-linux.twitch-seed` runs that rendered script through every case
+without a VM. And restarts back off (`RestartSec=5s`, `RestartSteps=4`,
+`RestartMaxDelaySec=30s`, start limit off): a `LoadCredential` file that isn't
+there yet fails the start before the app runs, and should not log every 5s
+forever. systemd does not reset that counter after a healthy run, so the ceiling
+is deliberately low.
 
 ## Nix dev shell
 

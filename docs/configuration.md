@@ -59,16 +59,16 @@ passed as the first CLI argument. Copy `settings.json.example` to
 
 ### Drawing from another machine (`controlAccess`)
 
-Binding `0.0.0.0` lets anyone on the network *watch* `/giveaway`, but the
+Binding `0.0.0.0` lets anyone on the network _watch_ `/giveaway`, but the
 buttons — open, close, draw, reset — POST to `/api/giveaway`, which defaults to
 loopback-only. Press Draw from a phone or a second PC and it answers `403`.
 `server.controlAccess` widens that:
 
-| Value        | Who may drive the draw                                                                                             |
-| ------------ | ------------------------------------------------------------------------------------------------------------------ |
-| `"loopback"` | (default) only the machine running the server                                                                       |
+| Value        | Who may drive the draw                                                                                                         |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| `"loopback"` | (default) only the machine running the server                                                                                  |
 | `"lan"`      | loopback plus private/link-local peers — `10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `100.64/10`, `fc00::/7`, `fe80::/10` |
-| `"any"`      | no address check at all                                                                                             |
+| `"any"`      | no address check at all                                                                                                        |
 
 For a box that is only reachable from your own network, `"lan"` is the setting
 you want:
@@ -78,9 +78,9 @@ you want:
 ```
 
 Understand what it buys, though: `"lan"` is an **address** check, not
-authentication. Every device on that network can draw. That is usually the
-point — whoever is in the room runs the giveaway — but on a shared or guest
-network, set `server.controlToken` as well:
+authentication. Every device on that network can draw. That is usually the point
+— whoever is in the room runs the giveaway — but on a shared or guest network,
+set `server.controlToken` as well:
 
 ```json
 "server": { "host": "0.0.0.0", "controlAccess": "lan", "controlToken": "pick-something-long" }
@@ -93,11 +93,12 @@ it is remembered for 30 days — bookmark the plain `/giveaway` afterwards.
 Loopback is never asked for the token, so `multichat giveaway draw` on the host
 keeps working unchanged.
 
-Scope: this covers `/api/giveaway` only. `/api/youtube-key`, `/api/fake` and
-`/api/rewards` stay loopback-only whatever `controlAccess` says — one sets a
-secret, one forges events, one moves viewers' channel points. And the read-only
-surfaces (`/`, `/overlay`, `/alerts`, `/giveaway`, `/events`) have never had
-authentication; `controlAccess` gates the buttons, not the pages.
+Scope: this covers `/api/giveaway` only. `/api/youtube-key`, `/api/fake`,
+`/api/rewards`, `/api/live` and `/api/status` stay loopback-only whatever
+`controlAccess` says — one sets a secret, one forges events, one moves viewers'
+channel points, one spends YouTube quota, and one describes the deployment. And
+the read-only surfaces (`/`, `/overlay`, `/alerts`, `/giveaway`, `/events`) have
+never had authentication; `controlAccess` gates the buttons, not the pages.
 
 ## State directory
 
@@ -107,19 +108,33 @@ are all written to disk as they change and reloaded at startup — so a reboot
 mid-giveaway costs you nothing. So are the [channel points](#channel-points)
 redemption ledger (`channelpoints-ledger.json`), the reward-id map
 (`channelpoints-rewards.json`) and the manual pause
-(`channelpoints-control.json`) — those three are written atomically (a temp
-file, fsynced, renamed into place) and flushed on SIGTERM/SIGINT, so a crash or
-a deploy mid-write never leaves a torn file; one that is corrupt anyway is moved
-aside to `<name>.corrupt-<timestamp>` with a loud log line saying what starting
-without it means (a lost manual pause is treated as paused). The directory is
-resolved in this order:
+(`channelpoints-control.json`), the YouTube quota ledger, a YouTube key set at
+runtime, and each EventSub channel's rotated Twitch refresh token.
 
-| Source                 | Used when                                                     |
-| ---------------------- | ------------------------------------------------------------- |
-| `$STATE_DIRECTORY`     | running under systemd (the NixOS module — `/var/lib/multichat`) |
-| `$MULTICHAT_STATE_DIR` | you set it explicitly                                          |
-| `$XDG_STATE_HOME/multichat` | `XDG_STATE_HOME` is set                                  |
-| `$HOME/.local/state/multichat` | otherwise                                             |
+Every one of those files is written **atomically** — a temp file, fsynced, then
+renamed into place — so a crash, a deploy or a power cut mid-write leaves the
+previous contents, never half a file. Changes that arrive while a write is in
+flight are folded into one follow-up write of the latest state, and whatever is
+pending is flushed on SIGTERM/SIGINT before the process exits. (The winners log
+is append-only instead: a cut can cost at most its last line.)
+
+A giveaway or channel-points file that is corrupt anyway — a file torn by an
+older version, a bad restore, a hand edit gone wrong — is **moved aside** to
+`<name>.corrupt-<timestamp>` rather than read as "empty" and overwritten, with a
+loud `!!!` log line saying what starting without it means (an empty entrant
+pool; campaign counters at zero; a lost manual pause, which is treated as
+paused). To recover, stop the server, repair the file that was moved aside, move
+it back under its own name and start again. A server that is stopped before
+anything changed does not write the empty state back.
+
+The directory is resolved in this order:
+
+| Source                         | Used when                                                       |
+| ------------------------------ | --------------------------------------------------------------- |
+| `$STATE_DIRECTORY`             | running under systemd (the NixOS module — `/var/lib/multichat`) |
+| `$MULTICHAT_STATE_DIR`         | you set it explicitly                                           |
+| `$XDG_STATE_HOME/multichat`    | `XDG_STATE_HOME` is set                                         |
+| `$HOME/.local/state/multichat` | otherwise                                                       |
 
 Deliberately never the working tree: that is where `git clean` and rebuilds
 happen. If the directory cannot be created the server logs a warning and runs
@@ -175,28 +190,28 @@ Twitch chat badges render as Twitch's own badge images. The global ones
 badges, …) work with no configuration at all, from a copy of Twitch's global
 badge list built into multichat.
 
-The channel's **own** subscriber and bits badges are only handed out by
-Twitch's API to a registered application, so they need your Twitch app's
-**Client ID and Client Secret** — nothing more. No `multichat login`, no
-broadcaster token and no `twitch.eventsub.channels` entry are needed: set
-`twitch.eventsub.clientId` + `twitch.eventsub.clientSecret` (the `channels`
-list may be empty or absent), or the `TWITCH_CLIENT_ID` /
-`TWITCH_CLIENT_SECRET` environment variables. The secret follows the same
-precedence as for EventSub (`TWITCH_CLIENT_SECRET` wins over the file). Under
-NixOS, `services.multichat.twitch.eventsub.clientId` plus
+The channel's **own** subscriber and bits badges are only handed out by Twitch's
+API to a registered application, so they need your Twitch app's **Client ID and
+Client Secret** — nothing more. No `multichat login`, no broadcaster token and
+no `twitch.eventsub.channels` entry are needed: set `twitch.eventsub.clientId` +
+`twitch.eventsub.clientSecret` (the `channels` list may be empty or absent), or
+the `TWITCH_CLIENT_ID` / `TWITCH_CLIENT_SECRET` environment variables. The
+secret follows the same precedence as for EventSub (`TWITCH_CLIENT_SECRET` wins
+over the file). Under NixOS, `services.multichat.twitch.eventsub.clientId` plus
 `twitch.eventsub.clientSecretFile` already suffice, even with no EventSub
 channels. See [Create a Twitch application](#1-create-a-twitch-application) for
 getting the pair.
 
 With credentials, the server fetches Twitch's live global badge list (refreshed
 daily; it wins over the built-in copy) and each joined channel's custom badges
-(refreshed every 6 hours), and logs `[Badges] room <id>: N custom badge
-version(s)` once per channel. A Tier 2/3 sub in a channel that uploaded only
-Tier 1 badges shows that Tier 1 badge, as on Twitch. Without credentials it
-logs one line at startup saying so, and a custom subscriber badge shows
-Twitch's generic one instead. A failed
-fetch keeps the last good list and is retried after 5 minutes; chat is never
-held up by it. The images themselves are loaded by the browser straight from
+(refreshed every 6 hours), and logs
+`[Badges] room <id>: N custom badge
+version(s)` once per channel. A Tier 2/3 sub
+in a channel that uploaded only Tier 1 badges shows that Tier 1 badge, as on
+Twitch. Without credentials it logs one line at startup saying so, and a custom
+subscriber badge shows Twitch's generic one instead. A failed fetch keeps the
+last good list and is retried after 5 minutes; chat is never held up by it. The
+images themselves are loaded by the browser straight from
 `static-cdn.jtvnw.net`.
 
 ## `youtube`
@@ -227,10 +242,10 @@ actually live.
 
 ### How YouTube live detection works
 
-multichat finds a channel's live stream without leaning on `search.list`,
-whose own quota bucket allows only 100 calls a day per Google project (a
-search every few minutes, around the clock, used to run it dry by mid-morning
-Pacific and leave YouTube dark until midnight):
+multichat finds a channel's live stream without leaning on `search.list`, whose
+own quota bucket allows only 100 calls a day per Google project (a search every
+few minutes, around the clock, used to run it dry by mid-morning Pacific and
+leave YouTube dark until midnight):
 
 1. **Once per channel:** a `handle` is resolved to its channel id, and the
    channel's _uploads playlist_ is looked up (`channels.list`, 1 unit each,
@@ -239,8 +254,8 @@ Pacific and leave YouTube dark until midnight):
    live video, are checked in a single `videos.list` (`playlistItems.list` +
    `videos.list` ≈ 2 units). A video counts as live when YouTube marks it
    `live`, with an active chat and no end time — an upcoming stream's waiting
-   room doesn't count. A stream scheduled to start within 15 minutes (or up to
-   2 hours late) tightens the check to once a minute.
+   room doesn't count. A stream scheduled to start within 15 minutes (or up to 2
+   hours late) tightens the check to once a minute.
 3. **Search, rationed:** some channels' streams only reach the uploads playlist
    after they end, so when the playlist finds nothing multichat may also search
    — at most 40 times per Pacific day across all channels, at least 20 minutes
@@ -249,20 +264,24 @@ Pacific and leave YouTube dark until midnight):
    Pacific and the playlist checks carry on.
 4. **While live:** chat is polled (see
    [Quota and long streams](#quota-and-long-streams)), and every 10 minutes
-   `videos.list` confirms the broadcast is still live on the same chat. When
-   the chat ends — YouTube answers `liveChatEnded` / `liveChatNotFound`, sends
-   a chat-ended event, or reports the stream offline and `videos.list` agrees —
-   the channel turns `offline` and is rechecked 30 seconds later, which picks
-   up an encoder restart that came back as a new broadcast. (A brief encoder
-   drop that `videos.list` still calls live just slows polling down.)
+   `videos.list` confirms the broadcast is still live on the same chat. When the
+   chat ends — YouTube answers `liveChatEnded` / `liveChatNotFound`, sends a
+   chat-ended event, or reports the stream offline and `videos.list` agrees —
+   the channel turns `offline` and is rechecked 30 seconds later, which picks up
+   an encoder restart that came back as a new broadcast. (A brief encoder drop
+   that `videos.list` still calls live just slows polling down.)
 
 A pinned `videoId` skips steps 1–3: that one video is checked on each tick.
 
+Something that already knows the stream just started can shorten the wait in
+steps 2 and 3 — see [Go-live hints](#go-live-hints). Detection never depends on
+one.
+
 Re-attaching to the same chat (after a key change, say) resumes where it left
-off, and messages already shown are dropped. Whenever the poller is catching
-up — a fresh attach (YouTube replays recent history), a resume after a gap (a
-quota park, a key change, an outage of more than five minutes) or a rejected
-page token — what it fetches is shown in the chat, but anything older than five
+off, and messages already shown are dropped. Whenever the poller is catching up
+— a fresh attach (YouTube replays recent history), a resume after a gap (a quota
+park, a key change, an outage of more than five minutes) or a rejected page
+token — what it fetches is shown in the chat, but anything older than five
 minutes is flagged `backlog` so the `/alerts` overlay doesn't announce stale
 Super Chats and memberships.
 
@@ -298,7 +317,117 @@ once. Under the NixOS module this is systemd's `StateDirectory`
 must be re-sent after a restart. See [NixOS Module](nixos.md).
 
 The startup key is chosen in this order: the persisted runtime key, then
-`$YOUTUBE_API_KEY`, then `youtube.apiKey` from `settings.json`.
+`$YOUTUBE_API_KEY`, then `youtube.apiKey` from `settings.json`. The server logs
+which one won, with a fingerprint of the key (never the key itself):
+
+```
+[YouTube] API key from the persisted runtime key (state directory) — fingerprint 0f0b5de5.
+[YouTube] A different key is declared in the environment (YOUTUBE_API_KEY) (fingerprint 84ff4ce7). The persisted one wins; the declared one is the fallback if the API refuses it.
+```
+
+That fallback is the one exception to the order. A key set at runtime keeps
+winning over the declared one (`$YOUTUBE_API_KEY`, else `youtube.apiKey`) on
+every later start — fine until it is revoked or expires, at which point every
+call would be refused while a good key sits unused. So when Google refuses the
+runtime key itself (invalid, expired, API not enabled, a key restriction) and a
+_different_ declared key exists, the server switches to the declared one and
+says so loudly
+(`[YouTube] !!! The persisted runtime key … was refused … Switching to the key from …`).
+It does not touch the persisted file, so the same thing happens at the next
+start until you delete `$STATE_DIRECTORY/youtube-api-key` or set a working key
+with `multichat set-youtube-key`. A declared key that is refused too is simply
+retried every 10 minutes, as before.
+
+## Go-live hints
+
+Left alone, multichat notices a YouTube stream within a discovery tick (up to 3
+minutes) when the broadcast shows up in the channel's uploads playlist, and only
+at its next search slot — 20 minutes or more — when it doesn't (see
+[How YouTube live detection works](#how-youtube-live-detection-works)). Whatever
+starts the stream already knows the moment it happens, and can say so:
+
+```bash
+multichat live on            # the stream just started
+multichat live off           # the stream just stopped
+multichat live on --source obs -p 8081   # name the sender in the log; non-default port
+```
+
+or, without the CLI, `POST /api/live` on the running server (see
+[HTTP & SSE API](api.md#post-apilive)) with either body:
+
+```json
+{ "state": "live", "source": "companion" }
+```
+
+```json
+{
+  "event": "stream.started",
+  "ts": 1760000000000,
+  "data": { "streaming": true }
+}
+```
+
+The second is the `{event, ts, data}` envelope a webhook sender uses (the same
+one multichat's own `webhook` integration emits), so a tool that POSTs
+`stream.started` / `stream.stopped` / `stream.state` webhooks — an OBS
+controller, a stream deck — can be pointed straight at
+`http://127.0.0.1:<port>/api/live`. Events that say nothing about the stream are
+answered `200` and ignored.
+
+What a hint does:
+
+- **`live`** — discovery looks **now**, then every 20 seconds for 5 minutes (a
+  _boost_), and one rationed search may run a minute into the boost instead of
+  waiting for its slot. Hints that arrive during a boost are folded into it, and
+  at most 12 boosts start per Pacific day (≈30 units each per channel — under 4%
+  of the default quota even if every one is used). The count is kept in the
+  quota ledger, so a restart doesn't reset it.
+- **`offline`** — the attached chat is verified with `videos.list` now, instead
+  of at the next 10-minute check (at most once a minute).
+
+What it never does: it is only a hint about _when_ to look. It never marks a
+channel live or detaches a chat by itself (YouTube's answer decides), never
+wakes a channel out of the quota park or the 10-minute retry after a refused
+key, never opens a blocked or used-up search, never resets the ledger or
+restarts the poller, and never touches Twitch chat. The endpoint is
+loopback-only, refuses requests sent by a web page, and answers immediately.
+
+**Twitch does it for you.** With [Twitch EventSub](#twitch-eventsub-alerts)
+configured, multichat subscribes to the channel's `stream.online` /
+`stream.offline` events (no extra scope, no re-login) and treats them as the
+same hint — so a simulcast that goes live on Twitch and YouTube together needs
+no wiring at all. A rerun or playlist going "online" is ignored. `/api/live` is
+still worth wiring where you can: it works without EventSub and for YouTube-only
+streams.
+
+## What is it doing? (`multichat status`)
+
+```bash
+multichat status             # readable
+multichat status --json      # the raw JSON, for a status bar or a script
+```
+
+prints what the running server reports on its loopback-only `GET /api/status`
+([HTTP & SSE API](api.md#get-apistatus)):
+
+```
+multichat 0.1.0 — up 2h0m
+YouTube: key from the environment (YOUTUBE_API_KEY), fingerprint 84ff4ce7 · polling 1 channel(s)
+  quota 2026-10-08 PT: 412/10000 units · 3 search(es) · live 1h30m of a 4h budget · resets in 11h0m
+  go-live boost: idle · 1/12 used today
+  @thecompany          live — polling live chat (video abc123, found via uploads playlist) (for 1h30m) · video abc123
+Twitch chat (IRC):
+  thecompanyinc        joined (for 2h0m)
+Twitch EventSub:
+  thecompanyinc        token ok (persisted, refreshed 20m ago) · connected · 8/8 subscriptions · stream online 1h31m ago
+```
+
+Problems are spelled in capitals: `KEYLESS` (no YouTube key yet),
+`PARKED until 00:00 PT` (the daily quota is spent), `KEY REFUSED`,
+`search blocked`, `NO TOKEN` / `TOKEN REJECTED` (EventSub can't authenticate —
+alerts, the giveaway's follow check and chat replies are down while Twitch chat
+itself keeps working), `RECONNECTING`. It never prints a key or a token — a
+YouTube key appears only as its fingerprint.
 
 ## Twitch EventSub alerts
 
@@ -367,8 +496,23 @@ if you want persistence outside systemd.
 
 The server refreshes reactively when a token is rejected, so it recovers on its
 own as long as the refresh token stays valid (re-run `multichat login` if you
-revoke the app's access). EventSub health is logged to the console; it does not
-change the sidebar status dots (chat's IRC connection owns those).
+revoke the app's access). EventSub health is logged to the console and shown by
+[`multichat status`](#what-is-it-doing-multichat-status); it does not change the
+sidebar status dots (chat's IRC connection owns those).
+
+The persisted token is written atomically, and the seed remains the fallback for
+when it can't be used:
+
+- a persisted file that is **empty or unreadable** (a write cut short by a power
+  loss under an older version, a bad restore) no longer switches the channel off
+  — the server logs it and starts from the seed;
+- when Twitch answers **`Invalid refresh token`** to the persisted token and the
+  seed is a different one, the seed is tried once before giving up. A seed you
+  have just replaced after a re-login is exactly that case.
+
+If both are refused the channel keeps retrying with back-off and
+`multichat status` shows `TOKEN REJECTED` — run `multichat login` again and
+replace the seed.
 
 ### 4. Adding a scope later (re-login)
 
@@ -385,10 +529,16 @@ procedure:
    `settings.json`, or the file behind `refreshTokenFile` on NixOS (for example
    the password-manager item — Proton Pass, agenix, sops — that feeds the
    `LoadCredential`).
-3. Delete the persisted token, `$STATE_DIRECTORY/twitch-refresh-<broadcasterId>`
-   (NixOS: `sudo rm /var/lib/private/multichat/twitch-refresh-<broadcasterId>`).
-   Do this _after_ step 2: the NixOS unit re-installs the seed whenever that
-   file is missing, and it must install the new one.
+3. Delete the persisted token,
+   `$STATE_DIRECTORY/twitch-refresh-<broadcasterId>`. **Under the NixOS module
+   this step is normally not needed:** its unit remembers a hash of the seed it
+   last saw (`twitch-refresh-<broadcasterId>.seed`, beside the token) and
+   installs the seed again when the secret's content changes. Only the very
+   first start that creates that `.seed` file can't tell a replaced seed from a
+   rotated token and leaves the token alone — if the file doesn't exist yet,
+   `sudo rm /var/lib/private/multichat/twitch-refresh-<broadcasterId>` once,
+   _after_ step 2 (the unit re-installs the seed whenever the token file is
+   missing or empty, and it must install the new one).
 4. Restart multichat.
 
 With channel points enabled, the server checks the scopes Twitch reports at
@@ -430,8 +580,8 @@ memo — a `THE COMPANY, INC` letterhead over `"[Name] just followed!"` — and,
 just before it disappears, draws a black **redaction** bar across one of the
 three words at random (name / "just" / action). `options`: `paper` / `ink`
 (colors), `hold` (ms on screen, default 4500), `redact` (`false` to disable the
-bar). With `events: ["follow", "sub", "raid", "cheer"]` it fires on those
-Twitch shoutouts only; kinds not listed keep the default card.
+bar). With `events: ["follow", "sub", "raid", "cheer"]` it fires on those Twitch
+shoutouts only; kinds not listed keep the default card.
 
 Three kinds get their own **stamped Company documents** instead of the memo —
 each with a red verdict stamp that slams onto the paper shortly after the card
@@ -440,23 +590,24 @@ lands:
 - A **sub** is **hiring paperwork**: the tier maps to a job title — Tier 1 is
   hired as `INTERN`, Tier 2 as `ASSOCIATE`, Tier 3 as `EXECUTIVE` (a
   `NOTICE OF EMPLOYMENT`, stamped `HIRED`), a resub renews their contract
-  (`CONTRACT RENEWAL` / `RENEWED`), and a gifter files referrals — `"[Name]
+  (`CONTRACT RENEWAL` / `RENEWED`), and a gifter files referrals —
+  `"[Name]
   referred 5 new hires!"` (`REFERRAL PROGRAM` / `APPROVED`). Tier and
   gift-count come from EventSub when the channel is configured there, or from
-  IRC `USERNOTICE` tags otherwise (Prime counts as Tier 1; a notice that
-  doesn't state a plan — e.g. a viewer continuing a gifted sub — renders a
-  titleless line rather than guessing, and a gift bomb's per-recipient notices
-  are folded into the one referral card).
+  IRC `USERNOTICE` tags otherwise (Prime counts as Tier 1; a notice that doesn't
+  state a plan — e.g. a viewer continuing a gifted sub — renders a titleless
+  line rather than guessing, and a gift bomb's per-recipient notices are folded
+  into the one referral card).
 - A **raid** is an **FBI raid**: a `FEDERAL BUREAU OF INVESTIGATION` search
-  warrant — `"[Name] stormed the premises with 250 agents!"` (the raiding
-  party as agents), stamped `EXECUTED`, while an alternating red/blue
-  police-light glow strobes around the card.
+  warrant — `"[Name] stormed the premises with 250 agents!"` (the raiding party
+  as agents), stamped `EXECUTED`, while an alternating red/blue police-light
+  glow strobes around the card.
 - A **cheer** is a **petty-cash receipt**: `"[Name] deposited 1000 bits!"`,
   stamped the only way the Company knows how — `OFF THE BOOKS`.
 
-`paper` / `ink` / `hold` apply to these cards too (`redact` does not — the
-stamp is their gag; note `paper`/`ink` recolor all the documents, including
-the warrant and receipt).
+`paper` / `ink` / `hold` apply to these cards too (`redact` does not — the stamp
+is their gag; note `paper`/`ink` recolor all the documents, including the
+warrant and receipt).
 
 **Per-source override.** Append `?theme=NAME` to the overlay URL
 (`/alerts?theme=The%20Company,%20Inc`) to override `activeTheme` for that OBS
@@ -499,7 +650,7 @@ overlay, see below).
 | `messages`       | object | Optional reply templates — see [Message templates](#giveaway-message-templates) below.                                                |
 | `timezone`       | string | IANA zone the compiled report renders turn times in. Default `"America/Denver"`.                                                      |
 | `terms`          | object | Optional terms-acceptance gate on entry — see below. Omit the block for no gate.                                                      |
-| `disposition`    | object | Optional winner-turn commands for what happens to the pull — see below. Omit for none.                                               |
+| `disposition`    | object | Optional winner-turn commands for what happens to the pull — see below. Omit for none.                                                |
 
 **Why Twitch-only.** YouTube's API has no way to verify whether a viewer is
 subscribed to a channel (subscriber lists are private and un-queryable), so a
@@ -526,9 +677,10 @@ to run silently (the `/giveaway` page still shows entries and the winner).
 [`/api/giveaway`](api.md#post-apigiveaway) endpoint, which is loopback-only
 until [`server.controlAccess`](#drawing-from-another-machine-controlaccess)
 widens it — so out of the box the control view only works on the server's own
-machine. Or drive it from the terminal: `multichat giveaway
-status|open|close|draw|reset|demo|winners|campaign-reset|remove <who>`. The
-entrant pool, campaign progress, and winners log are persisted to the
+machine. Or drive it from the terminal:
+`multichat giveaway
+status|open|close|draw|reset|demo|winners|campaign-reset|remove <who>`.
+The entrant pool, campaign progress, and winners log are persisted to the
 [state directory](#state-directory), so they survive a restart.
 
 **Removing an entrant.** Every name in the ENTRANTS list has a `✕` next to it,
@@ -567,9 +719,9 @@ occupy entry numbers.
 ### Campaign mode: guaranteed first-N + follower milestones
 
 `firstN` and `followerStep` turn the one-off giveaway into a running
-**campaign**. The worked example — *"the first 500 entrants each get a card
-pack (opened on stream, mailed); after that, every 100 new followers we open 10
-more packs for random people from the pool"*:
+**campaign**. The worked example — _"the first 500 entrants each get a card pack
+(opened on stream, mailed); after that, every 100 new followers we open 10 more
+packs for random people from the pool"_:
 
 ```json
 "giveaway": {
@@ -586,7 +738,7 @@ more packs for random people from the pool"*:
   entered-at timestamp — assigned once, never reused, surviving removals and
   pool resets.
 - **The guaranteed queue (`firstN`).** Entrants #1..500 are all winners; each
-  **draw** just picks *who's next* (random among the un-drawn ≤ 500) so the reel
+  **draw** just picks _who's next_ (random among the un-drawn ≤ 500) so the reel
   is your "next pack to open" moment. The draw button reads "Draw next pack"
   while the queue has anyone left. Entries stay open past 500 — later entrants
   join the **bonus pool** and get the `enteredPool` reply instead.
@@ -614,13 +766,13 @@ more packs for random people from the pool"*:
 With the block present, `!enter` admits only entrants who have already typed the
 accept command (`prefix` + `terms.command`, so `!accept` by default); everyone
 else gets the `termsRequired` reply instead of an entry. Acceptances are
-persisted with the rest of the giveaway state. Bump `version` to invalidate every
-acceptance on file and make people accept again after the terms change.
+persisted with the rest of the giveaway state. Bump `version` to invalidate
+every acceptance on file and make people accept again after the terms change.
 
 **multichat does not host a terms page.** `url` is only substituted into the
 `termsRequired` reply as `{terms}` — it has to point at a page you publish
-yourself. If you have no page yet, leave `url` empty and write the terms into the
-`termsRequired` message; the built-in prompt would otherwise render an empty
+yourself. If you have no page yet, leave `url` empty and write the terms into
+the `termsRequired` message; the built-in prompt would otherwise render an empty
 `()` where the link belongs.
 
 The gate is only as visible as your chat replies. With `replies: false` an
@@ -650,7 +802,7 @@ rather than just recording. Each choice fires `giveaway.turn.disposition` on the
 the speaker's own Twitch user id against the active turn and ignores everyone
 else, including you; it also refuses a second decision once one is recorded.
 There is no operator override — no `/api/giveaway` action, no CLI verb, and no
-control on the `/giveaway` page, which only *displays* the active turn. So a
+control on the `/giveaway` page, which only _displays_ the active turn. So a
 winner who says nothing leaves their turn open indefinitely, and a winner who
 won't cooperate cannot be dispositioned on their behalf.
 
@@ -659,20 +811,20 @@ won't cooperate cannot be dispositioned on their behalf.
 The `messages` object overrides any of the built-in chat replies. `{user}` is
 always the viewer's display name; the other placeholders are filled per key:
 
-| Key              | Sent when…                                    | Extra placeholders                                                       |
-| ---------------- | --------------------------------------------- | ------------------------------------------------------------------------ |
-| `entered`        | an entrant joins (within `firstN`, or always when `firstN` is 0) | `{number}` entry #, `{remaining}` guaranteed slots left |
-| `enteredPool`    | an entrant joins beyond `firstN`              | `{number}`                                                               |
-| `alreadyEntered` | a repeat `!enter`                             | —                                                                        |
-| `notFollowing`   | `requireFollow` rejects a non-follower        | —                                                                        |
-| `winner`         | a draw lands                                  | `{number}`                                                               |
-| `milestone`      | a follower milestone is crossed               | `{count}` total new follows, `{milestone}` ordinal, `{draws}` credits    |
-| `termsRequired`  | `!enter` from someone who hasn't accepted the terms | `{accept}` the accept command, `{terms}` the T&C url            |
-| `termsAccepted`  | a successful `!accept`                        | `{enter}` the entry command                                              |
-| `mailed`         | the winner chooses `mail`                     | `{cards}` count, `{value}` pack total                                    |
-| `donated`        | the winner chooses `donate`                   | `{cards}`, `{value}`                                                     |
-| `destroyed`      | the winner chooses `destroy`                  | `{cards}`, `{value}`                                                     |
-| `passed`         | the winner chooses `pass`                     | `{cards}`, `{value}`, `{next}` the winner drawn next                     |
+| Key              | Sent when…                                                       | Extra placeholders                                                    |
+| ---------------- | ---------------------------------------------------------------- | --------------------------------------------------------------------- |
+| `entered`        | an entrant joins (within `firstN`, or always when `firstN` is 0) | `{number}` entry #, `{remaining}` guaranteed slots left               |
+| `enteredPool`    | an entrant joins beyond `firstN`                                 | `{number}`                                                            |
+| `alreadyEntered` | a repeat `!enter`                                                | —                                                                     |
+| `notFollowing`   | `requireFollow` rejects a non-follower                           | —                                                                     |
+| `winner`         | a draw lands                                                     | `{number}`                                                            |
+| `milestone`      | a follower milestone is crossed                                  | `{count}` total new follows, `{milestone}` ordinal, `{draws}` credits |
+| `termsRequired`  | `!enter` from someone who hasn't accepted the terms              | `{accept}` the accept command, `{terms}` the T&C url                  |
+| `termsAccepted`  | a successful `!accept`                                           | `{enter}` the entry command                                           |
+| `mailed`         | the winner chooses `mail`                                        | `{cards}` count, `{value}` pack total                                 |
+| `donated`        | the winner chooses `donate`                                      | `{cards}`, `{value}`                                                  |
+| `destroyed`      | the winner chooses `destroy`                                     | `{cards}`, `{value}`                                                  |
+| `passed`         | the winner chooses `pass`                                        | `{cards}`, `{value}`, `{next}` the winner drawn next                  |
 
 ```json
 "messages": {
@@ -687,25 +839,26 @@ always the viewer's display name; the other placeholders are filled per key:
 
 These override their `settings.json` counterparts at startup:
 
-| Variable               | Overrides                                                |
-| ---------------------- | -------------------------------------------------------- |
-| `PORT`                 | `server.port`                                            |
-| `HOST`                 | `server.host`                                            |
-| `YOUTUBE_API_KEY`      | the startup YouTube key (below a persisted runtime key)  |
-| `TWITCH_CLIENT_SECRET` | `twitch.eventsub.clientSecret`                           |
-| `TWITCH_CLIENT_ID`     | `twitch.eventsub.clientId` when that's empty (badge art), and `multichat login` |
-| `STATE_DIRECTORY`      | directory all persistent state is written to (systemd)   |
-| `MULTICHAT_STATE_DIR`  | the same, outside systemd (see [State directory](#state-directory)) |
-| `MULTICHAT_CONTROL_ACCESS` | `server.controlAccess` |
-| `MULTICHAT_CONTROL_TOKEN` | `server.controlToken` |
-| `MULTICHAT_CALLBACK_TOKEN` | `integrations.callbackToken` |
-| `MULTICHAT_INTEGRATION_TOKEN_<NAME>` | a subscriber's `token` (see [Integrations](#integrations)) |
-| `MULTICHAT_EFFECTS_TOKEN` | `channelPoints.overlayToken` (see [Channel points](#channel-points)) |
+| Variable                                | Overrides                                                                                      |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `PORT`                                  | `server.port`                                                                                  |
+| `HOST`                                  | `server.host`                                                                                  |
+| `YOUTUBE_API_KEY`                       | the startup YouTube key (below a persisted runtime key)                                        |
+| `TWITCH_CLIENT_SECRET`                  | `twitch.eventsub.clientSecret`                                                                 |
+| `TWITCH_CLIENT_ID`                      | `twitch.eventsub.clientId` when that's empty (badge art), and `multichat login`                |
+| `STATE_DIRECTORY`                       | directory all persistent state is written to (systemd)                                         |
+| `MULTICHAT_STATE_DIR`                   | the same, outside systemd (see [State directory](#state-directory))                            |
+| `MULTICHAT_CONTROL_ACCESS`              | `server.controlAccess`                                                                         |
+| `MULTICHAT_CONTROL_TOKEN`               | `server.controlToken`                                                                          |
+| `MULTICHAT_CALLBACK_TOKEN`              | `integrations.callbackToken`                                                                   |
+| `MULTICHAT_INTEGRATION_TOKEN_<NAME>`    | a subscriber's `token` (see [Integrations](#integrations))                                     |
+| `MULTICHAT_EFFECTS_TOKEN`               | `channelPoints.overlayToken` (see [Channel points](#channel-points))                           |
+| `MULTICHAT_TWITCH_SEED_<broadcasterId>` | an EventSub channel's seed `refreshToken` (how the NixOS module hands over `refreshTokenFile`) |
 
 ## Integrations
 
-The `integrations` block wires multichat's giveaway to external tools. It has two
-halves that together form a loop: multichat pushes giveaway-lifecycle events
+The `integrations` block wires multichat's giveaway to external tools. It has
+two halves that together form a loop: multichat pushes giveaway-lifecycle events
 **out** to subscribers, and a subscriber pushes results **back** to
 `POST /api/turn-report`, where they attach to the winner's turn in the ledger.
 
@@ -728,26 +881,26 @@ halves that together form a loop: multichat pushes giveaway-lifecycle events
 }
 ```
 
-| Field           | Meaning                                                                      |
-| --------------- | ---------------------------------------------------------------------------- |
+| Field           | Meaning                                                                           |
+| --------------- | --------------------------------------------------------------------------------- |
 | `callbackToken` | Bearer an external tool must present on `/api/turn-report`. Empty = loopback only |
-| `name`          | Identifies the subscriber in logs; also names its token env var               |
-| `adapter`       | `"webhook"` or `"chat-cards"` — how events become HTTP calls                  |
-| `baseUrl`       | Where to deliver. Trailing slash trimmed. A subscriber without one is dropped |
-| `token`         | Bearer sent with every delivery, when the target requires one                 |
-| `events`        | Event types to deliver; `["*"]` (or omitted) means all of them                |
-| `enabled`       | `false` silences this subscriber without deleting its config                  |
-| `packSize`      | chat-cards only: cards per pack. `0`/unset uses chat-cards' own default       |
+| `name`          | Identifies the subscriber in logs; also names its token env var                   |
+| `adapter`       | `"webhook"` or `"chat-cards"` — how events become HTTP calls                      |
+| `baseUrl`       | Where to deliver. Trailing slash trimmed. A subscriber without one is dropped     |
+| `token`         | Bearer sent with every delivery, when the target requires one                     |
+| `events`        | Event types to deliver; `["*"]` (or omitted) means all of them                    |
+| `enabled`       | `false` silences this subscriber without deleting its config                      |
+| `packSize`      | chat-cards only: cards per pack. `0`/unset uses chat-cards' own default           |
 
 ### Events
 
-| Event                         | Fires when…                                    |
-| ----------------------------- | ---------------------------------------------- |
-| `giveaway.turn.start`         | a draw lands and the winner's turn opens       |
-| `giveaway.turn.disposition`   | the winner picks mail / donate / destroy / pass |
-| `giveaway.turn.end`           | the turn closes                                |
-| `giveaway.entrant.added`      | an entrant is accepted into the pool           |
-| `giveaway.terms.accepted`     | an entrant accepts the T&Cs                    |
+| Event                       | Fires when…                                     |
+| --------------------------- | ----------------------------------------------- |
+| `giveaway.turn.start`       | a draw lands and the winner's turn opens        |
+| `giveaway.turn.disposition` | the winner picks mail / donate / destroy / pass |
+| `giveaway.turn.end`         | the turn closes                                 |
+| `giveaway.entrant.added`    | an entrant is accepted into the pool            |
+| `giveaway.terms.accepted`   | an entrant accepts the T&Cs                     |
 
 The `webhook` adapter POSTs `{event, ts, data}` for every subscribed event. The
 `chat-cards` adapter only maps events it has a call for — today that is
@@ -756,16 +909,16 @@ The `webhook` adapter POSTs `{event, ts, data}` for every subscribed event. The
 report, which is how a report finds its turn.
 
 Delivery is fire-and-forget with one retry. A subscriber being down never blocks
-or rolls back a draw — the draw stands, and the report reconciles values whenever
-the tool comes back.
+or rolls back a draw — the draw stands, and the report reconciles values
+whenever the tool comes back.
 
 ### The chat-cards loop
 
 [chat-cards](https://github.com/The-Company-Inc-Nerds/chat-cards) opens and
-prices a physical card pack on stream. Wired as a subscriber, a draw opens a pack
-under the winner's name; as each card is scanned and priced, chat-cards POSTs the
-pack back to `/api/turn-report` and the `/giveaway` page shows what was pulled and
-what it was worth.
+prices a physical card pack on stream. Wired as a subscriber, a draw opens a
+pack under the winner's name; as each card is scanned and priced, chat-cards
+POSTs the pack back to `/api/turn-report` and the `/giveaway` page shows what
+was pulled and what it was worth.
 
 Point chat-cards back at this server with its own `--report-url`
 (`services.chat-cards.report.url` on NixOS):
@@ -1009,17 +1162,17 @@ Pacific** (01:00 Mountain): **100 `search.list` calls**, and a **10,000-unit
 pool** for everything else. `channels.list`, `playlistItems.list` and
 `videos.list` cost 1 unit each; a live-chat poll (`liveChatMessages.list`) is
 budgeted at **5 units** — Google doesn't publish the figure, so check _APIs &
-Services → YouTube Data API v3 → Quotas_ in the Cloud Console for your
-project's real numbers.
+Services → YouTube Data API v3 → Quotas_ in the Cloud Console for your project's
+real numbers.
 
 Watching for a stream costs about 40 units an hour per channel (≈1,000 a day
 each, see
-[How YouTube live detection works](#how-youtube-live-detection-works)). The
-rest is for chat. Polling at YouTube's suggested pace (often 1–5 seconds)
-would burn 3,600–18,000 units an hour and empty the pool partway through a
-stream, so multichat keeps a ledger of today's estimated spend and stretches
-the poll interval until the remaining quota covers the rest of the day's
-planned streaming:
+[How YouTube live detection works](#how-youtube-live-detection-works)). The rest
+is for chat. Polling at YouTube's suggested pace (often 1–5 seconds) would burn
+3,600–18,000 units an hour and empty the pool partway through a stream, so
+multichat keeps a ledger of today's estimated spend and stretches the poll
+interval until the remaining quota covers the rest of the day's planned
+streaming:
 
 ```
 remaining = dailyQuota − units spent today
@@ -1038,11 +1191,11 @@ polls — instead of running the pool dry. Chat then arrives in big, late batche
 and the end of a stream is noticed minutes late, so set `budgetHours` to your
 real daily streaming time to keep chat responsive. The ledger is saved to
 `youtube-quota.json` in the [state directory](#state-directory) (at most every
-30 seconds, and on shutdown), so a restart doesn't forget what today has
-already cost. It also remembers a `quotaExceeded` from Google until midnight
-Pacific; if Google grants more quota mid-day, raise `dailyQuota`, delete
-`youtube-quota.json` (under NixOS `/var/lib/private/multichat/`) and restart
-the service to resume at once.
+30 seconds, and on shutdown), so a restart doesn't forget what today has already
+cost. It also remembers a `quotaExceeded` from Google until midnight Pacific; if
+Google grants more quota mid-day, raise `dailyQuota`, delete
+`youtube-quota.json` (under NixOS `/var/lib/private/multichat/`) and restart the
+service to resume at once.
 
 | Setting       | Default | Effect                                                                    |
 | ------------- | ------- | ------------------------------------------------------------------------- |
@@ -1057,9 +1210,9 @@ of retrying all day.
 the process or the key: a dev box running `deno task dev` with the production
 key (or any key from the same project) doubles the burn, and two pollers on one
 chat trip YouTube's "polled too soon" limit. Give development its own project.
-When the server is handed a different key from the one today's spend was
-counted against, it starts a fresh ledger for the day, since that key may
-belong to another project (only a fingerprint of the key is stored).
+When the server is handed a different key from the one today's spend was counted
+against, it starts a fresh ledger for the day, since that key may belong to
+another project (only a fingerprint of the key is stored).
 
 **More quota.** Ask Google via the
 [YouTube API Services audit and quota extension form](https://support.google.com/youtube/contact/yt_api_form),
@@ -1077,19 +1230,31 @@ Every status change is logged once, with its reason:
 [YouTube] @channel: error — liveChatMessages.list failed (badRequest: API key not valid. Please pass a valid API key.) — retrying in 10m
 ```
 
+A [go-live hint](#go-live-hints) that changed something is logged with who sent
+it (one that was folded into a running boost, or had nothing to speed up, is
+only answered):
+
+```
+[YouTube] go-live hint (obs) — checking now and every 20s for 5 min (boost 1/12 today)
+[YouTube] offline hint (twitch thecompanyinc) — verifying @channel now instead of at the next periodic check
+```
+
+[`multichat status`](#what-is-it-doing-multichat-status) shows where each
+channel stands right now without reading the journal.
+
 and every failed request once, with the HTTP status, Google's reason, how
-multichat classified it, and Google's message (the API key is never logged —
-not even when a network error quotes the request URL):
+multichat classified it, and Google's message (the API key is never logged — not
+even when a network error quotes the request URL):
 
 ```
 [YouTube] GET /videos?part=snippet,liveStreamingDetails&id=abc123 → HTTP 403 quotaExceeded (quotaDaily): The request cannot be completed because you have exceeded your quota.
 ```
 
-| Reason                                                     | What it means → what multichat does                                     |
-| ---------------------------------------------------------- | ----------------------------------------------------------------------- |
-| `quotaExceeded` (403)                                      | Daily pool spent → `error` until midnight Pacific                       |
-| `rateLimitExceeded` (429, `Search Queries per day`)        | Search bucket spent → search pauses until midnight; detection continues |
-| `rateLimitExceeded` (403, or 429 per minute)               | Polled too fast → a short wait, then the same chat position             |
-| `liveChatEnded` / `liveChatDisabled` / `liveChatNotFound`  | The chat is over → `offline`, rechecked in 30s                          |
-| `badRequest` (`API_KEY_INVALID`), `forbidden`, `accessNotConfigured` | Key or project problem → `error`, retried every 10 minutes; a live chat keeps its place, so a new key resumes it at once |
-| `timeout` / `network` / HTTP 5xx                           | Transient → retried with back-off (5s → 60s); `error` after 3 in a row  |
+| Reason                                                               | What it means → what multichat does                                                                                                                                                                                                     |
+| -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `quotaExceeded` (403)                                                | Daily pool spent → `error` until midnight Pacific                                                                                                                                                                                       |
+| `rateLimitExceeded` (429, `Search Queries per day`)                  | Search bucket spent → search pauses until midnight; detection continues                                                                                                                                                                 |
+| `rateLimitExceeded` (403, or 429 per minute)                         | Polled too fast → a short wait, then the same chat position                                                                                                                                                                             |
+| `liveChatEnded` / `liveChatDisabled` / `liveChatNotFound`            | The chat is over → `offline`, rechecked in 30s                                                                                                                                                                                          |
+| `badRequest` (`API_KEY_INVALID`), `forbidden`, `accessNotConfigured` | Key or project problem → `error`, retried every 10 minutes; a live chat keeps its place, so a new key resumes it at once. A refused _runtime_ key falls back to the declared one (see [above](#setting-the-youtube-api-key-at-runtime)) |
+| `timeout` / `network` / HTTP 5xx                                     | Transient → retried with back-off (5s → 60s); `error` after 3 in a row                                                                                                                                                                  |

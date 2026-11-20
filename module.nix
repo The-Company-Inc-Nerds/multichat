@@ -42,7 +42,8 @@ let
     ++ lib.optional cpCfg.enable (urlHost cpCfg.overlayUrl));
 
   # The persisted rotated refresh token of the channel-points channel — the file
-  # a re-login for a new scope has to delete (it wins over any seed).
+  # a re-login for a new scope has to get past (it wins over the seed until the
+  # unit sees the seed itself change; see the start script).
   cpEsChannel = lib.findFirst (ch: ch.login == cpCfg.channel) null esCfg.channels;
   cpTokenState = "/var/lib/private/multichat/twitch-refresh-"
     + (if cpEsChannel != null && cpEsChannel.broadcasterId != ""
@@ -53,6 +54,14 @@ let
   esTokenFiles = builtins.filter
     (ch: ch.refreshTokenFile != null && ch.broadcasterId != "")
     esCfg.channels;
+
+  # Env var the unit hands a channel's seed refresh token to the app in. Must
+  # mirror twitchSeedEnvVar() in src/twitchauth.ts exactly (every run of
+  # non-alphanumerics in the id becomes one "_"); if the two ever disagree the
+  # app never sees the seed and silently loses its fallback.
+  seedEnv = id: "MULTICHAT_TWITCH_SEED_"
+    + lib.concatStringsSep "_"
+      (builtins.filter builtins.isString (builtins.split "[^A-Za-z0-9]+" id));
 
   # systemd LoadCredential entries for every file-based secret.
   loadCreds =
@@ -1098,9 +1107,11 @@ in
       ++ lib.optional cpCfg.enable
         ("services.multichat.channelPoints needs the channel:manage:redemptions scope on \""
           + cpCfg.channel + "\"'s token. A token minted before this release lacks it: re-run "
-          + "`multichat login`, replace the refreshTokenFile secret with the new token, and delete "
-          + cpTokenState + " (the persisted rotated token wins over the seed) before restarting. "
-          + "The service logs a loud warning while it is missing.");
+          + "`multichat login`, replace the refreshTokenFile secret with the new token and restart. "
+          + "The unit installs a replaced seed by itself once it has recorded the old one's hash in "
+          + cpTokenState + ".seed; if that file does not exist yet, also delete " + cpTokenState
+          + " (the persisted rotated token wins over the seed). "
+          + "The service logs a loud warning while the scope is missing.");
 
     # Make the `multichat` CLI available so an operator can run
     # `multichat set-youtube-key <KEY>` against the running service.
@@ -1142,9 +1153,30 @@ in
           export MULTICHAT_EFFECTS_TOKEN="$(cat "$CREDENTIALS_DIRECTORY/effects-token")"
         ''}
         ${lib.concatMapStringsSep "\n" (ch: ''
-          # Seed the refresh token once; never overwrite the rotated token the app persists.
-          if [ ! -e "$STATE_DIRECTORY/twitch-refresh-${ch.broadcasterId}" ]; then
-            install -m600 "$CREDENTIALS_DIRECTORY/twitch-refresh-${ch.broadcasterId}" "$STATE_DIRECTORY/twitch-refresh-${ch.broadcasterId}"
+          # The app persists the refresh token Twitch rotates to and prefers it,
+          # so the seed is installed only when there is no usable state file
+          # (missing, or left empty by a power cut) or when the seed itself was
+          # replaced since it was last seen — then re-running `multichat login`
+          # and updating the secret is all a re-login takes. "Seen" is the
+          # seed's hash, kept beside the token: a first start that finds a
+          # token but no hash only records it, and never overwrites a working
+          # rotated token. An empty seed (a fetch that wrote a blank file) is
+          # ignored altogether. Written via rename, so a power cut here can't
+          # leave half a token either.
+          seed="$CREDENTIALS_DIRECTORY/twitch-refresh-${ch.broadcasterId}"
+          state="$STATE_DIRECTORY/twitch-refresh-${ch.broadcasterId}"
+          if [ -s "$seed" ]; then
+            want="$(sha256sum < "$seed" | cut -d' ' -f1)"
+            seen="$(cat "$state.seed" 2>/dev/null || true)"
+            if [ ! -s "$state" ] || { [ -n "$seen" ] && [ "$seen" != "$want" ]; }; then
+              install -m600 "$seed" "$state.new" && mv -f "$state.new" "$state"
+            fi
+            if [ "$seen" != "$want" ]; then
+              printf '%s\n' "$want" > "$state.seed.new" && mv -f "$state.seed.new" "$state.seed"
+            fi
+            # Also handed to the app: its fallback when the state file turns
+            # out unreadable, or Twitch rejects the persisted token.
+            export ${seedEnv ch.broadcasterId}="$(cat "$seed")"
           fi
         '') esTokenFiles}
         exec ${cfg.package}/bin/multichat ${settingsFile}
@@ -1153,6 +1185,18 @@ in
       serviceConfig = {
         Restart = "on-failure";
         RestartSec = "5s";
+        # Retries are unlimited (startLimitIntervalSec above), so space them
+        # out: a start that keeps failing — typically a LoadCredential file
+        # that isn't there yet, which fails before the app even runs — backs
+        # off from 5s to 30s over four steps instead of logging a failure
+        # every 5s for as long as it takes. The ceiling is kept low on
+        # purpose: systemd does not reset its restart counter when the unit
+        # then runs fine (only a manual stop/restart or a deploy does), so
+        # after a boot that had to wait for its secrets a later crash is
+        # restarted at this delay, not at RestartSec. mkDefault, so a host can
+        # pick its own pace.
+        RestartSteps = lib.mkDefault 4;
+        RestartMaxDelaySec = lib.mkDefault "30s";
         DynamicUser = true;
 
         # Persist a YouTube key set at runtime (`multichat set-youtube-key`) across

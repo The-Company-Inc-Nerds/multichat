@@ -4,14 +4,18 @@ import {
   channelPointsLedgerPath,
   channelPointsRewardsPath,
   checkControlAccess,
+  createStateWriter,
+  decodeStateFile,
   isLoopbackAddr,
   isPrivateAddr,
   isStaleStateTmp,
   keyStatePath,
   normalizeControlAccess,
+  parseLiveSignalBody,
   parseYouTubeKeyBody,
   quarantinePath,
   resolveStartupKey,
+  resolveStartupKeySource,
   resolveStateDir,
   stateTmpPath,
   twitchBroadcasterStatePath,
@@ -373,4 +377,173 @@ Deno.test("browserRequestDenied: the CLI passes; any web page is refused", () =>
   for (const v of ["cross-site", "same-site", "Cross-Site", "bogus"]) {
     assertExists(browserRequestDenied(new Headers({ "sec-fetch-site": v })));
   }
+});
+
+Deno.test("resolveStartupKeySource: names the winner and keeps the declared key", () => {
+  assertEquals(
+    resolveStartupKeySource({ persisted: "P", env: "E", settings: "S" }),
+    {
+      key: "P",
+      source: "persisted",
+      declared: { key: "E", source: "environment" },
+    },
+  );
+  assertEquals(
+    resolveStartupKeySource({ persisted: " ", env: " ", settings: " S " }),
+    {
+      key: "S",
+      source: "settings",
+      declared: { key: "S", source: "settings" },
+    },
+  );
+  assertEquals(resolveStartupKeySource({ persisted: "P" }), {
+    key: "P",
+    source: "persisted",
+    declared: null,
+  });
+  assertEquals(resolveStartupKeySource({}), {
+    key: "",
+    source: null,
+    declared: null,
+  });
+});
+
+Deno.test("parseLiveSignalBody: the plain {state} shape", () => {
+  assertEquals(parseLiveSignalBody('{"state":"live"}'), {
+    kind: "signal",
+    signal: { state: "live", source: "api" },
+  });
+  assertEquals(
+    parseLiveSignalBody('{"state":" OFFLINE ","source":"companion"}'),
+    { kind: "signal", signal: { state: "offline", source: "companion" } },
+  );
+  // The sender's name is only logged: control bytes go, length is capped.
+  const r = parseLiveSignalBody(
+    JSON.stringify({
+      state: "live",
+      source: "a\n\u001b[31mb" + "x".repeat(99),
+    }),
+  );
+  assert(r.kind === "signal");
+  assert(
+    ![...r.signal.source].some((c) => c < " " || c > "~"),
+    r.signal.source,
+  );
+  assertEquals(r.signal.source.length, 64);
+  assertEquals(parseLiveSignalBody('{"state":"maybe"}').kind, "bad");
+  assertEquals(parseLiveSignalBody('{"state":1}').kind, "bad");
+});
+
+Deno.test("parseLiveSignalBody: the {event, ts, data} webhook envelope", () => {
+  const env = (event: string, data?: unknown) =>
+    parseLiveSignalBody(JSON.stringify({ event, ts: 1, data }));
+  const state = (r: ReturnType<typeof parseLiveSignalBody>) =>
+    r.kind === "signal" ? r.signal.state : r.kind;
+  assertEquals(state(env("stream.started", { streaming: true })), "live");
+  assertEquals(state(env("stream.stopped", { streaming: false })), "offline");
+  // The event name decides for started/stopped, whatever data says…
+  assertEquals(state(env("stream.started")), "live");
+  assertEquals(state(env("stream.stopped", { streaming: true })), "offline");
+  // …anything else goes by data.streaming (a periodic re-sync).
+  assertEquals(state(env("stream.state", { streaming: true })), "live");
+  assertEquals(state(env("stream.state", { streaming: false })), "offline");
+  assertEquals(state(env("obs.anything", { streaming: true })), "live");
+  // Well-formed but about something else: ignored, never an error a sender
+  // would retry.
+  assertEquals(state(env("record.started", { recording: true })), "ignored");
+  assertEquals(state(env("stream.state", { streaming: "yes" })), "ignored");
+  assertEquals(state(env("stream.state")), "ignored");
+  const r = env("stream.started", { streaming: true, source: "mailroom" });
+  assert(r.kind === "signal");
+  assertEquals(r.signal.source, "mailroom stream.started");
+});
+
+Deno.test("parseLiveSignalBody: malformed bodies are bad requests", () => {
+  for (
+    const raw of ["", "not json", "[]", "null", '"live"', "{}", '{"event":""}']
+  ) {
+    assertEquals(parseLiveSignalBody(raw).kind, "bad", raw);
+  }
+});
+
+Deno.test("createStateWriter: coalesces overlapping changes into one follow-up write", async () => {
+  const writes: string[] = [];
+  const gates: (() => void)[] = [];
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  let state = 0;
+  const w = createStateWriter(
+    (v) =>
+      new Promise<void>((resolve) => {
+        writes.push(v);
+        gates.push(resolve);
+      }),
+    () => String(state),
+  );
+  state = 1;
+  w();
+  state = 2;
+  w();
+  state = 3;
+  w(); // two changes while the first write is in flight: one more write
+  assertEquals(writes, ["1"]);
+  gates.shift()!();
+  await tick();
+  assertEquals(writes, ["1", "3"]); // the latest state, read when it started
+  gates.shift()!();
+  await tick();
+  assertEquals(writes, ["1", "3"]); // nothing further was asked for
+  assertEquals(gates.length, 0);
+});
+
+Deno.test("createStateWriter: flush writes the latest state, and nothing for an untouched writer", async () => {
+  const writes: string[] = [];
+  const record = (v: string) => {
+    writes.push(v);
+    return Promise.resolve();
+  };
+  // A shutdown before anything changed must not replace the file on disk
+  // with whatever memory holds (the empty state, after a quarantine).
+  const untouched = createStateWriter(record, () => "EMPTY");
+  await untouched.flush();
+  assertEquals(writes, []);
+
+  let state = "a";
+  const w = createStateWriter(record, () => state);
+  w();
+  state = "b";
+  await w.flush(); // resolves only once the latest state has been written
+  assertEquals(writes[0], "a");
+  assertEquals(writes.at(-1), "b");
+  const before = writes.length;
+  state = "c";
+  await w.flush(); // nothing in flight: writes now
+  assertEquals(writes.slice(before), ["c"]);
+});
+
+Deno.test("createStateWriter: a failing persist neither wedges the writer nor escapes", async () => {
+  const writes: string[] = [];
+  let fail = true;
+  let state = 1;
+  const w = createStateWriter((v) => {
+    if (fail) return Promise.reject(new Error("disk full"));
+    writes.push(v);
+    return Promise.resolve();
+  }, () => String(state));
+  w();
+  await w.flush(); // would reject (and crash as unhandled) if it escaped
+  assertEquals(writes, []);
+  fail = false;
+  state = 2;
+  w();
+  await w.flush();
+  assertEquals(writes.at(-1), "2");
+});
+
+Deno.test("decodeStateFile: shape-checked JSON, else null", () => {
+  const isArr = (v: unknown) => Array.isArray(v);
+  assertEquals(decodeStateFile("[1,2]", isArr), { value: [1, 2] });
+  assertEquals(decodeStateFile("", isArr), null); // empty after a crash
+  assertEquals(decodeStateFile('[{"a":1', isArr), null); // torn
+  assertEquals(decodeStateFile("{}", isArr), null); // wrong shape
+  assertEquals(decodeStateFile("null", (v) => v === null), { value: null });
 });

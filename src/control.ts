@@ -22,6 +22,7 @@ import type {
   RewardsResult,
   RewardSyncReport,
 } from "./channelpoints.ts";
+import type { StatusSources } from "./status.ts";
 
 /** Result of an attempt to set the runtime YouTube key (returned to the CLI client). */
 export interface KeyUpdateResult {
@@ -100,10 +101,33 @@ export interface ChannelPointsHooks {
   simulate(key: string, user?: string): Promise<RewardsResult>;
 }
 
+/** A go-live hint as POST /api/live understands it, whichever body shape
+ *  carried it (see parseLiveSignalBody). */
+export interface LiveSignal {
+  state: "live" | "offline";
+  /** Who sent it — only ever used in a log line. */
+  source: string;
+}
+
+/** What a go-live hint did. `effect` is the machine-readable outcome (the
+ *  LiveHintEffect of src/youtube.ts, or "keyless" / "unconfigured" when no
+ *  poller is running to take the hint); `message` says it for a person. */
+export interface LiveSignalResult {
+  ok: true;
+  state: "live" | "offline";
+  effect: string;
+  message: string;
+}
+
 /** Hooks createServer calls back into. Kept optional so tests can omit them. */
 export interface ServerHooks {
   /** Invoked with a validated key when a loopback POST /api/youtube-key arrives. */
   setYouTubeKey?: (key: string) => Promise<KeyUpdateResult>;
+  /** Invoked for a loopback POST /api/live. Synchronous on purpose: the hint
+   *  is answered at once and never waits on discovery. */
+  liveSignal?: (signal: LiveSignal) => LiveSignalResult;
+  /** The live parts of GET /api/status (the server adds the rest). */
+  status?: () => StatusSources;
   /** Present when a giveaway is enabled; drives the loopback POST /api/giveaway. */
   giveaway?: GiveawayHooks;
   /** Present when channel points are enabled; drives the loopback
@@ -150,21 +174,145 @@ export function parseYouTubeKeyBody(
   return raw.trim();
 }
 
+const LIVE_STATES = new Set(["live", "offline"]);
+
+/** A sender's name as it may be logged: printable ASCII only, capped. */
+function cleanSource(raw: unknown, fallback: string): string {
+  const s = typeof raw === "string"
+    ? raw.replace(/[^\x20-\x7e]/g, "").trim().slice(0, 64)
+    : "";
+  return s || fallback;
+}
+
 /**
- * Pick the API key to use at startup. A key the operator set at runtime
- * (persisted to disk) is the most recent intent, so it wins over a deploy-time
- * env var, which in turn wins over a static settings.json value. Returns "" when
- * none is set (the server then waits for a runtime key).
+ * Read a POST /api/live body. Two shapes are accepted:
+ *
+ *   {"state": "live" | "offline", "source"?: string}
+ *   {"event": string, "ts"?: number, "data"?: {"streaming"?: boolean, …}}
+ *
+ * The second is the `{event, ts, data}` envelope a webhook sender uses (the
+ * same one this server's own `webhook` integration adapter emits):
+ * `stream.started` means live and `stream.stopped` offline; any other event
+ * goes by `data.streaming`, so a periodic `stream.state` re-sync counts too.
+ * An event that says nothing about the stream is "ignored" — well-formed, so
+ * the sender is told 200 rather than an error it would keep retrying. Only a
+ * body that is neither shape is "bad".
  */
+export function parseLiveSignalBody(
+  raw: string,
+):
+  | { kind: "signal"; signal: LiveSignal }
+  | { kind: "ignored"; reason: string }
+  | { kind: "bad"; message: string } {
+  let body: unknown;
+  try {
+    body = JSON.parse(raw);
+  } catch {
+    return { kind: "bad", message: "body is not JSON" };
+  }
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return { kind: "bad", message: "body must be a JSON object" };
+  }
+  const o = body as Record<string, unknown>;
+  if (o.state !== undefined) {
+    const state = typeof o.state === "string"
+      ? o.state.trim().toLowerCase()
+      : "";
+    if (!LIVE_STATES.has(state)) {
+      return { kind: "bad", message: 'state must be "live" or "offline"' };
+    }
+    return {
+      kind: "signal",
+      signal: {
+        state: state as LiveSignal["state"],
+        source: cleanSource(o.source, "api"),
+      },
+    };
+  }
+  if (typeof o.event !== "string" || !o.event.trim()) {
+    return {
+      kind: "bad",
+      message: 'expected {"state": "live"|"offline"} or an {event, ts, data} ' +
+        "envelope",
+    };
+  }
+  const event = o.event.trim();
+  const data = typeof o.data === "object" && o.data !== null
+    ? o.data as Record<string, unknown>
+    : {};
+  const state = event === "stream.started"
+    ? "live"
+    : event === "stream.stopped"
+    ? "offline"
+    : data.streaming === true
+    ? "live"
+    : data.streaming === false
+    ? "offline"
+    : null;
+  if (!state) {
+    return {
+      kind: "ignored",
+      reason: `event "${cleanSource(event, "?")}" carries no stream state`,
+    };
+  }
+  return {
+    kind: "signal",
+    signal: {
+      state,
+      source: `${cleanSource(data.source, "webhook")} ${
+        cleanSource(event, "")
+      }`,
+    },
+  };
+}
+
+/** Where a startup YouTube key came from (null: there is none). */
+export type KeySource = "persisted" | "environment" | "settings";
+
+/**
+ * Pick the API key to use at startup, and say where it came from. A key the
+ * operator set at runtime (persisted to disk) is the most recent intent, so it
+ * wins over a deploy-time env var, which in turn wins over a static
+ * settings.json value. `key` is "" (and `source` null) when none is set — the
+ * server then waits for a runtime key.
+ *
+ * `declared` is the key the deployment itself supplies (environment, else
+ * settings) whatever won: what the server falls back to when a persisted
+ * runtime key turns out to be refused (see the key manager in main.ts).
+ */
+export function resolveStartupKeySource(sources: {
+  persisted?: string | null;
+  env?: string | null;
+  settings?: string | null;
+}): {
+  key: string;
+  source: KeySource | null;
+  declared: { key: string; source: "environment" | "settings" } | null;
+} {
+  const clean = (v: string | null | undefined) => (v ?? "").trim();
+  const env = clean(sources.env);
+  const settings = clean(sources.settings);
+  const declared = env
+    ? { key: env, source: "environment" as const }
+    : settings
+    ? { key: settings, source: "settings" as const }
+    : null;
+  const persisted = clean(sources.persisted);
+  if (persisted) return { key: persisted, source: "persisted", declared };
+  return {
+    key: declared?.key ?? "",
+    source: declared?.source ?? null,
+    declared,
+  };
+}
+
+/** The key half of resolveStartupKeySource. */
 export function resolveStartupKey(sources: {
   persisted?: string | null;
   env?: string | null;
   settings?: string | null;
 }): string {
-  for (const v of [sources.persisted, sources.env, sources.settings]) {
-    if (v && v.trim()) return v.trim();
-  }
-  return "";
+  return resolveStartupKeySource(sources).key;
 }
 
 /**
@@ -306,6 +454,73 @@ export function channelPointsControlPath(
 ): string | null {
   const dir = (stateDir ?? "").replace(/\/+$/, "");
   return dir ? `${dir}/channelpoints-control.json` : null;
+}
+
+/**
+ * One writer for one state file. A change that lands while a write is in
+ * flight is coalesced into a single follow-up write of the latest state, so
+ * two quick changes can neither interleave on disk nor lose the second one.
+ * `persist` does the actual (atomic) write and is injected, which keeps this
+ * testable without a filesystem; `snapshot` is read when a write starts, never
+ * earlier. Calling the writer schedules a write; `flush` writes the latest
+ * state now, or right after the write in flight, and resolves once it is on
+ * disk (graceful shutdown). A writer that was never called writes nothing on
+ * flush: a shutdown that lands before anything changed must not replace the
+ * file on disk with whatever memory holds — after a corrupt file was moved
+ * aside, that is the empty state.
+ *
+ * Persistence is best-effort everywhere, so a `persist` that throws is
+ * swallowed here (it reports its own failures): it must neither wedge the
+ * writer nor surface as an unhandled rejection, which would end the process.
+ */
+export function createStateWriter(
+  persist: (value: string) => Promise<void>,
+  snapshot: () => string,
+): { (): void; flush: () => Promise<void> } {
+  let running: Promise<void> | null = null;
+  let again = false;
+  let used = false;
+  const schedule = () => {
+    used = true;
+    if (running) {
+      again = true;
+      return;
+    }
+    running = (async () => {
+      do {
+        again = false;
+        try {
+          await persist(snapshot());
+        } catch { /* best-effort */ }
+      } while (again);
+    })().finally(() => {
+      running = null;
+    });
+  };
+  return Object.assign(schedule, {
+    flush: async () => {
+      if (!used) return;
+      schedule();
+      if (running) await running;
+    },
+  });
+}
+
+/**
+ * Decode the text of a JSON state file: the parsed value when it is JSON of
+ * the expected shape, else null — a torn or empty file from a crash, a hand
+ * edit gone wrong. The caller moves such a file aside (quarantinePath) rather
+ * than let the next write replace the evidence.
+ */
+export function decodeStateFile(
+  raw: string,
+  shapeOk: (v: unknown) => boolean,
+): { value: unknown } | null {
+  try {
+    const value: unknown = JSON.parse(raw);
+    if (shapeOk(value)) return { value };
+  } catch { /* torn or empty */ }
+  return null;
 }
 
 /** Suffix every atomic-write temp file ends with (see stateTmpPath). */

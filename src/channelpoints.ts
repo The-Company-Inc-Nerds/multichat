@@ -552,7 +552,9 @@ export function channelPointsSetupProblems(
  * the token response didn't say, `scopes` null). The persisted rotated refresh
  * token beats every seed, so a fresh `multichat login` alone changes nothing:
  * the state file has to go too, and the seed has to be replaced wherever it
- * lives (the Proton Pass item behind LoadCredential on NixOS).
+ * lives (the Proton Pass item behind LoadCredential on NixOS — whose unit
+ * reinstalls a seed it sees change, which stands in for the deletion once it
+ * has a `<state file>.seed` marker to compare against).
  */
 export function channelPointsScopeWarning(
   login: string,
@@ -570,7 +572,9 @@ export function channelPointsScopeWarning(
     "behind LoadCredential);",
     tokenPath
       ? `  3. delete ${tokenPath} — the persisted rotated token wins over any ` +
-        "seed, so the old scopes stay until it is gone;"
+        "seed, so the old scopes stay until it is gone (the NixOS unit does " +
+        `this itself for a replaced refreshTokenFile once ${tokenPath}.seed ` +
+        "exists);"
       : "  3. (no state directory — the seed is re-read at every start);",
     "  4. restart multichat.",
   ].join("\n");

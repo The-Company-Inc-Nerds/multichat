@@ -573,6 +573,8 @@ Deno.test("channelPointsScopeWarning: names the state file to delete and the re-
   assert(w.includes("channel:manage:redemptions"));
   assert(w.includes("multichat login"));
   assert(w.includes("delete /var/lib/multichat/twitch-refresh-1477084215"));
+  // …which the NixOS unit does itself once it has a seed hash to compare.
+  assert(w.includes("/var/lib/multichat/twitch-refresh-1477084215.seed"));
   assert(w.includes("LoadCredential"));
   const noDir = channelPointsScopeWarning("tci", [], null)!;
   assert(noDir.includes("no state directory"));

@@ -15,9 +15,11 @@ import {
   checkControlAccess,
   isLoopbackAddr,
   normalizeControlAccess,
+  parseLiveSignalBody,
   parseYouTubeKeyBody,
   type ServerHooks,
 } from "./control.ts";
+import { buildServerStatus } from "./status.ts";
 import { describeFakeAction, parseFakeAction } from "./fake.ts";
 import { parseGiveawayAction } from "./giveaway.ts";
 import { parseTurnReport } from "./integrations.ts";
@@ -1766,6 +1768,10 @@ export function createServer(
 
   // Seed one status entry per configured channel, all "connecting" until a client reports in.
   const statuses = new Map<string, ChannelStatus>();
+  // When each entry last changed state — for GET /api/status only, never sent
+  // over SSE (the roster frame keeps its shape).
+  const startedAt = Date.now();
+  const statusSince = new Map<string, number>();
   const key = (platform: Platform, name: string) => `${platform}:${name}`;
   for (const name of settings.twitch.channels) {
     statuses.set(key("twitch", name), {
@@ -1773,6 +1779,7 @@ export function createServer(
       name,
       state: "connecting",
     });
+    statusSince.set(key("twitch", name), startedAt);
   }
   for (const ch of settings.youtube.channels) {
     const name = youtubeLabel(ch); // the same name the poller reports under
@@ -1781,6 +1788,7 @@ export function createServer(
       name,
       state: "connecting",
     });
+    statusSince.set(key("youtube", name), startedAt);
   }
 
   // Last giveaway state broadcast, cached like `statuses` so a newly-connected
@@ -1841,6 +1849,7 @@ export function createServer(
       const existing = statuses.get(k);
       if (existing && existing.state === state) return;
       statuses.set(k, { platform, name, state });
+      statusSince.set(k, Date.now());
       broadcast({ type: "status", data: [...statuses.values()] });
     },
   };
@@ -1904,6 +1913,104 @@ export function createServer(
         else if (a.action === "delete") emitter.delete(a.data);
         else emitter.status(a.data.platform, a.data.name, a.data.state);
         return ctl("Injected: " + describeFakeAction(a) + "\n", 200);
+      }
+
+      // A go-live hint: something that already knows the stream started or
+      // stopped (mailroom's webhook, Companion, OBS, `multichat live on`) says
+      // so, and the YouTube poller looks now instead of at its next tick. It
+      // only changes *when* the poller looks, but it does spend quota, so it
+      // is hard loopback-only and refused from web pages, like /api/rewards.
+      // Answered at once: the hook never waits on discovery. A well-formed
+      // body always gets 200 — a sender that retries on errors must not be
+      // sent into a loop by an event this server has no use for.
+      if (pathname === "/api/live") {
+        const ctl = (body: string, status: number, json = false) =>
+          new Response(body, {
+            status,
+            headers: {
+              "x-multichat": "control",
+              ...(json ? { "content-type": "application/json" } : {}),
+            },
+          });
+        if (req.method !== "POST") return ctl("Method Not Allowed\n", 405);
+        if (!isLoopbackAddr(info.remoteAddr)) {
+          return ctl("Forbidden: the live endpoint is loopback-only\n", 403);
+        }
+        const browser = browserRequestDenied(req.headers);
+        if (browser) {
+          return ctl(
+            JSON.stringify({
+              ok: false,
+              reason: "forbidden",
+              message:
+                `Forbidden: the live endpoint is not for web pages — ${browser}`,
+            }) + "\n",
+            403,
+            true,
+          );
+        }
+        const parsed = parseLiveSignalBody(await req.text());
+        if (parsed.kind === "bad") {
+          return ctl("Bad Request: " + parsed.message + "\n", 400);
+        }
+        if (parsed.kind === "ignored") {
+          return ctl(
+            JSON.stringify({
+              ok: true,
+              effect: "ignored",
+              message: parsed.reason,
+            }) + "\n",
+            200,
+            true,
+          );
+        }
+        if (!hooks.liveSignal) {
+          return ctl("Live hints are not available\n", 501);
+        }
+        return ctl(
+          JSON.stringify(hooks.liveSignal(parsed.signal)) + "\n",
+          200,
+          true,
+        );
+      }
+
+      // What the server is doing right now, as JSON: key source, quota, why
+      // detection is parked, each channel's last transition, EventSub's token
+      // and subscriptions (see status.ts). Read-only and free of key material,
+      // but it describes the deployment, so loopback-only and not for pages.
+      // Driven by `multichat status`.
+      if (pathname === "/api/status") {
+        const ctl = (body: string, status: number, json = false) =>
+          new Response(body, {
+            status,
+            headers: {
+              "x-multichat": "control",
+              ...(json
+                ? {
+                  "content-type": "application/json",
+                  "cache-control": "no-store",
+                }
+                : {}),
+            },
+          });
+        if (req.method !== "GET") return ctl("Method Not Allowed\n", 405);
+        if (!isLoopbackAddr(info.remoteAddr)) {
+          return ctl("Forbidden: the status endpoint is loopback-only\n", 403);
+        }
+        const browser = browserRequestDenied(req.headers);
+        if (browser) {
+          return ctl(`Forbidden: ${browser}\n`, 403);
+        }
+        const status = buildServerStatus({
+          startedAt,
+          now: Date.now(),
+          roster: [...statuses].map(([k, st]) => ({
+            ...st,
+            since: statusSince.get(k) ?? startedAt,
+          })),
+          sources: hooks.status?.(),
+        });
+        return ctl(JSON.stringify(status) + "\n", 200, true);
       }
 
       // Operator control-plane for channel points (status/sync/pause/resume/

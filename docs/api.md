@@ -3,24 +3,27 @@
 multichat serves a single page and a Server-Sent Events stream. The viewer
 surface is read-only and unauthenticated — meant to run on a trusted network —
 plus loopback-only control endpoints: setting the YouTube API key, injecting
-fake events for previewing how they render, driving the giveaway, and driving
-channel points.
+fake events for previewing how they render, driving the giveaway, driving
+channel points, hinting that the stream went live, and reading the server's
+status.
 
 ## Endpoints
 
-| Method | Path                    | Response            | Description                                                                            |
-| ------ | ----------------------- | ------------------- | -------------------------------------------------------------------------------------- |
-| `GET`  | `/` (and `/index.html`) | `text/html`         | The viewer page (HTML/CSS/JS embedded in the binary)                                   |
-| `GET`  | `/overlay`              | `text/html`         | Same page in OBS overlay mode (see below)                                              |
-| `GET`  | `/alerts`               | `text/html`         | Same page in OBS alerts mode — animated shoutout pop-ups (see below)                   |
-| `GET`  | `/giveaway`             | `text/html`         | Giveaway picker — CS2-style case reel; `?overlay` = transparent OBS source (see below) |
-| `GET`  | `/events`               | `text/event-stream` | The live SSE feed of chat events                                                       |
-| `POST` | `/api/youtube-key`      | `text/plain`        | Set the YouTube API key (loopback-only — see below)                                    |
-| `POST` | `/api/fake`             | `text/plain`        | Inject a fake chat event for previewing (loopback-only — see below)                    |
+| Method | Path                    | Response            | Description                                                                               |
+| ------ | ----------------------- | ------------------- | ----------------------------------------------------------------------------------------- |
+| `GET`  | `/` (and `/index.html`) | `text/html`         | The viewer page (HTML/CSS/JS embedded in the binary)                                      |
+| `GET`  | `/overlay`              | `text/html`         | Same page in OBS overlay mode (see below)                                                 |
+| `GET`  | `/alerts`               | `text/html`         | Same page in OBS alerts mode — animated shoutout pop-ups (see below)                      |
+| `GET`  | `/giveaway`             | `text/html`         | Giveaway picker — CS2-style case reel; `?overlay` = transparent OBS source (see below)    |
+| `GET`  | `/events`               | `text/event-stream` | The live SSE feed of chat events                                                          |
+| `POST` | `/api/youtube-key`      | `text/plain`        | Set the YouTube API key (loopback-only — see below)                                       |
+| `POST` | `/api/fake`             | `text/plain`        | Inject a fake chat event for previewing (loopback-only — see below)                       |
 | `POST` | `/api/giveaway`         | `application/json`  | Drive the giveaway: open/close/draw/reset/remove (loopback, or wider via `controlAccess`) |
-| `POST` | `/api/turn-report`      | `application/json`  | Integration callback: chat-cards reports a pack back (callback token, else loopback)  |
-| `POST` | `/api/rewards`          | `application/json`  | Drive channel points: status/sync/pause/resume/pending/refund/simulate (loopback-only) |
-| any    | anything else           | `404`               | Not found                                                                              |
+| `POST` | `/api/turn-report`      | `application/json`  | Integration callback: chat-cards reports a pack back (callback token, else loopback)      |
+| `POST` | `/api/rewards`          | `application/json`  | Drive channel points: status/sync/pause/resume/pending/refund/simulate (loopback-only)    |
+| `POST` | `/api/live`             | `application/json`  | Go-live hint: the stream just started / stopped (loopback-only — see below)               |
+| `GET`  | `/api/status`           | `application/json`  | What the server is doing: key source, quota, parked reasons, EventSub (loopback-only)     |
+| any    | anything else           | `404`               | Not found                                                                                 |
 
 The viewer page also takes `?overlay` and `?alerts` query params (`/?overlay` is
 equivalent to `/overlay`, `/?alerts` to `/alerts`), plus `?direction=up|down`
@@ -184,13 +187,17 @@ in settings.
   `removed` (the entrant dropped, or `null`) and `matches` (whom the target
   resolved to). A miss or an ambiguous target — two entrants sharing a display
   name — removes **nothing**: `removed` is `null`, `matches` lists the
-  candidates, and the pool is unchanged. Re-run with the `userId` to pick one. `GiveawayState` is
+  candidates, and the pool is unchanged. Re-run with the `userId` to pick one.
+  `GiveawayState` is
   `{ open, entrants: [{userId, login, displayName, enteredAt, number}],
-  nextNumber, lastWinner?, campaign? }` — `campaign` is a derived summary
+  nextNumber, lastWinner?, campaign? }`
+  — `campaign` is a derived summary
   `{ followerCount, milestonesReached, creditsRemaining, guaranteedRemaining,
-  poolSize, winnersTotal, recentWinners (last 10), followTracking }`. A
-  `GiveawayWinner` is `{ userId, login, displayName, number, enteredAt, wonAt,
-  tier }` with tier `"guaranteed"` | `"milestone-K"` | `"manual"`.
+  poolSize, winnersTotal, recentWinners (last 10), followTracking }`.
+  A `GiveawayWinner` is
+  `{ userId, login, displayName, number, enteredAt, wonAt,
+  tier }` with tier
+  `"guaranteed"` | `"milestone-K"` | `"manual"`.
 
 Mutating actions broadcast the new pool to every connected page as a `giveaway`
 SSE frame. Entries themselves are **not** an action here — they come from
@@ -207,9 +214,9 @@ viewers typing the command in chat (see
 
 ## `POST /api/turn-report`
 
-Where an integration pushes a result back so it lands on the winner's turn in the
-giveaway ledger. chat-cards calls this for every pack it opens, re-sending the
-whole pack each time a card is scanned or repriced.
+Where an integration pushes a result back so it lands on the winner's turn in
+the giveaway ledger. chat-cards calls this for every pack it opens, re-sending
+the whole pack each time a card is scanned or repriced.
 
 - **Auth.** The bearer configured as `integrations.callbackToken`, sent as
   `Authorization: Bearer …` or `?token=`. With no token configured the endpoint
@@ -227,13 +234,13 @@ whole pack each time a card is scanned or repriced.
 Reports are persisted with the rest of the giveaway state, so they survive a
 restart.
 
-| Status | Meaning                                       |
-| ------ | --------------------------------------------- |
-| `200`  | Recorded; the stored report is echoed back    |
-| `400`  | Body was not valid JSON, or `packId` was missing |
+| Status | Meaning                                                                     |
+| ------ | --------------------------------------------------------------------------- |
+| `200`  | Recorded; the stored report is echoed back                                  |
+| `400`  | Body was not valid JSON, or `packId` was missing                            |
 | `403`  | Bad/missing callback token, or a non-loopback peer with no token configured |
-| `405`  | Method was not `POST`                         |
-| `501`  | No giveaway is enabled in settings            |
+| `405`  | Method was not `POST`                                                       |
+| `501`  | No giveaway is enabled in settings                                          |
 
 See [Integrations](configuration.md#integrations) for the outbound half.
 
@@ -310,6 +317,194 @@ With `announce` on, each redemption also appears on the SSE feed as an ordinary
 `message` with `kind: "system"` — `"<viewer> redeemed <title>"`, the reward's
 tier color as `accentColor`, and the cost as `amount` — so it shows as a
 highlighted row in `/` and `/overlay` but never pops on `/alerts`.
+
+## `POST /api/live`
+
+A **hint** that the stream just started or stopped, from something that already
+knows — an OBS controller's webhook, a Companion button,
+`multichat live on|off`. It changes only _when_ the YouTube poller looks; see
+[Go-live hints](configuration.md#go-live-hints) for what it does and never does.
+Detection works without it.
+
+- **Loopback-only, always**, whatever `server.controlAccess` says — a hint
+  spends YouTube quota.
+- **Not from a browser.** As for `/api/rewards`: a request carrying an `Origin`
+  header, or a `Sec-Fetch-Site` other than `none` / `same-origin`, gets `403`
+  `{"ok":false,"reason":"forbidden","message":…}`.
+- **Answered at once.** The response never waits for the poller to act.
+- **Body.** A JSON object in either of two shapes:
+  - `{"state": "live" | "offline", "source"?: "<who is sending>"}` — `source` is
+    only used in the server's log line (printable ASCII, cut to 64 characters).
+  - `{"event": "<name>", "ts"?: <epoch ms>, "data"?: {"streaming"?: <bool>, …}}`
+    — the envelope a webhook sender uses (the same one this server's `webhook`
+    integration adapter emits). `stream.started` means live and `stream.stopped`
+    offline, whatever `data` says; any other event goes by `data.streaming`
+    (`true` = live, `false` = offline), so a periodic `stream.state` re-sync
+    works too. `data.source`, if a string, names the sender in the log.
+- **Response.** `200` with JSON for every well-formed body — including one this
+  server has no use for, so a sender that retries on errors is never sent into a
+  loop:
+
+  ```json
+  {
+    "ok": true,
+    "state": "live",
+    "effect": "boost",
+    "message": "checking now and every 20s for 5 min (boost 1/12 today)"
+  }
+  ```
+
+  | `effect`       | Meaning                                                                                     |
+  | -------------- | ------------------------------------------------------------------------------------------- |
+  | `boost`        | `live`: discovery was woken and ticks every 20s for 5 minutes                               |
+  | `coalesced`    | `live`: already inside a boost · `offline`: the chat was re-verified less than a minute ago |
+  | `capped`       | `live`: today's 12 boosts are used; discovery stays on its normal tick                      |
+  | `parked`       | `live`: the daily quota is spent, or the key is refused — nothing to speed up               |
+  | `attached`     | `live`: every watched channel is already on its live chat                                   |
+  | `verify`       | `offline`: the attached chat(s) are being checked with `videos.list` now                    |
+  | `idle`         | no YouTube channel is being watched yet / no chat is attached to verify                     |
+  | `keyless`      | there is no YouTube API key yet                                                             |
+  | `unconfigured` | no YouTube channels are configured                                                          |
+  | `ignored`      | an envelope whose event says nothing about the stream (no `state` field in the response)    |
+
+| Status | Meaning                                                            |
+| ------ | ------------------------------------------------------------------ |
+| `200`  | Understood; `effect` says what it did (possibly nothing)           |
+| `400`  | Body was not JSON, or neither shape (`state` not `live`/`offline`) |
+| `403`  | Not from loopback, or sent by a web page (`Origin`)                |
+| `405`  | Method was not `POST`                                              |
+| `501`  | The server was started without the live-hint hook                  |
+
+With [Twitch EventSub](configuration.md#twitch-eventsub-alerts) configured the
+server feeds itself the same hint from the channel's `stream.online` /
+`stream.offline` events.
+
+## `GET /api/status`
+
+What the server is doing right now, as JSON — the thing to look at when YouTube
+"didn't notice we went live" or alerts stopped. `multichat status` prints it
+readably (`--json` for the raw body). Read-only and free of key material (a
+YouTube key appears only as its fingerprint, tokens not at all), but it
+describes the deployment, so:
+
+- **Loopback-only, always**, and **not from a browser** (same rule as above;
+  `403` as plain text).
+
+```json
+{
+  "version": "0.1.0",
+  "startedAt": 1760000000000,
+  "now": 1760007200000,
+  "uptimeSec": 7200,
+  "youtube": {
+    "configured": 1,
+    "key": {
+      "present": true,
+      "source": "environment",
+      "fingerprint": "84ff4ce7",
+      "note": null
+    },
+    "polling": true,
+    "quota": {
+      "day": "2026-10-08",
+      "units": 412,
+      "searches": 3,
+      "searchBlocked": false,
+      "exhausted": false,
+      "liveMs": 5400000,
+      "lastSearchAt": 1760005400000,
+      "keyFp": "84ff4ce7",
+      "boosts": 1,
+      "boostAt": 1760001800000,
+      "dailyQuota": 10000,
+      "budgetHours": 4,
+      "resetsAt": 1760079600000
+    },
+    "parked": null,
+    "boost": {
+      "active": false,
+      "until": null,
+      "usedToday": 1,
+      "dailyCap": 12,
+      "earlySearch": null
+    },
+    "channels": [{
+      "name": "@thecompany",
+      "state": "live",
+      "reason": "polling live chat (video abc123, found via uploads playlist)",
+      "since": 1760001800000,
+      "parked": null,
+      "videoId": "abc123",
+      "checkedAt": 1760001800000,
+      "nextCheckAt": null
+    }]
+  },
+  "twitch": {
+    "irc": [
+      { "name": "thecompanyinc", "state": "live", "since": 1760000001000 }
+    ],
+    "eventsub": {
+      "state": "on",
+      "channels": [{
+        "login": "thecompanyinc",
+        "broadcasterId": "1477084215",
+        "token": "ok",
+        "tokenSource": "persisted",
+        "tokenError": null,
+        "tokenRefreshedAt": 1760006000000,
+        "scopes": ["moderator:read:followers"],
+        "session": "connected",
+        "sessionError": null,
+        "subscriptions": { "active": 8, "wanted": 8, "failed": [] },
+        "stream": "online",
+        "streamAt": 1760001740000
+      }]
+    }
+  }
+}
+```
+
+All times are epoch milliseconds; `now` is the server's clock, so ages can be
+computed without trusting the reader's.
+
+- **`youtube.key`** — `source` is `persisted` (a runtime key reloaded from the
+  state directory), `environment` (`YOUTUBE_API_KEY`), `settings`
+  (`youtube.apiKey`) or `runtime` (`set-youtube-key` during this run); `note` is
+  set after the server left a refused runtime key for the declared one.
+- **`youtube.quota`** — today's ledger (Pacific day): estimated `units` spent,
+  `searches` made, whether the pool is `exhausted` or the search bucket
+  `searchBlocked`, live time, the go-live `boosts` started, and `resetsAt` (the
+  next 00:00 PT). `null` until a poller has run.
+- **`youtube.parked`** — why detection is held back, or `null`:
+  `{reason, until, detail}` with `reason` one of `keyless` (no key at all),
+  `exhausted` (pool spent — nothing is checked until `until`), `denied` (the key
+  is refused — retried every 10 minutes) or `search-blocked` (only the search
+  fallback is off; playlist detection continues).
+- **`youtube.boost`** — the [go-live boost](configuration.md#go-live-hints):
+  whether one is running, until when, how many of the day's were used, and its
+  early search (`waiting` / `due` / `done`).
+- **`youtube.channels[]`** — per watched channel: the sidebar `state`, the
+  `reason` it entered that state (the text of its last transition's log line)
+  and `since` when, `parked` (`exhausted` / `denied` / `null`), the `videoId`
+  whose chat is attached right now, and when discovery last ran / runs next.
+- **`twitch.irc[]`** — the chat connection per joined channel (`live` = joined).
+- **`twitch.eventsub`** — `state` is `off` (not configured), `no-credentials`
+  (channels configured but no `clientId` / `clientSecret`, so nothing started)
+  or `on`; per channel then: `token` (`pending` → `ok`, or `none` = no refresh
+  token to start from, `rejected` = Twitch refused it, `error` = the refresh
+  failed some other way) with `tokenSource` (`persisted` / `seed`), the granted
+  `scopes`, the WebSocket `session` (`idle` / `connecting` / `connected` /
+  `retrying` + `sessionError`), how the last subscribe round went, and the last
+  `stream.online` / `stream.offline` Twitch sent.
+
+`youtube` / `twitch.eventsub` are `null` only on a server built without the
+status hook (never the packaged one).
+
+| Status | Meaning                                             |
+| ------ | --------------------------------------------------- |
+| `200`  | The status                                          |
+| `403`  | Not from loopback, or sent by a web page (`Origin`) |
+| `405`  | Method was not `GET`                                |
 
 ## The SSE stream
 
@@ -410,7 +605,11 @@ animation.
 ```json
 {
   "type": "giveaway",
-  "data": { "open": false, "entrants": [/* winner removed */], "nextNumber": 9 },
+  "data": {
+    "open": false,
+    "entrants": [/* winner removed */],
+    "nextNumber": 9
+  },
   "draw": {
     "winner": {
       "userId": "1001",
@@ -430,34 +629,34 @@ animation.
 Defined in [`src/types.ts`](../src/types.ts). All fields beyond the first block
 are optional.
 
-| Field         | Type                    | Description                                                                                                       |
-| ------------- | ----------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `id`          | string                  | Stable message id (used for deletions)                                                                            |
-| `platform`    | `"twitch" \| "youtube"` | Source platform                                                                                                   |
-| `channel`     | string                  | Channel name / label                                                                                              |
-| `author`      | string                  | Display name                                                                                                      |
-| `content`     | string                  | Plain-text body (fallback when `segments` is absent)                                                              |
-| `timestamp`   | number                  | Epoch milliseconds                                                                                                |
-| `authorColor` | string?                 | CSS color; derived from the name if the platform gives none                                                       |
-| `segments`    | Segment[]?              | Tokenized body: `{type:"text",text}` or `{type:"emote",url,alt}`                                                  |
-| `badges`      | Badge[]?                | Badges: `{id,label,title?,version?,info?,url?,url2x?,url4x?}`; `url*` = Twitch badge art (1x/2x/4x), else a chip  |
-| `kind`        | MessageKind?            | `chat` (default), `action`, `cheer`, `sub`, `raid`, `follow`, `superchat`, `supersticker`, `membership`, `system` |
-| `amount`      | string?                 | e.g. `"500 bits"`, `"$5.00"`                                                                                      |
-| `quantity`    | number?                 | Numeric twin of `amount` where themed cards need it (cheer bits, raid viewers)                                    |
-| `accentColor` | string?                 | Highlight color for event rows / tiers                                                                            |
-| `eventText`   | string?                 | Notice line for event rows, e.g. "X subscribed for 3 months"                                                      |
-| `sub`         | object?                 | Structured detail for `kind: "sub"`: `{tier?: 1\|2\|3, variant: "new"\|"resub"\|"gift", count?}` (alert themes key off it; `tier` absent = unknown) |
+| Field         | Type                    | Description                                                                                                                                                                                                                                                                                               |
+| ------------- | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`          | string                  | Stable message id (used for deletions)                                                                                                                                                                                                                                                                    |
+| `platform`    | `"twitch" \| "youtube"` | Source platform                                                                                                                                                                                                                                                                                           |
+| `channel`     | string                  | Channel name / label                                                                                                                                                                                                                                                                                      |
+| `author`      | string                  | Display name                                                                                                                                                                                                                                                                                              |
+| `content`     | string                  | Plain-text body (fallback when `segments` is absent)                                                                                                                                                                                                                                                      |
+| `timestamp`   | number                  | Epoch milliseconds                                                                                                                                                                                                                                                                                        |
+| `authorColor` | string?                 | CSS color; derived from the name if the platform gives none                                                                                                                                                                                                                                               |
+| `segments`    | Segment[]?              | Tokenized body: `{type:"text",text}` or `{type:"emote",url,alt}`                                                                                                                                                                                                                                          |
+| `badges`      | Badge[]?                | Badges: `{id,label,title?,version?,info?,url?,url2x?,url4x?}`; `url*` = Twitch badge art (1x/2x/4x), else a chip                                                                                                                                                                                          |
+| `kind`        | MessageKind?            | `chat` (default), `action`, `cheer`, `sub`, `raid`, `follow`, `superchat`, `supersticker`, `membership`, `system`                                                                                                                                                                                         |
+| `amount`      | string?                 | e.g. `"500 bits"`, `"$5.00"`                                                                                                                                                                                                                                                                              |
+| `quantity`    | number?                 | Numeric twin of `amount` where themed cards need it (cheer bits, raid viewers)                                                                                                                                                                                                                            |
+| `accentColor` | string?                 | Highlight color for event rows / tiers                                                                                                                                                                                                                                                                    |
+| `eventText`   | string?                 | Notice line for event rows, e.g. "X subscribed for 3 months"                                                                                                                                                                                                                                              |
+| `sub`         | object?                 | Structured detail for `kind: "sub"`: `{tier?: 1\|2\|3, variant: "new"\|"resub"\|"gift", count?}` (alert themes key off it; `tier` absent = unknown)                                                                                                                                                       |
 | `backlog`     | boolean?                | `true` on history older than 5 minutes that YouTube returns while the poller is catching up — a fresh attach, a resume after a gap (a quota park, a key change, an outage of more than 5 minutes), or a page-token reset. Render it, but don't pop an alert for it (`/alerts` skips it). Absent otherwise |
 
-A `Badge`'s `id` is the bare set id (`moderator`, `subscriber`, `member`, …)
-and `label` is always its short chip text (`"Mod"`, `"T2 Sub · 14 mo"`,
+A `Badge`'s `id` is the bare set id (`moderator`, `subscriber`, `member`, …) and
+`label` is always its short chip text (`"Mod"`, `"T2 Sub · 14 mo"`,
 `"Bits 1000"`), which the page draws when the badge has no art or its image
 fails to load. Twitch badges also carry `version` (e.g. `"3012"`, a Tier 3
 12-month subscriber badge) and `info` (the unescaped `badge-info` value, e.g.
 the exact months `"14"`). When the server resolved art for the badge, `url` /
-`url2x` / `url4x` are its 18/36/72px images and `title` is Twitch's title for
-it (e.g. `"Moderator"`, or `"Subscriber (14 months)"` with the months from
-`badge-info`), used as the image's alt and tooltip; `title` is absent when
-there is no art. YouTube badges are `{id,label}` only.
+`url2x` / `url4x` are its 18/36/72px images and `title` is Twitch's title for it
+(e.g. `"Moderator"`, or `"Subscriber (14 months)"` with the months from
+`badge-info`), used as the image's alt and tooltip; `title` is absent when there
+is no art. YouTube badges are `{id,label}` only.
 
 See [Chat Features](features.md) for how these fields are rendered.

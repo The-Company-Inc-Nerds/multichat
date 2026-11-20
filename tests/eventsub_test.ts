@@ -1,11 +1,14 @@
 import {
+  applySessionEvent,
   classifyFrame,
+  type EventSubSessionState,
   type FollowEvent,
   getKeepaliveSeconds,
   getNotification,
   getReconnectUrl,
   getSessionId,
   handleNotification,
+  isLiveBroadcast,
   mapCheer,
   mapFollow,
   mapRaid,
@@ -14,6 +17,7 @@ import {
   mapSubMessage,
   mapSubscribe,
   type RedemptionEvent,
+  type StreamEvent,
   subTierLabel,
 } from "../src/eventsub.ts";
 import { fakeEmitter } from "./_fake.ts";
@@ -395,4 +399,66 @@ Deno.test("getNotification: pulls type, event, and a stable id", () => {
     getNotification({ metadata: { message_type: "notification" } }),
     null,
   );
+});
+
+Deno.test("handleNotification: stream.online / offline reach onStream and render nothing", () => {
+  const e = fakeEmitter();
+  const seen: StreamEvent[] = [];
+  const on = (ev: StreamEvent) => seen.push(ev);
+  const handle = (type: string, event: Record<string, unknown>) =>
+    handleNotification(type, event, "chan", "id", e, undefined, undefined, on);
+  assertEquals(handle("stream.online", { type: "live" }), true);
+  assertEquals(handle("stream.online", { type: "Rerun" }), true);
+  assertEquals(handle("stream.offline", {}), true);
+  assertEquals(seen, [
+    { channel: "chan", live: true, kind: "live" },
+    { channel: "chan", live: true, kind: "rerun" },
+    { channel: "chan", live: false, kind: "" },
+  ]);
+  assertEquals(e.captured.messages.length, 0);
+  // Handled with no observer too (no "unknown type" path).
+  assertEquals(
+    handleNotification("stream.offline", {}, "chan", "id", e),
+    true,
+  );
+});
+
+Deno.test("isLiveBroadcast: a real broadcast, not a rerun or playlist", () => {
+  assert(isLiveBroadcast({ channel: "c", live: true, kind: "live" }));
+  assert(isLiveBroadcast({ channel: "c", live: true, kind: "" }));
+  assert(!isLiveBroadcast({ channel: "c", live: true, kind: "rerun" }));
+  assert(!isLiveBroadcast({ channel: "c", live: true, kind: "playlist" }));
+  assert(!isLiveBroadcast({ channel: "c", live: false, kind: "" }));
+});
+
+Deno.test("applySessionEvent: connect, subscribe, retry, reconnect", () => {
+  let s: EventSubSessionState = {
+    session: "idle",
+    sessionError: null,
+    subscriptions: null,
+  };
+  s = applySessionEvent(s, { kind: "connecting" });
+  assertEquals(s.session, "connecting");
+  s = applySessionEvent(s, { kind: "connected" });
+  s = applySessionEvent(s, {
+    kind: "subscribed",
+    active: 7,
+    wanted: 8,
+    failed: ["channel.cheer"],
+  });
+  assertEquals(s, {
+    session: "connected",
+    sessionError: null,
+    subscriptions: { active: 7, wanted: 8, failed: ["channel.cheer"] },
+  });
+  s = applySessionEvent(s, { kind: "retrying", error: "socket closed" });
+  assertEquals(s.session, "retrying");
+  assertEquals(s.sessionError, "socket closed");
+  // Reconnecting keeps the error on show until the welcome arrives, and the
+  // last subscription tally throughout.
+  s = applySessionEvent(s, { kind: "connecting" });
+  assertEquals(s.sessionError, "socket closed");
+  assertEquals(s.subscriptions?.active, 7);
+  s = applySessionEvent(s, { kind: "connected" });
+  assertEquals(s.sessionError, null);
 });

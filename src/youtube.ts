@@ -55,6 +55,22 @@ export const BACKLOG_WINDOW_MS = 5 * 60_000;
  *  pool dry. */
 export const MAX_GOVERNED_POLL_MS = 10 * 60_000;
 
+/** After a go-live hint (see liveHint) offline discovery ticks this often… */
+export const BOOST_TICK_MS = 20_000;
+/** …for this long: ≈15 ticks, ≈30 units per offline channel. */
+export const BOOST_DURATION_MS = 5 * 60_000;
+/** Boosts started per Pacific day, whoever sends the hints: 12 × ≈30 units is
+ *  ≈360 per channel, under 4% of the default pool. */
+export const BOOST_DAILY_CAP = 12;
+/** How far into a boost its one early search may fire. The hint usually lands
+ *  the moment the encoder starts, before YouTube has turned the broadcast
+ *  live; the playlist ticks are cheap and repeat, the search is a single shot,
+ *  so it waits until the cheap path has had a few tries. */
+export const BOOST_SEARCH_DELAY_MS = 60_000;
+/** An "offline" hint re-verifies the attached chats at most this often, so a
+ *  sender stuck repeating it costs 1 unit a minute, not one per request. */
+export const HINT_VERIFY_SPACING_MS = 60_000;
+
 const HOUR_MS = 3_600_000;
 const DAY_MS = 24 * HOUR_MS;
 const UNIT_COST = 1; // channels / playlistItems / videos .list
@@ -153,6 +169,10 @@ export interface YtFailure {
   status: number;
   reason: string;
   message: string;
+  /** Set when the API refused this key or its project (invalid, expired,
+   *  API not enabled, a key restriction) — a different key might work, where
+   *  any other "denied" is about the request. */
+  keyRefused?: true;
 }
 
 export type YtResult<T> = { ok: true; data: T } | YtFailure;
@@ -169,7 +189,8 @@ const RATE_REASONS = new Set([
   "userRateLimitExceeded",
   "userRequestsExceedRateLimit",
 ]);
-const DENIED_REASONS = new Set([
+// Refusals of the key itself or of its Google project.
+const KEY_REASONS = new Set([
   "keyInvalid",
   "keyExpired",
   "API_KEY_INVALID",
@@ -180,9 +201,8 @@ const DENIED_REASONS = new Set([
   "API_KEY_HTTP_REFERRER_BLOCKED",
   "API_KEY_IP_ADDRESS_BLOCKED",
   "API_KEY_SERVICE_BLOCKED",
-  "forbidden",
-  "badRequest",
 ]);
+const DENIED_REASONS = new Set([...KEY_REASONS, "forbidden", "badRequest"]);
 
 const str = (v: unknown): string => (typeof v === "string" ? v : "");
 const records = (v: unknown): Record<string, unknown>[] =>
@@ -205,7 +225,7 @@ export function classifyYtError(
   status: number,
   bodyText: string,
   liveChat = false,
-): { kind: YtErrorKind; reason: string; message: string } {
+): { kind: YtErrorKind; reason: string; message: string; keyRefused?: true } {
   let err: Record<string, unknown> | null = null;
   try {
     const o = JSON.parse(bodyText);
@@ -258,6 +278,9 @@ export function classifyYtError(
   // day's quota is gone" (that would park the channel until midnight).
   if (has(RATE_REASONS)) return out("rateLimited");
   if (domains.includes("youtube.quota")) return out("quotaDaily");
+  // Google's "API key not valid" 400 says `badRequest` in errors[] and names
+  // the key only in details[], so the key reasons are matched across both.
+  if (has(KEY_REASONS)) return { ...out("denied"), keyRefused: true };
   if (has(DENIED_REASONS) || status >= 400) return out("denied");
   return out("transient");
 }
@@ -343,6 +366,7 @@ export async function ytFetch<T>(
       keyParam(url),
     ),
   };
+  if (c.keyRefused && !netError) fail.keyRefused = true;
   if (!signal?.aborted) {
     log(
       `[YouTube] GET ${redactUrl(url)} → ${
@@ -416,6 +440,10 @@ export interface QuotaSnapshot {
   lastSearchAt: number | null;
   /** keyFingerprint of the key this day's spend was counted against. */
   keyFp: string | null;
+  /** Go-live boosts started today (see liveHint; capped at BOOST_DAILY_CAP). */
+  boosts: number;
+  /** When the latest boost started; it runs for BOOST_DURATION_MS. */
+  boostAt: number | null;
 }
 
 export function freshQuota(
@@ -431,6 +459,8 @@ export function freshQuota(
     liveMs: 0,
     lastSearchAt: null,
     keyFp,
+    boosts: 0,
+    boostAt: null,
   };
 }
 
@@ -457,6 +487,10 @@ export function normalizeQuotaSnapshot(
     liveMs: num(r.liveMs),
     lastSearchAt: typeof r.lastSearchAt === "number" ? r.lastSearchAt : null,
     keyFp,
+    boosts: num(r.boosts),
+    boostAt: typeof r.boostAt === "number" && Number.isFinite(r.boostAt)
+      ? r.boostAt
+      : null,
   };
 }
 
@@ -526,12 +560,30 @@ export function searchSpacingMs(
   return Math.max(SEARCH_MIN_SPACING_MS, msUntilMidnight / remaining);
 }
 
-/** Whether the shared search gate is open at `nowMs`. */
+/** Whether a go-live boost is running at `nowMs` (never while the pool is
+ *  exhausted: a boost can't outrun the quota park). */
+export function boostActive(q: QuotaSnapshot, nowMs: number): boolean {
+  if (q.boostAt === null || q.exhausted) return false;
+  const age = nowMs - q.boostAt;
+  return age >= 0 && age < BOOST_DURATION_MS;
+}
+
+/** Whether the running boost still holds its one early search: it becomes due
+ *  BOOST_SEARCH_DELAY_MS in, and any search from then on uses it up. Derived
+ *  from the ledger alone, so a restart mid-boost can't grant it twice. */
+export function earlySearchDue(q: QuotaSnapshot, nowMs: number): boolean {
+  if (q.boostAt === null || !boostActive(q, nowMs)) return false;
+  const from = q.boostAt + BOOST_SEARCH_DELAY_MS;
+  return nowMs >= from && (q.lastSearchAt === null || q.lastSearchAt < from);
+}
+
+/** Whether the shared search gate is open at `nowMs`. A boost's early search
+ *  skips the spacing only — never the block, the exhausted pool or the cap. */
 export function searchGateOpen(q: QuotaSnapshot, nowMs: number): boolean {
   if (q.searchBlocked || q.exhausted || q.searches >= SEARCH_DAILY_CAP) {
     return false;
   }
-  if (q.lastSearchAt === null) return true;
+  if (q.lastSearchAt === null || earlySearchDue(q, nowMs)) return true;
   return nowMs - q.lastSearchAt >=
     searchSpacingMs(q.searches, msUntilPacificMidnight(nowMs));
 }
@@ -548,6 +600,8 @@ export interface QuotaLedger {
   /** Returns true when this call marked it (false: already exhausted). */
   markExhausted(): boolean;
   addLiveMs(ms: number): void;
+  /** Start a go-live boost now; it counts toward BOOST_DAILY_CAP. */
+  noteBoost(): void;
   searchAllowed(): boolean;
   /** The governed chat interval with `chats` live and `watching` channels
    *  watched in all (each needs its discovery reserve; default 1). */
@@ -617,6 +671,12 @@ export function createQuotaLedger(opts: {
     addLiveMs(ms) {
       if (!(ms > 0)) return;
       cur().liveMs += ms;
+      changed();
+    },
+    noteBoost() {
+      const s = cur();
+      s.boosts++;
+      s.boostAt = now();
       changed();
     },
     searchAllowed: () => searchGateOpen(cur(), now()),
@@ -920,6 +980,25 @@ const sleep: SleepFn = (ms, signal) =>
     signal?.addEventListener("abort", onAbort, { once: true });
   });
 
+/** Why a channel is not being checked on its usual cadence. */
+export type ChannelPark = "exhausted" | "denied" | null;
+
+/** Where one channel's poller stands — what GET /api/status reports. */
+export interface ChannelReport {
+  state: ChannelState;
+  /** Why it entered that state: the text of its last transition's log line. */
+  reason: string;
+  /** When it entered it (epoch ms). */
+  since: number;
+  /** Parked until Pacific midnight (quota) or on the 10 min key retry. */
+  parked: ChannelPark;
+  /** The broadcast whose chat is attached right now, else null. */
+  videoId: string | null;
+  /** When discovery last finished a check / when the next one is due. */
+  checkedAt: number | null;
+  nextCheckAt: number | null;
+}
+
 export interface YouTubeRuntime {
   readonly ledger: QuotaLedger;
   readonly now: () => number;
@@ -931,6 +1010,18 @@ export interface YouTubeRuntime {
   readonly channels: Map<string, ChannelCache>;
   /** Labels whose chat is being polled right now (they split the budget). */
   readonly active: Set<string>;
+  /** Per-channel poller state, keyed like `channels`. */
+  readonly reports: Map<string, ChannelReport>;
+  /** One wake callback per offline discovery sleep / per chat-poll sleep in
+   *  progress: how a hint cuts them short (see liveHint). */
+  readonly discoveryWakers: Set<() => void>;
+  readonly chatWakers: Set<() => void>;
+  /** Labels whose attached chat an "offline" hint asked to verify now. */
+  readonly verifyNow: Set<string>;
+  /** When an "offline" hint last asked for that (rate limit), else null. */
+  readonly hint: { verifyAt: number | null };
+  /** Told when the API refuses `key` itself (see YtFailure.keyRefused). */
+  readonly onKeyRefused?: (key: string, failure: YtFailure) => void;
 }
 
 export interface YouTubeRuntimeOptions {
@@ -945,6 +1036,8 @@ export interface YouTubeRuntimeOptions {
   fetch?: FetchFn;
   random?: () => number;
   log?: LogFn;
+  /** Fired each time the API refuses the key a poller is using. */
+  onKeyRefused?: (key: string, failure: YtFailure) => void;
 }
 
 /** The state a poller keeps across generations, plus its injectable clock,
@@ -968,6 +1061,278 @@ export function createYouTubeRuntime(
     log: opts.log ?? defaultLog,
     channels: new Map(),
     active: new Set(),
+    reports: new Map(),
+    discoveryWakers: new Set(),
+    chatWakers: new Set(),
+    verifyNow: new Set(),
+    hint: { verifyAt: null },
+    onKeyRefused: opts.onKeyRefused,
+  };
+}
+
+function channelReport(rt: YouTubeRuntime, label: string): ChannelReport {
+  let r = rt.reports.get(label);
+  if (!r) {
+    r = {
+      state: "connecting",
+      reason: "starting",
+      since: rt.now(),
+      parked: null,
+      videoId: null,
+      checkedAt: null,
+      nextCheckAt: null,
+    };
+    rt.reports.set(label, r);
+  }
+  return r;
+}
+
+/**
+ * `rt.sleep` that a hint can also cut short; resolves true when a hint did
+ * (false: slept out, or the generation was torn down). Each sleeper registers
+ * one wake callback in `wakers` for as long as it sleeps and takes it — and
+ * its abort listener — away on waking, so neither the set nor a generation's
+ * signal (which can live for months) collects one entry per poll.
+ */
+async function hintableSleep(
+  rt: YouTubeRuntime,
+  wakers: Set<() => void>,
+  ms: number,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (signal?.aborted) return false;
+  const local = new AbortController();
+  let woken = false;
+  const wake = () => {
+    woken = true;
+    local.abort();
+  };
+  const stop = () => local.abort();
+  signal?.addEventListener("abort", stop, { once: true });
+  wakers.add(wake);
+  try {
+    await rt.sleep(ms, local.signal);
+  } finally {
+    wakers.delete(wake);
+    signal?.removeEventListener("abort", stop);
+  }
+  return woken;
+}
+
+// ---- Go-live hint ----------------------------------------------------------------
+//
+// Discovery finds a stream by itself within a tick (or, for a channel whose
+// live video only shows up in search, within a search slot). Something that
+// already knows the stream started — the encoder's own "streaming started"
+// event, Twitch's stream.online — can shorten that wait. It is only ever a
+// hint: it changes when the poller looks, never what it concludes.
+
+export type LiveHintEffect =
+  | "boost" // discovery woken; ticking fast for BOOST_DURATION_MS
+  | "coalesced" // already inside a boost / a verify was just asked for
+  | "capped" // the day's boosts are used up
+  | "parked" // quota exhausted, or the key is refused: nothing to speed up
+  | "attached" // every watched channel is already on its live chat
+  | "verify" // the attached chats are being re-verified now
+  | "idle"; // nothing is watched / no chat is attached
+
+export interface LiveHintResult {
+  state: "live" | "offline";
+  effect: LiveHintEffect;
+  message: string;
+}
+
+function wakeAll(wakers: Set<() => void>): void {
+  for (const wake of [...wakers]) wake();
+}
+
+/**
+ * Act on a hint that the stream just went `live` or `offline`. Returns at
+ * once; the pollers do the work.
+ *
+ * "live" starts a boost: sleeping offline channels are woken and tick every
+ * BOOST_TICK_MS for BOOST_DURATION_MS, with one early search (see
+ * earlySearchDue). Hints inside a running boost coalesce into it, and at most
+ * BOOST_DAILY_CAP boosts start per Pacific day (counted in the ledger, so the
+ * cap survives a restart). "offline" makes the attached chats ask videos.list
+ * now instead of at their next periodic check.
+ *
+ * Neither marks a channel live or detaches a chat by itself, wakes a channel
+ * out of the quota or key park, opens a blocked or capped search, resets the
+ * ledger, or restarts the poller generation.
+ */
+export function liveHint(
+  rt: YouTubeRuntime,
+  state: "live" | "offline",
+  source = "",
+): LiveHintResult {
+  const now = rt.now();
+  const from = source ? ` (${source})` : "";
+  const done = (effect: LiveHintEffect, message: string): LiveHintResult => ({
+    state,
+    effect,
+    message,
+  });
+
+  if (state === "offline") {
+    const attached = [...rt.active];
+    if (attached.length === 0) {
+      return done("idle", "no live chat is attached — nothing to verify");
+    }
+    const last = rt.hint.verifyAt;
+    if (
+      last !== null && now - last >= 0 && now - last < HINT_VERIFY_SPACING_MS
+    ) {
+      return done(
+        "coalesced",
+        `the attached chat was re-verified ${
+          Math.round((now - last) / 1000)
+        }s ago — not asking again yet`,
+      );
+    }
+    rt.hint.verifyAt = now;
+    for (const label of attached) rt.verifyNow.add(label);
+    wakeAll(rt.chatWakers);
+    rt.log(
+      `[YouTube] offline hint${from} — verifying ${
+        attached.join(", ")
+      } now instead of at the next periodic check`,
+    );
+    return done(
+      "verify",
+      `verifying ${attached.length} attached chat(s) with videos.list now`,
+    );
+  }
+
+  const q = rt.ledger.snapshot();
+  if (q.exhausted) {
+    return done(
+      "parked",
+      "daily YouTube API quota exhausted — nothing is checked until 00:00 PT " +
+        `(in ${formatDuration(msUntilPacificMidnight(now))})`,
+    );
+  }
+  const waiting = [...rt.reports].filter(([label]) => !rt.active.has(label));
+  if (rt.reports.size === 0) {
+    return done("idle", "no YouTube channel is being watched");
+  }
+  if (waiting.length === 0) {
+    return done(
+      "attached",
+      "every watched channel is already on its live chat",
+    );
+  }
+  if (waiting.every(([, r]) => r.parked !== null)) {
+    return done(
+      "parked",
+      waiting.some(([, r]) => r.parked === "denied")
+        ? "the API key is being refused — discovery stays on its 10 min retry"
+        : "discovery is still waiting out the quota park",
+    );
+  }
+  if (boostActive(q, now)) {
+    return done(
+      "coalesced",
+      `already checking every ${BOOST_TICK_MS / 1000}s for another ${
+        Math.ceil((q.boostAt! + BOOST_DURATION_MS - now) / 1000)
+      }s`,
+    );
+  }
+  if (q.boosts >= BOOST_DAILY_CAP) {
+    return done(
+      "capped",
+      `all ${BOOST_DAILY_CAP} of today's boosts are used — discovery stays ` +
+        `on its ${DISCOVERY_TICK_MS / 60_000} min tick`,
+    );
+  }
+  rt.ledger.noteBoost();
+  wakeAll(rt.discoveryWakers);
+  const message = `checking now and every ${BOOST_TICK_MS / 1000}s for ${
+    BOOST_DURATION_MS / 60_000
+  } min (boost ${q.boosts + 1}/${BOOST_DAILY_CAP} today)`;
+  rt.log(`[YouTube] go-live hint${from} — ${message}`);
+  return done("boost", message);
+}
+
+/** The poller's state as GET /api/status reports it (no key material: the
+ *  ledger's `keyFp` is the one-way keyFingerprint). */
+export interface YouTubeRuntimeStatus {
+  quota: QuotaSnapshot & {
+    dailyQuota: number;
+    budgetHours: number;
+    /** Epoch ms of the next 00:00 PT — when both buckets reset. */
+    resetsAt: number;
+  };
+  /** Why detection is held back, if it is: the pool is spent (everything
+   *  waits for `until`), the key is refused (10 min retries), or only the
+   *  search fallback is blocked (playlist detection continues). */
+  parked: {
+    reason: "exhausted" | "denied" | "search-blocked";
+    until: number | null;
+    detail: string;
+  } | null;
+  boost: {
+    active: boolean;
+    until: number | null;
+    usedToday: number;
+    dailyCap: number;
+    /** The running boost's early search: not due yet, due, or spent. */
+    earlySearch: "waiting" | "due" | "done" | null;
+  };
+  channels: (ChannelReport & { name: string })[];
+}
+
+export function youtubeRuntimeStatus(rt: YouTubeRuntime): YouTubeRuntimeStatus {
+  const now = rt.now();
+  const q = rt.ledger.snapshot();
+  const resetsAt = now + msUntilPacificMidnight(now);
+  const channels = [...rt.reports].map(([name, r]) => ({ name, ...r }));
+  const denied = channels.filter((c) => c.parked === "denied");
+  let parked: YouTubeRuntimeStatus["parked"] = null;
+  if (q.exhausted) {
+    parked = {
+      reason: "exhausted",
+      until: resetsAt,
+      detail: "daily YouTube API quota exhausted — resuming at 00:00 PT",
+    };
+  } else if (denied.length > 0) {
+    const next = denied.map((c) => c.nextCheckAt).filter((t) => t !== null);
+    parked = {
+      reason: "denied",
+      until: next.length ? Math.min(...next) : null,
+      detail: denied[0].reason,
+    };
+  } else if (q.searchBlocked) {
+    parked = {
+      reason: "search-blocked",
+      until: resetsAt,
+      detail: "search.list's daily bucket is spent — live detection " +
+        "continues via uploads playlists",
+    };
+  }
+  const active = boostActive(q, now);
+  return {
+    quota: {
+      ...q,
+      dailyQuota: rt.ledger.dailyQuota,
+      budgetHours: rt.ledger.budgetHours,
+      resetsAt,
+    },
+    parked,
+    boost: {
+      active,
+      until: active ? q.boostAt! + BOOST_DURATION_MS : null,
+      usedToday: q.boosts,
+      dailyCap: BOOST_DAILY_CAP,
+      earlySearch: !active
+        ? null
+        : earlySearchDue(q, now)
+        ? "due"
+        : now < q.boostAt! + BOOST_SEARCH_DELAY_MS
+        ? "waiting"
+        : "done",
+    },
+    channels,
   };
 }
 
@@ -1033,6 +1398,7 @@ interface ChannelCtx {
   emitter: Emitter;
   rt: YouTubeRuntime;
   cache: ChannelCache;
+  report: ChannelReport;
   signal?: AbortSignal;
   status: (state: ChannelState, why: string) => void;
 }
@@ -1317,12 +1683,25 @@ async function pollChat(
   let interval = DEFAULT_POLL_MS;
 
   rt.active.add(ctx.label);
+  ctx.report.videoId = videoId;
+  ctx.report.nextCheckAt = null;
   ctx.status(
     "live",
     `polling live chat (video ${videoId}, found via ${via}${
       token ? ", resuming" : ""
     })`,
   );
+  // One videos.list check of the attached broadcast; a non-null result ends
+  // the chat (it is over, or the pool is spent).
+  const verifyNow = async (): Promise<ChatEnd | null> => {
+    lastVerify = rt.now();
+    const v = await verifyChat(ctx, videoId, chatId);
+    if (signal?.aborted) return { why: "aborted" };
+    if (v === "quota") return { why: "quota" };
+    if (v === "live") return null;
+    forgetChat(cache, chatId, rt.now());
+    return { why: "ended", detail: v };
+  };
   try {
     while (!signal?.aborted) {
       if (rt.ledger.snapshot().exhausted) return { why: "quota" };
@@ -1424,6 +1803,8 @@ async function pollChat(
       );
       const now = rt.now();
       let verify = now - lastVerify >= LIVE_VERIFY_MS;
+      // An "offline" hint that arrived mid-poll (see liveHint).
+      if (rt.verifyNow.delete(ctx.label)) verify = true;
       if (page.offlineAt) {
         // Stream offline: ended for good, or an encoder blip? Ask videos.list
         // now (then at most once a minute) and slow down meanwhile.
@@ -1434,19 +1815,30 @@ async function pollChat(
         }
       }
       if (verify) {
-        lastVerify = now;
-        const v = await verifyChat(ctx, videoId, chatId);
-        if (signal?.aborted) break;
-        if (v === "quota") return { why: "quota" };
-        if (v !== "live") {
-          forgetChat(cache, chatId, rt.now());
-          return { why: "ended", detail: v };
-        }
+        const end = await verifyNow();
+        if (end) return end;
       }
-      await rt.sleep(interval, signal);
+      // Sleep the interval out. An "offline" hint cuts in to verify, then the
+      // rest of the interval is slept: the chat itself is never polled early
+      // (YouTube refuses a chat polled before its interval is up). Only a
+      // hint's wake loops here, so a clock that stands still can't spin it.
+      let left = interval;
+      while (left > 0) {
+        const from = rt.now();
+        const woken = await hintableSleep(rt, rt.chatWakers, left, signal);
+        if (signal?.aborted || !woken) break;
+        // A wake meant for another channel's chat just goes back to sleep.
+        if (rt.verifyNow.delete(ctx.label)) {
+          const end = await verifyNow();
+          if (end) return end;
+        }
+        left -= Math.max(0, rt.now() - from);
+      }
     }
   } finally {
     rt.active.delete(ctx.label);
+    rt.verifyNow.delete(ctx.label);
+    ctx.report.videoId = null;
   }
   return { why: "aborted" };
 }
@@ -1465,11 +1857,29 @@ export async function pollYouTubeChannel(
   signal?: AbortSignal,
 ): Promise<void> {
   const label = youtubeLabel(ch);
+  const report = channelReport(rt, label);
   let last: ChannelState | null = null;
-  const status = (state: ChannelState, why: string, force = false) => {
+  const status = (
+    state: ChannelState,
+    why: string,
+    force = false,
+    parked: ChannelPark = null,
+  ) => {
     if (signal?.aborted) return; // a torn-down generation stays silent
-    if (state === last && !force) return;
+    if (state === last && !force) {
+      // Same dot, new cause (failing polls → a refused key): the report
+      // follows, the log and the sidebar already said "error".
+      if (parked !== report.parked) {
+        report.parked = parked;
+        report.reason = why;
+      }
+      return;
+    }
     last = state;
+    report.state = state;
+    report.reason = why;
+    report.since = rt.now();
+    report.parked = parked;
     rt.log(
       `[YouTube] ${label}: ${state} — ${why}`,
       state === "error" ? "error" : "info",
@@ -1483,8 +1893,14 @@ export async function pollYouTubeChannel(
     emitter,
     rt,
     cache: channelCache(rt, label),
+    report,
     signal,
     status,
+  };
+  // A key the API refuses outright is reported, so the owner of the key can
+  // fall back to another one (see the key manager in main.ts).
+  const keyRefused = (failure: YtFailure) => {
+    if (failure.keyRefused && !signal?.aborted) rt.onKeyRefused?.(key, failure);
   };
 
   // Transient discovery failures in a row, and the back-off before the next.
@@ -1494,6 +1910,9 @@ export async function pollYouTubeChannel(
   status("connecting", "looking for a live stream");
   while (!signal?.aborted) {
     let wait: number;
+    // Only the plain offline wait may be cut short or sped up by a go-live
+    // hint; the back-offs and the key retry keep their own pace.
+    let hintable = false;
     try {
       if (rt.ledger.snapshot().exhausted) {
         const left = msUntilPacificMidnight(rt.now());
@@ -1503,11 +1922,12 @@ export async function pollYouTubeChannel(
             formatDuration(left)
           })`,
           true,
+          "exhausted",
         );
-        await rt.sleep(
-          left + QUOTA_JITTER_MIN_MS + rt.random() * QUOTA_JITTER_SPAN_MS,
-          signal,
-        );
+        const park = left + QUOTA_JITTER_MIN_MS +
+          rt.random() * QUOTA_JITTER_SPAN_MS;
+        report.nextCheckAt = rt.now() + park;
+        await rt.sleep(park, signal);
         if (signal?.aborted) break;
         status("connecting", "new quota day — looking for a live stream");
         continue;
@@ -1515,6 +1935,7 @@ export async function pollYouTubeChannel(
 
       const d = await discover(ctx);
       if (signal?.aborted) break;
+      report.checkedAt = rt.now();
       if (d.kind !== "failed") {
         failures = 0;
         backoff = TRANSIENT_BASE_MS;
@@ -1527,8 +1948,11 @@ export async function pollYouTubeChannel(
           status(
             "error",
             `liveChatMessages.list failed (${end.failure.reason}: ${end.failure.message}) — retrying in 10m`,
+            false,
+            "denied",
           );
           wait = DENIED_RETRY_MS;
+          keyRefused(end.failure);
         } else {
           status(
             "offline",
@@ -1542,13 +1966,18 @@ export async function pollYouTubeChannel(
           d.soon ? "not live yet (a scheduled stream is due)" : "not live",
         );
         wait = d.soon ? UPCOMING_TICK_MS : DISCOVERY_TICK_MS;
+        hintable = true;
+        if (boostActive(rt.ledger.snapshot(), rt.now())) {
+          wait = Math.min(wait, BOOST_TICK_MS);
+        }
       } else {
         if (d.failure.kind === "quotaDaily") continue;
         const what =
           `${d.step} failed (${d.failure.reason}: ${d.failure.message})`;
         if (d.failure.kind === "denied") {
           wait = DENIED_RETRY_MS;
-          status("error", `${what} — retrying in 10m`);
+          status("error", `${what} — retrying in 10m`, false, "denied");
+          keyRefused(d.failure);
         } else {
           // A blip (5xx, timeout, network, rate limit): retry with back-off,
           // and only turn the dot red once it keeps failing.
@@ -1570,7 +1999,12 @@ export async function pollYouTubeChannel(
       status("error", `unexpected error: ${redactKey(String(e), key)}`);
       wait = ERROR_RETRY_MS;
     }
-    await rt.sleep(wait, signal);
+    report.nextCheckAt = rt.now() + wait;
+    if (hintable) {
+      await hintableSleep(rt, rt.discoveryWakers, wait, signal);
+    } else {
+      await rt.sleep(wait, signal);
+    }
     if (signal?.aborted) break;
     if (last === "error") status("connecting", "retrying");
   }

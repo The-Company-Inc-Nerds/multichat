@@ -13,6 +13,7 @@ import {
   emptyCampaign,
   emptyPool,
   findEntrants,
+  GIVEAWAY_FILE_SHAPE,
   type GiveawayAction,
   type GiveawayEntry,
   giveawayMessage,
@@ -875,4 +876,46 @@ Deno.test("removeByNeedle: removes one, refuses a miss or an ambiguous match", (
   assertEquals(miss.removed, null);
   assertEquals(miss.matches, []);
   assertEquals(miss.state.entrants.length, 2);
+});
+
+Deno.test("GIVEAWAY_FILE_SHAPE: every file an earlier version wrote still loads", () => {
+  const ok = (k: keyof typeof GIVEAWAY_FILE_SHAPE, raw: string) =>
+    GIVEAWAY_FILE_SHAPE[k](JSON.parse(raw));
+  // What the engine writes today.
+  let pool = emptyPool();
+  for (let i = 0; i < 1000; i++) {
+    pool = addEntrant(pool, {
+      userId: String(i),
+      login: `u${i}`,
+      displayName: `U${i}`,
+      enteredAt: i,
+    }).state;
+  }
+  const bare = JSON.stringify(pool);
+  assert(ok("pool", bare));
+  assertEquals(normalizePoolState(JSON.parse(bare))?.entrants.length, 1000);
+  assert(ok("campaign", JSON.stringify(emptyCampaign())));
+  assert(ok("packs", "{}"));
+  assert(ok("turns", "[]"));
+  assert(ok("plan", serializePlan(null))); // "no plan" is saved as null
+  // A pre-campaign pool (no entry numbers): accepted, then migrated.
+  const legacy = '{"open":true,"entrants":[{"userId":"1","login":"a"}]}';
+  assert(ok("pool", legacy));
+  assertEquals(normalizePoolState(JSON.parse(legacy))?.entrants[0].number, 1);
+  // An emptied plan is still a plan file.
+  assert(ok("plan", '{"seed":1,"order":[]}'));
+});
+
+Deno.test("GIVEAWAY_FILE_SHAPE: a torn or foreign file is not trusted", () => {
+  const bad = (k: keyof typeof GIVEAWAY_FILE_SHAPE, v: unknown) =>
+    !GIVEAWAY_FILE_SHAPE[k](v);
+  assert(bad("pool", {}));
+  assert(bad("pool", null));
+  assert(bad("pool", { entrants: "x" }));
+  assert(bad("campaign", []));
+  assert(bad("campaign", null));
+  assert(bad("packs", []));
+  assert(bad("turns", {}));
+  assert(bad("plan", {}));
+  assert(bad("plan", []));
 });

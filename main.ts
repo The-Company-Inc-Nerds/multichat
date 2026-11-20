@@ -30,19 +30,26 @@ import {
 import {
   createYouTubeRuntime,
   keyFingerprint,
+  liveHint,
   normalizeYouTubeConfig,
   startYouTubePoller,
+  youtubeLabel,
   type YouTubeRuntime,
+  youtubeRuntimeStatus,
+  type YtFailure,
 } from "./src/youtube.ts";
 import { createServer } from "./src/server.ts";
 import { normalizeAlertsConfig } from "./src/alerts.ts";
 import {
+  applySessionEvent,
   type EventSubChannelContext,
   type FollowEvent,
   type FollowHandler,
+  isLiveBroadcast,
   type RedemptionEvent,
   type RedemptionHandler,
   startTwitchEventSub,
+  type StreamHandler,
 } from "./src/eventsub.ts";
 import {
   buildAuthCodeRequest,
@@ -60,6 +67,7 @@ import {
   buildUpdateRedemptionStatusRequest,
   buildUsersRequest,
   CHAT_WRITE_SCOPE,
+  chooseRefreshToken,
   type HelixResult,
   type HttpRequest,
   LOGIN_SCOPES,
@@ -73,7 +81,9 @@ import {
   parseUsersResponse,
   REDEMPTIONS_MANAGE_SCOPE,
   resolveAppCredentials,
+  shouldRetryWithSeed,
   type SubscriptionFeature,
+  twitchSeedEnvVar,
 } from "./src/twitchauth.ts";
 import {
   type BadgeArt,
@@ -146,6 +156,8 @@ import {
   type ChannelPointsHooks,
   channelPointsLedgerPath,
   channelPointsRewardsPath,
+  createStateWriter,
+  decodeStateFile,
   giveawayCampaignStatePath,
   type GiveawayHooks,
   giveawayPacksStatePath,
@@ -156,15 +168,26 @@ import {
   isStaleStateTmp,
   keyStatePath,
   type KeyUpdateResult,
+  type LiveSignal,
+  type LiveSignalResult,
   normalizeControlAccess,
   quarantinePath,
-  resolveStartupKey,
+  resolveStartupKeySource,
   resolveStateDir,
   stateTmpPath,
   twitchBroadcasterStatePath,
   twitchTokenStatePath,
   youtubeQuotaStatePath,
 } from "./src/control.ts";
+import {
+  type EventSubChannelStatus,
+  type EventSubStatus,
+  formatStatus,
+  keySourceText,
+  type ServerStatus,
+  type YouTubeKeySource,
+  type YouTubeStatus,
+} from "./src/status.ts";
 import {
   activeTurn,
   buildTurnReport,
@@ -207,6 +230,7 @@ import {
   drawSegmented,
   emptyCampaign,
   emptyPool,
+  GIVEAWAY_FILE_SHAPE,
   type GiveawayAction,
   giveawayMessage,
   hasEntrant,
@@ -336,25 +360,18 @@ async function ensureStateDir(dir: string | null): Promise<string | null> {
   }
 }
 
-/** Best-effort persist a value to a state file (0600). Never throws — a failure
- *  just means it won't survive a restart, matching the YouTube key's behavior. */
-async function persistState(path: string, value: string): Promise<void> {
-  try {
-    await Deno.writeTextFile(path, value, { mode: 0o600 });
-  } catch (e) {
-    console.error(`[Control] Could not persist ${path}: ${e}`);
-  }
-}
-
 let atomicWriteSeq = 0;
 
 /**
- * Crash-safe variant of persistState for state that must never come back torn
- * (the channel-points ledger holds the only record of viewers' points in
- * flight): write a uniquely named temp file beside `path`, fsync it, then
- * rename it over `path` — a reader, or the next boot after a SIGKILL or power
- * loss mid-write, sees the old file or the new one, never half of one. Never
- * throws; a failure is logged and the temp file removed.
+ * Persist a value to a state file (0600) so that it can never come back torn —
+ * every state file goes through here: the channel-points ledger holds the only
+ * record of viewers' points in flight, the giveaway pool a queue of entrants,
+ * and an empty Twitch token file used to switch EventSub off for good. Write a
+ * uniquely named temp file beside `path`, fsync it, then rename it over `path`:
+ * a reader, or the next boot after a SIGKILL or power loss mid-write, sees the
+ * old file or the new one, never half of one. Best-effort like all
+ * persistence: never throws; a failure is logged, the temp file removed, and
+ * the value just won't survive a restart.
  */
 async function persistStateAtomic(path: string, value: string): Promise<void> {
   const tmp = stateTmpPath(
@@ -406,6 +423,59 @@ async function sweepStaleTmp(paths: (string | null)[]): Promise<void> {
   }
 }
 
+/**
+ * One writer per state file (see createStateWriter): overlapping changes are
+ * coalesced, and each write is atomic (temp file + fsync + rename), so a
+ * crash, kill or power loss mid-write leaves the previous state, never a torn
+ * file. A no-op without a path (no state directory: in-memory only).
+ */
+function stateWriter(
+  path: string | null,
+  snapshot: () => string,
+): { (): void; flush: () => Promise<void> } {
+  if (!path) return Object.assign(() => {}, { flush: async () => {} });
+  return createStateWriter(
+    (value) => persistStateAtomic(path, value),
+    snapshot,
+  );
+}
+
+/**
+ * Read one JSON state file back: "missing" on a first run; "corrupt" for
+ * anything that isn't the expected JSON shape (a torn or empty file from a
+ * crash, a hand edit gone wrong) — that file is moved aside, kept for
+ * inspection instead of being overwritten by the next write, and reported
+ * loudly under `tag`, so the caller falls back on purpose rather than silently
+ * starting empty.
+ */
+async function readState(
+  tag: string,
+  path: string,
+  what: string,
+  shapeOk: (v: unknown) => boolean,
+): Promise<
+  { kind: "ok"; value: unknown } | { kind: "missing" } | { kind: "corrupt" }
+> {
+  let raw: string;
+  try {
+    raw = await Deno.readTextFile(path);
+  } catch (e) {
+    if (e instanceof Deno.errors.NotFound) return { kind: "missing" };
+    console.error(`[${tag}] !!! could not read the ${what} (${path}): ${e}`);
+    return { kind: "corrupt" };
+  }
+  const decoded = decodeStateFile(raw, shapeOk);
+  if (decoded) return { kind: "ok", value: decoded.value };
+  const aside = quarantinePath(path, Date.now());
+  const moved = await Deno.rename(path, aside).then(() => true, () => false);
+  console.error(
+    `[${tag}] !!! the ${what} (${path}) is corrupt${
+      moved ? ` — moved aside to ${aside}` : " and could not be moved aside"
+    }.`,
+  );
+  return { kind: "corrupt" };
+}
+
 /** Best-effort append one line to a state file (0600) — the winners JSONL.
  *  Append-only means a crash can corrupt at most the trailing line. */
 async function appendState(path: string, line: string): Promise<void> {
@@ -431,6 +501,13 @@ const YT_QUOTA_PERSIST_MS = 30_000;
  * resumes the chat instead of replaying it. A key whose fingerprint differs
  * from the ledger's may belong to another Google project: today restarts from
  * zero for it.
+ *
+ * It also knows where the key came from. A runtime key (persisted, or set on
+ * this run) outranks the one the deployment declares, which is right until the
+ * runtime key goes stale: the API then refuses every call while a good key
+ * sits unused in the environment. So when the poller reports its key refused
+ * and a different declared key exists, the manager switches to that one —
+ * loudly, and without touching the persisted file.
  */
 function createYouTubeKeyManager(opts: {
   getEmitter: () => Emitter;
@@ -443,8 +520,17 @@ function createYouTubeKeyManager(opts: {
   };
 }) {
   let current = "";
+  let source: YouTubeKeySource | null = null;
+  let declared: { key: string; source: "environment" | "settings" } | null =
+    null;
+  let note: string | null = null;
   let controller: AbortController | null = null;
   let runtime: Promise<YouTubeRuntime> | null = null;
+  // The same runtime once loaded — what the synchronous status and hint paths
+  // read (they must never wait on a ledger read).
+  let live: YouTubeRuntime | null = null;
+  let swept = false;
+  const startedAt = Date.now();
 
   // Load (once) the persisted ledger and build the shared runtime. Writes are
   // throttled to one per YT_QUOTA_PERSIST_MS, serialized, atomic, and flushed
@@ -466,7 +552,7 @@ function createYouTubeKeyManager(opts: {
           }
         }
       }
-      let timer: number | undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
       let chain: Promise<void> = Promise.resolve();
       const write = () => {
         if (!path) return chain;
@@ -486,6 +572,7 @@ function createYouTubeKeyManager(opts: {
             void write();
           }, YT_QUOTA_PERSIST_MS);
         },
+        onKeyRefused: (key, failure) => void fallBack(key, failure),
       });
       if (path) {
         flushOnShutdown(async () => {
@@ -494,27 +581,27 @@ function createYouTubeKeyManager(opts: {
           await write();
         });
       }
+      live = rt;
       return rt;
     })();
     return runtime;
   }
 
+  // Atomic, like every other state file: a power cut mid-write must not leave
+  // an empty key file behind to be read back as "no key" at the next start.
   async function persist(key: string): Promise<void> {
     if (!opts.statePath) return; // in-memory only (no StateDirectory)
-    try {
-      await Deno.writeTextFile(opts.statePath, key, { mode: 0o600 });
-    } catch (e) {
-      // Persistence is best-effort: the key still works for this run, it just
-      // won't survive a restart. Never let it take the server down.
-      console.error(
-        `[Control] Could not persist API key (${opts.statePath}): ${e}`,
-      );
+    if (!swept) {
+      swept = true;
+      await sweepStaleTmp([opts.statePath]);
     }
+    await persistStateAtomic(opts.statePath, key);
   }
 
   async function apply(
     rawKey: string,
     persistKey: boolean,
+    from: YouTubeKeySource = "runtime",
   ): Promise<KeyUpdateResult> {
     const key = rawKey.trim();
     if (!key) return { ok: false, message: "Empty API key" };
@@ -523,6 +610,8 @@ function createYouTubeKeyManager(opts: {
     }
 
     current = key;
+    source = from;
+    if (from === "runtime") note = null;
     if (persistKey) await persist(key);
     const rt = opts.channels.length ? await getRuntime() : null;
     // A newer key arrived while we awaited: that call starts the poller.
@@ -561,7 +650,138 @@ function createYouTubeKeyManager(opts: {
     };
   }
 
-  return { apply };
+  /** The API refused `key` itself (see YtFailure.keyRefused). Only a runtime
+   *  key has anything to fall back to, and only once: the declared key being
+   *  refused as well is simply the poller's 10 min retry. */
+  async function fallBack(key: string, failure: YtFailure): Promise<void> {
+    if (key !== current) return; // an older generation's report
+    if (source !== "persisted" && source !== "runtime") return;
+    if (!declared || declared.key === current) return;
+    const what = source === "persisted"
+      ? "persisted runtime key"
+      : "key set at runtime";
+    const fp = keyFingerprint(current);
+    const to = `${keySourceText(declared.source)}, fingerprint ${
+      keyFingerprint(declared.key)
+    }`;
+    console.error(
+      `[YouTube] !!! The ${what} (fingerprint ${fp}) was refused by the API ` +
+        `(${failure.reason}: ${failure.message}). Switching to the key from ` +
+        `${to}.` +
+        (opts.statePath
+          ? ` The refused key stays in ${opts.statePath} and is tried first ` +
+            "again at the next start — delete that file, or set a working " +
+            "key with `multichat set-youtube-key`, to end this."
+          : ""),
+    );
+    note = `the ${what} (fingerprint ${fp}) was refused (${failure.reason}); ` +
+      `running on the key from ${keySourceText(declared.source)} instead`;
+    await apply(declared.key, false, declared.source);
+  }
+
+  /** Resolve and apply the startup key, saying where it came from — a stale
+   *  persisted key shadowing the deployment's own is otherwise invisible. */
+  async function start(sources: {
+    persisted: string | null;
+    env: string | null;
+    settings: string | null;
+  }): Promise<void> {
+    const r = resolveStartupKeySource(sources);
+    declared = r.declared;
+    if (!r.key || !r.source) {
+      console.log(
+        "YouTube channels configured but no API key yet. " +
+          "Set one on the running server:  multichat set-youtube-key <KEY>",
+      );
+      return;
+    }
+    console.log(
+      `[YouTube] API key from ${keySourceText(r.source)} — fingerprint ${
+        keyFingerprint(r.key)
+      }.`,
+    );
+    if (r.source === "persisted" && declared && declared.key !== r.key) {
+      console.log(
+        `[YouTube] A different key is declared in ${
+          keySourceText(declared.source)
+        } (fingerprint ${
+          keyFingerprint(declared.key)
+        }). The persisted one wins; the declared one is the fallback if the ` +
+          "API refuses it.",
+      );
+    }
+    // persist:false — don't rewrite a file we may have just read it from.
+    await apply(r.key, false, r.source);
+  }
+
+  /** The YouTube half of GET /api/status. Synchronous, no key material. */
+  function status(): YouTubeStatus {
+    const configured = opts.channels.length;
+    const polling = configured > 0 && !!controller &&
+      !controller.signal.aborted;
+    const rs = live ? youtubeRuntimeStatus(live) : null;
+    const reports = new Map(rs?.channels.map((c) => [c.name, c]) ?? []);
+    const waiting = current ? "starting" : "waiting for an API key";
+    return {
+      configured,
+      key: {
+        present: !!current,
+        source: current ? source : null,
+        fingerprint: current ? keyFingerprint(current) : null,
+        note,
+      },
+      polling,
+      quota: rs?.quota ?? null,
+      parked: configured > 0 && !current
+        ? {
+          reason: "keyless",
+          until: null,
+          detail: "no YouTube API key — set one with " +
+            "`multichat set-youtube-key`",
+        }
+        : rs?.parked ?? null,
+      boost: rs?.boost ?? null,
+      channels: opts.channels.map((ch) => {
+        const name = youtubeLabel(ch);
+        return reports.get(name) ?? {
+          name,
+          state: "connecting",
+          reason: waiting,
+          since: startedAt,
+          parked: null,
+          videoId: null,
+          checkedAt: null,
+          nextCheckAt: null,
+        };
+      }),
+    };
+  }
+
+  /** A go-live hint (POST /api/live, Twitch stream.online/offline). Answers
+   *  at once; the pollers act on it (see liveHint in src/youtube.ts). */
+  function liveSignal(sig: LiveSignal): LiveSignalResult {
+    const say = (effect: string, message: string): LiveSignalResult => ({
+      ok: true,
+      state: sig.state,
+      effect,
+      message,
+    });
+    if (opts.channels.length === 0) {
+      return say("unconfigured", "no YouTube channels are configured");
+    }
+    if (!current) {
+      return say(
+        "keyless",
+        "no YouTube API key yet — set one with `multichat set-youtube-key`",
+      );
+    }
+    if (!live || !controller) {
+      return say("idle", "the YouTube poller is still starting");
+    }
+    return { ok: true, ...liveHint(live, sig.state, sig.source) };
+  }
+
+  return { apply, start, status, liveSignal };
 }
 
 /** How long a fetched badge list is trusted before it is refreshed, and the
@@ -802,6 +1022,8 @@ function createTwitchEventSubManager(opts: {
   /** Optional follow observer, forwarded to every channel's EventSub socket
    *  (the giveaway milestone counter). */
   onFollow?: FollowHandler;
+  /** Optional stream on/off observer, forwarded likewise (the go-live hint). */
+  onStream?: StreamHandler;
   /** Optional channel-points engine: only its channel subscribes to the
    *  redemption events (others would 403 on every reconnect without the scope). */
   channelPoints?: ChannelPointsWiring;
@@ -812,12 +1034,15 @@ function createTwitchEventSubManager(opts: {
   // once a channel's broadcaster id + token are fully resolved (see startChannel).
   const channelAuth = new Map<string, ChannelAuth>();
 
+  // One status record per started channel, in config order (GET /api/status).
+  const statuses: EventSubChannelStatus[] = [];
+
   async function startChannel(ch: TwitchEventSubChannelConfig): Promise<void> {
     const login = (ch.login ?? "").toLowerCase();
     const label = login || ch.broadcasterId || "unknown";
 
     let broadcasterId = ch.broadcasterId ?? "";
-    let refreshToken = ch.refreshToken ?? "";
+    let refreshToken = "";
     let accessToken = "";
     let expiresAt = 0;
     let inflight: Promise<string | null> | null = null;
@@ -826,23 +1051,67 @@ function createTwitchEventSubManager(opts: {
     // (null until one reports them) — how a pre-redemptions token is caught.
     let grantedScopes: string[] | null = null;
 
+    const st: EventSubChannelStatus = {
+      login,
+      broadcasterId: broadcasterId || null,
+      token: "pending",
+      tokenSource: null,
+      tokenError: null,
+      tokenRefreshedAt: null,
+      scopes: null,
+      session: "idle",
+      sessionError: null,
+      subscriptions: null,
+      stream: null,
+      streamAt: null,
+    };
+    statuses.push(st);
+
     // If the broadcaster id is known up front (config or cache), we can key the
     // persisted (rotated) refresh token by it and prefer that over settings.
     const bidCachePath = twitchBroadcasterStatePath(opts.stateDir, login);
     if (!broadcasterId && bidCachePath) {
       broadcasterId = (await readKeyFile(bidCachePath)) ?? "";
     }
+    // The seed: what the operator configured — settings.json, or (under the
+    // NixOS module, which blanks it there) the credential exported by id.
+    const seed =
+      ((broadcasterId ? readEnv(twitchSeedEnvVar(broadcasterId)) : "") ||
+        ch.refreshToken || "").trim();
+    let seedTried = false;
+    let persisted: string | null = null;
     if (broadcasterId) {
+      st.broadcasterId = broadcasterId;
       tokenPath = twitchTokenStatePath(opts.stateDir, broadcasterId);
-      const persisted = tokenPath ? await readKeyFile(tokenPath) : null;
-      if (persisted) refreshToken = persisted;
+      if (tokenPath) {
+        await sweepStaleTmp([tokenPath, bidCachePath]);
+        const file = await readTokenFile(tokenPath);
+        persisted = file.kind === "ok" ? file.token : null;
+        // A file that is there but empty or unreadable (a write cut short by a
+        // power loss, a bad restore) used to switch the channel off for good.
+        if (file.kind === "empty" || file.kind === "unreadable") {
+          console.error(
+            `[EventSub] ${label}: the persisted refresh token (${tokenPath}) ` +
+              `is ${file.kind}${
+                file.kind === "unreadable" ? `: ${file.error}` : ""
+              }` +
+              (seed
+                ? " — starting from the seed instead."
+                : ", and no seed is configured."),
+          );
+        }
+      }
     }
+    const chosen = chooseRefreshToken(persisted, seed);
+    refreshToken = chosen.token;
+    st.tokenSource = chosen.source;
 
     async function doRefresh(): Promise<string | null> {
       if (!refreshToken) {
         console.error(
           `[EventSub] ${label}: no refresh token — run: multichat twitch-login`,
         );
+        st.token = "none";
         return null;
       }
       const req = buildRefreshRequest(clientId, clientSecret, refreshToken);
@@ -859,6 +1128,8 @@ function createTwitchEventSubManager(opts: {
         json = await res.json();
       } catch (e) {
         console.error(`[EventSub] ${label}: token refresh failed: ${e}`);
+        st.token = "error";
+        st.tokenError = String(e).slice(0, 200);
         return null;
       }
       const parsed = parseTokenResponse(json);
@@ -866,14 +1137,42 @@ function createTwitchEventSubManager(opts: {
         console.error(
           `[EventSub] ${label}: token refresh rejected: ${parsed.message}`,
         );
+        // Twitch no longer accepts this token (revoked, or the persisted file
+        // went stale). The seed is the only other credential there is: try it
+        // once — a seed that was replaced since is exactly the fix.
+        if (
+          shouldRetryWithSeed({
+            message: parsed.message,
+            current: refreshToken,
+            seed,
+            tried: seedTried,
+          })
+        ) {
+          seedTried = true;
+          console.error(
+            `[EventSub] ${label}: !!! the ${
+              st.tokenSource ?? "current"
+            } refresh token is no longer valid — retrying once with the seed.`,
+          );
+          refreshToken = seed;
+          st.tokenSource = "seed";
+          return await doRefresh();
+        }
+        st.token = "rejected";
+        st.tokenError = parsed.message.slice(0, 200);
         return null;
       }
       // Rotation: persist the new refresh token BEFORE using the new access token,
       // so a crash can't strand us with an already-invalidated refresh token.
+      // Atomic, so a power cut mid-write leaves the old token, not an empty file.
       refreshToken = parsed.refreshToken;
-      if (tokenPath) await persistState(tokenPath, refreshToken);
+      if (tokenPath) await persistStateAtomic(tokenPath, refreshToken);
       accessToken = parsed.accessToken;
       if (parsed.scopes) grantedScopes = parsed.scopes;
+      st.token = "ok";
+      st.tokenError = null;
+      st.tokenRefreshedAt = Date.now();
+      st.scopes = grantedScopes;
       // Refresh a minute early to avoid using a token that expires mid-request.
       expiresAt = Date.now() + Math.max(0, parsed.expiresIn - 60) * 1000;
       return accessToken;
@@ -910,12 +1209,15 @@ function createTwitchEventSubManager(opts: {
         `[EventSub] ${label}: no refresh token — run: multichat twitch-login ` +
           `(skipping this channel)`,
       );
+      st.token = "none";
       return;
     }
     if (!broadcasterId && !login) {
       console.error(
         "[EventSub] a channel needs a login or broadcasterId — skipping",
       );
+      st.token = "none";
+      st.tokenError = "the entry has neither a login nor a broadcasterId";
       return;
     }
 
@@ -946,9 +1248,12 @@ function createTwitchEventSubManager(opts: {
         if (broadcasterId) {
           // Cache the id and (re)point the token file at it, persisting the
           // current token.
-          if (bidCachePath) await persistState(bidCachePath, broadcasterId);
+          st.broadcasterId = broadcasterId;
+          if (bidCachePath) {
+            await persistStateAtomic(bidCachePath, broadcasterId);
+          }
           tokenPath = twitchTokenStatePath(opts.stateDir, broadcasterId);
-          if (tokenPath) await persistState(tokenPath, refreshToken);
+          if (tokenPath) await persistStateAtomic(tokenPath, refreshToken);
         }
       }
       if (token && broadcasterId) break;
@@ -999,6 +1304,16 @@ function createTwitchEventSubManager(opts: {
       features,
       onRedemption: cp?.onRedemption,
       onSessionReady: cp?.onSessionReady,
+      onStream: (ev) => {
+        st.stream = ev.live ? "online" : "offline";
+        st.streamAt = Date.now();
+        console.log(
+          `[EventSub] ${label}: stream ${st.stream}` +
+            (ev.kind ? ` (${ev.kind})` : ""),
+        );
+        opts.onStream?.(ev);
+      },
+      onSession: (ev) => Object.assign(st, applySessionEvent(st, ev)),
     };
     startTwitchEventSub(ctx);
   }
@@ -1022,7 +1337,12 @@ function createTwitchEventSubManager(opts: {
     return channelAuth.get(key.toLowerCase());
   }
 
-  return { start, getChannelAuth };
+  /** Every started channel's token + session state (GET /api/status). */
+  function status(): EventSubChannelStatus[] {
+    return statuses.map((st) => ({ ...st }));
+  }
+
+  return { start, getChannelAuth, status };
 }
 
 async function readKeyFile(path: string): Promise<string | null> {
@@ -1030,6 +1350,26 @@ async function readKeyFile(path: string): Promise<string | null> {
     return (await Deno.readTextFile(path)).trim() || null;
   } catch {
     return null; // not set yet — wait for a runtime key
+  }
+}
+
+/** Read a persisted refresh token, telling "never written" apart from "there
+ *  but unusable" — the second is a damaged file, worth saying out loud. */
+async function readTokenFile(
+  path: string,
+): Promise<
+  | { kind: "ok"; token: string }
+  | { kind: "missing" }
+  | { kind: "empty" }
+  | { kind: "unreadable"; error: string }
+> {
+  try {
+    const token = (await Deno.readTextFile(path)).trim();
+    return token ? { kind: "ok", token } : { kind: "empty" };
+  } catch (e) {
+    return e instanceof Deno.errors.NotFound
+      ? { kind: "missing" }
+      : { kind: "unreadable", error: String(e) };
   }
 }
 
@@ -1125,6 +1465,8 @@ function createGiveawayEngine(opts: {
   onFollow: FollowHandler;
   hooks: GiveawayHooks;
   init: () => Promise<void>;
+  /** Write every state file's latest contents to disk (graceful shutdown). */
+  flush: () => Promise<void>;
 } {
   const { config } = opts;
   const poolPath = giveawayPoolStatePath(opts.stateDir);
@@ -1166,48 +1508,73 @@ function createGiveawayEngine(opts: {
   function broadcast(draw?: GiveawayDraw): void {
     opts.getBroadcast()?.(view(), draw);
   }
-  function persist(): void {
-    // Derived fields (campaign snapshot, active turn, aggregates) are not
-    // persisted — they're rebuilt in view() from the pool/turns/packs.
-    if (poolPath) {
-      const { campaign: _c, activeTurn: _a, aggregates: _g, ...bare } = state;
-      void persistState(poolPath, JSON.stringify(bare));
-    }
-  }
-  function persistCampaign(): void {
-    if (campaignPath) void persistState(campaignPath, JSON.stringify(campaign));
-  }
-  function persistPacks(): void {
-    if (packsPath) {
-      void persistState(packsPath, serializePackReports(packReports));
-    }
-  }
-  function persistTurns(): void {
-    if (turnsPath) void persistState(turnsPath, serializeTurns(turns));
-  }
-  function persistPlan(): void {
-    if (planPath) void persistState(planPath, serializePlan(plan));
-  }
+  // One single-flight atomic writer per file (see stateWriter): the pool holds
+  // the guaranteed queue and its permanent entry numbers, and a burst of
+  // entries used to fire overlapping truncating writes at it — enough to tear
+  // the file with no crash at all. Derived fields (campaign snapshot, active
+  // turn, aggregates) are not persisted — they're rebuilt in view() from the
+  // pool/turns/packs.
+  const persist = stateWriter(poolPath, () => {
+    const { campaign: _c, activeTurn: _a, aggregates: _g, ...bare } = state;
+    return JSON.stringify(bare);
+  });
+  const persistCampaign = stateWriter(
+    campaignPath,
+    () => JSON.stringify(campaign),
+  );
+  const persistPacks = stateWriter(
+    packsPath,
+    () => serializePackReports(packReports),
+  );
+  const persistTurns = stateWriter(turnsPath, () => serializeTurns(turns));
+  const persistPlan = stateWriter(planPath, () => serializePlan(plan));
 
-  /** Restore persisted pool + campaign + winners at startup (best-effort;
-   *  corrupt files start empty — a bad winners line is skipped, not fatal). */
+  /** Restore persisted pool + campaign + winners at startup. A missing file is
+   *  a first run. A corrupt one (torn, empty, not the expected JSON) is moved
+   *  aside and reported with what starting without it means — never silently
+   *  read as "empty" and then overwritten. A bad winners line is skipped. */
   async function init(): Promise<void> {
+    await sweepStaleTmp([
+      poolPath,
+      campaignPath,
+      packsPath,
+      turnsPath,
+      planPath,
+    ]);
+    const lost = (what: string) =>
+      console.error(`[Giveaway] !!! starting with ${what}`);
     if (poolPath) {
-      const raw = await readKeyFile(poolPath);
-      if (raw) {
-        try {
-          const restored = normalizePoolState(JSON.parse(raw));
-          if (restored) state = restored;
-        } catch { /* corrupt — start empty */ }
+      const r = await readState(
+        "Giveaway",
+        poolPath,
+        "entrant pool",
+        GIVEAWAY_FILE_SHAPE.pool,
+      );
+      const restored = r.kind === "ok" ? normalizePoolState(r.value) : null;
+      if (restored) state = restored;
+      else if (r.kind === "corrupt") {
+        lost(
+          "an EMPTY entrant pool: the entrants, their entry numbers and the " +
+            "guaranteed queue are gone from memory. The winners log is " +
+            "separate and intact; restore the pool from the file moved aside " +
+            "(stop the server, repair it, move it back) before taking entries.",
+        );
       }
     }
     if (campaignPath) {
-      const raw = await readKeyFile(campaignPath);
-      if (raw) {
-        try {
-          const restored = normalizeCampaignState(JSON.parse(raw));
-          if (restored) campaign = restored;
-        } catch { /* corrupt — start empty */ }
+      const r = await readState(
+        "Giveaway",
+        campaignPath,
+        "campaign counters",
+        GIVEAWAY_FILE_SHAPE.campaign,
+      );
+      const restored = r.kind === "ok" ? normalizeCampaignState(r.value) : null;
+      if (restored) campaign = restored;
+      else if (r.kind === "corrupt") {
+        lost(
+          "the campaign counters at ZERO: follower progress and unspent " +
+            "milestone draw credits are forgotten.",
+        );
       }
     }
     if (winnersPath) {
@@ -1216,29 +1583,60 @@ function createGiveawayEngine(opts: {
       } catch { /* no log yet */ }
     }
     if (packsPath) {
-      const raw = await readKeyFile(packsPath);
-      if (raw) {
-        try {
-          packReports = normalizePackReports(JSON.parse(raw));
-        } catch { /* corrupt — start empty */ }
+      const r = await readState(
+        "Giveaway",
+        packsPath,
+        "pack reports",
+        GIVEAWAY_FILE_SHAPE.packs,
+      );
+      if (r.kind === "ok") packReports = normalizePackReports(r.value);
+      else if (r.kind === "corrupt") {
+        lost(
+          "no pack reports: card counts and values already reported are " +
+            "forgotten until chat-cards reports those packs again.",
+        );
       }
     }
     if (turnsPath) {
-      const raw = await readKeyFile(turnsPath);
-      if (raw) {
-        try {
-          turns = normalizeTurns(JSON.parse(raw));
-        } catch { /* corrupt — start empty */ }
+      const r = await readState(
+        "Giveaway",
+        turnsPath,
+        "turn ledger",
+        GIVEAWAY_FILE_SHAPE.turns,
+      );
+      if (r.kind === "ok") turns = normalizeTurns(r.value);
+      else if (r.kind === "corrupt") {
+        lost(
+          "an EMPTY turn ledger: past turns and their dispositions are " +
+            "missing from `giveaway turns` / `report` (the winners log still " +
+            "lists every winner).",
+        );
       }
     }
     if (planPath) {
-      const raw = await readKeyFile(planPath);
-      if (raw) {
-        try {
-          plan = normalizePlan(JSON.parse(raw));
-        } catch { /* corrupt — no plan */ }
+      const r = await readState(
+        "Giveaway",
+        planPath,
+        "draw plan",
+        GIVEAWAY_FILE_SHAPE.plan,
+      );
+      if (r.kind === "ok") plan = normalizePlan(r.value);
+      else if (r.kind === "corrupt") {
+        lost(
+          "no committed draw plan: draws are random until `plan` is re-run.",
+        );
       }
     }
+  }
+
+  async function flush(): Promise<void> {
+    await Promise.all([
+      persist.flush(),
+      persistCampaign.flush(),
+      persistPacks.flush(),
+      persistTurns.flush(),
+      persistPlan.flush(),
+    ]);
   }
 
   // Helix follow check with one forced-refresh retry on 401. Returns undefined
@@ -1701,7 +2099,7 @@ function createGiveawayEngine(opts: {
     },
   };
 
-  return { onMessage, onFollow, hooks, init };
+  return { onMessage, onFollow, hooks, init, flush };
 }
 
 /** Log giveaway setup problems at startup (the follow gate depends on EventSub;
@@ -1833,81 +2231,20 @@ function createChannelPointsEngine(opts: {
   let pumping = false;
   let pumpAgain = false;
 
-  // One writer per file: a change that lands while a write is in flight is
-  // coalesced into one follow-up write of the latest state, so two quick
-  // changes can neither interleave on disk nor lose the second one. Each
-  // write is atomic (temp file + fsync + rename): a crash, kill or power loss
-  // mid-write leaves the previous state, never a torn file.
-  function writer(
-    path: string | null,
-    snapshot: () => string,
-  ): { (): void; flush: () => Promise<void> } {
-    let running: Promise<void> | null = null;
-    let again = false;
-    const schedule = () => {
-      if (!path) return;
-      if (running) {
-        again = true;
-        return;
-      }
-      running = (async () => {
-        do {
-          again = false;
-          await persistStateAtomic(path, snapshot());
-        } while (again);
-      })().finally(() => {
-        running = null;
-      });
-    };
-    return Object.assign(schedule, {
-      // Write the latest state now, or right after the write in flight.
-      flush: async () => {
-        schedule();
-        if (running) await running;
-      },
-    });
-  }
-  const persistLedger = writer(ledgerPath, () => serializeLedger(ledger));
-  const persistRewards = writer(rewardsPath, () => JSON.stringify(managed));
-  const persistControl = writer(controlPath, () => JSON.stringify(control));
-
-  /**
-   * Read one state file back: "missing" on a first run; "corrupt" for anything
-   * that isn't the expected JSON shape (a torn or empty file from a crash, a
-   * hand edit gone wrong) — that file is moved aside, kept for inspection
-   * instead of being overwritten by the next write, and reported loudly, so
-   * the caller falls back on purpose rather than silently starting empty.
-   */
-  async function readState(
+  const persistLedger = stateWriter(ledgerPath, () => serializeLedger(ledger));
+  const persistRewards = stateWriter(
+    rewardsPath,
+    () => JSON.stringify(managed),
+  );
+  const persistControl = stateWriter(
+    controlPath,
+    () => JSON.stringify(control),
+  );
+  const readCpState = (
     path: string,
     what: string,
     shapeOk: (v: unknown) => boolean,
-  ): Promise<
-    { kind: "ok"; value: unknown } | { kind: "missing" } | { kind: "corrupt" }
-  > {
-    let raw: string;
-    try {
-      raw = await Deno.readTextFile(path);
-    } catch (e) {
-      if (e instanceof Deno.errors.NotFound) return { kind: "missing" };
-      console.error(
-        `[ChannelPoints] !!! could not read the ${what} (${path}): ${e}`,
-      );
-      return { kind: "corrupt" };
-    }
-    try {
-      const value: unknown = JSON.parse(raw);
-      if (shapeOk(value)) return { kind: "ok", value };
-    } catch { /* torn or empty */ }
-    const aside = quarantinePath(path, Date.now());
-    const moved = await Deno.rename(path, aside).then(() => true, () => false);
-    console.error(
-      `[ChannelPoints] !!! the ${what} (${path}) is corrupt${
-        moved ? ` — moved aside to ${aside}` : " and could not be moved aside"
-      }.`,
-    );
-    return { kind: "corrupt" };
-  }
+  ) => readState("ChannelPoints", path, what, shapeOk);
 
   /** Restore the ledger, reward map and manual pause. A corrupt file is moved
    *  aside and reported with what starting without it means. */
@@ -1916,7 +2253,11 @@ function createChannelPointsEngine(opts: {
     const isObject = (v: unknown) =>
       typeof v === "object" && v !== null && !Array.isArray(v);
     if (ledgerPath) {
-      const r = await readState(ledgerPath, "redemption ledger", Array.isArray);
+      const r = await readCpState(
+        ledgerPath,
+        "redemption ledger",
+        Array.isArray,
+      );
       if (r.kind === "ok") {
         ledger = pruneLedger(normalizeLedger(r.value), Date.now());
       } else if (r.kind === "corrupt") {
@@ -1930,7 +2271,7 @@ function createChannelPointsEngine(opts: {
       }
     }
     if (rewardsPath) {
-      const r = await readState(rewardsPath, "reward id map", isObject);
+      const r = await readCpState(rewardsPath, "reward id map", isObject);
       if (r.kind === "ok") managed = normalizeManagedRewards(r.value);
       else if (r.kind === "corrupt") {
         console.error(
@@ -1942,7 +2283,7 @@ function createChannelPointsEngine(opts: {
       }
     }
     if (controlPath) {
-      const r = await readState(controlPath, "pause control", isObject);
+      const r = await readCpState(controlPath, "pause control", isObject);
       if (r.kind === "ok") control = normalizeChannelPointsControl(r.value);
       else if (r.kind === "corrupt") {
         // Fail safe: the operator may have paused the rewards on purpose.
@@ -2984,7 +3325,10 @@ async function runServer(configPath: string): Promise<void> {
       emitIntegration: (ev) => integrations.emit(ev),
     })
     : undefined;
-  if (giveawayEngine) await giveawayEngine.init();
+  if (giveawayEngine) {
+    await giveawayEngine.init();
+    flushOnShutdown(() => giveawayEngine.flush());
+  }
 
   // Channel points (when enabled): Twitch redemptions → overlay effects →
   // fulfil/refund. Built before the server so /api/rewards can drive it; it
@@ -3011,8 +3355,14 @@ async function runServer(configPath: string): Promise<void> {
   // `keys`/`giveawayEngine`/`channelPoints` reference `emitter`/
   // `broadcastGiveaway` only through deferred callbacks, so the forward
   // reference to this destructure is fine.
+  // EventSub's part of GET /api/status; replaced below once it is known
+  // whether (and with what) EventSub starts.
+  let eventsubStatus = (): EventSubStatus => ({ state: "off", channels: [] });
+
   const { emitter, broadcastGiveaway } = createServer(settings, {
     setYouTubeKey: (key) => keys.apply(key, true),
+    liveSignal: (signal) => keys.liveSignal(signal),
+    status: () => ({ youtube: keys.status(), eventsub: eventsubStatus() }),
     giveaway: giveawayEngine?.hooks,
     channelPoints: channelPoints?.hooks,
   });
@@ -3052,6 +3402,7 @@ async function runServer(configPath: string): Promise<void> {
         "Twitch EventSub is configured but clientId/clientSecret is missing — " +
           "skipping EventSub (follows/cheers/subs/raids will not appear).",
       );
+      eventsubStatus = () => ({ state: "no-credentials", channels: [] });
     } else {
       const mgr = createTwitchEventSubManager({
         getEmitter: () => emitter,
@@ -3060,9 +3411,21 @@ async function runServer(configPath: string): Promise<void> {
         onFollow: giveawayEngine
           ? (f) => giveawayEngine.onFollow(f)
           : undefined,
+        // The channel going on air on Twitch is as good a go-live hint as any
+        // for a simulcast (and going off air a reason to re-verify the
+        // attached chat): the same nudge POST /api/live gives. A rerun or a
+        // playlist "going online" is not a broadcast starting.
+        onStream: (ev) => {
+          if (ev.live && !isLiveBroadcast(ev)) return;
+          keys.liveSignal({
+            state: ev.live ? "live" : "offline",
+            source: `twitch ${ev.channel}`,
+          });
+        },
         channelPoints: channelPoints?.wiring,
       });
       getChannelAuth = mgr.getChannelAuth;
+      eventsubStatus = () => ({ state: "on", channels: mgr.status() });
       mgr.start();
     }
   }
@@ -3079,21 +3442,11 @@ async function runServer(configPath: string): Promise<void> {
     return;
   }
 
-  const persisted = statePath ? await readKeyFile(statePath) : null;
-  const startupKey = resolveStartupKey({
-    persisted,
+  await keys.start({
+    persisted: statePath ? await readKeyFile(statePath) : null,
     env: Deno.env.get("YOUTUBE_API_KEY") ?? null,
     settings: youtube.apiKey,
   });
-  if (startupKey) {
-    // persist:false — don't rewrite a file we may have just read it from.
-    await keys.apply(startupKey, false);
-  } else {
-    console.log(
-      "YouTube channels configured but no API key yet. " +
-        "Set one on the running server:  multichat set-youtube-key <KEY>",
-    );
-  }
 }
 
 function cliUsage(): string {
@@ -3107,8 +3460,10 @@ function cliUsage(): string {
     "  multichat fake [kind] [opts]               inject fake events (all kinds, or just one) into a running server",
     "  multichat giveaway [verb] [opts]           control the giveaway (status|open|close|draw|reset|demo|winners|packs|turns|report|plan|campaign-reset|remove <who>)",
     "  multichat rewards [verb] [opts]            control channel-point chaos (status|sync|pause|resume|pending|refund <id>|simulate <key> [--user NAME])",
+    "  multichat live [on|off] [opts]             tell a running server the stream just started / stopped (a go-live hint)",
+    "  multichat status [--json] [opts]           what a running server is doing (key, quota, parked reasons, EventSub)",
     "",
-    "Options (set-youtube-key, fake, giveaway and rewards share these):",
+    "Options (set-youtube-key, fake, giveaway, rewards, live and status share these):",
     "  -p, --port <port>   server port   (default: $PORT or 8080)",
     "  -h, --host <host>   server host   (default: $HOST or 127.0.0.1)",
     "      --help          show this help",
@@ -3159,6 +3514,20 @@ function cliUsage(): string {
     "  multichat rewards pending    # redemptions still in flight or not yet fulfilled/refunded on Twitch",
     "  multichat rewards refund <id>          # refund one open redemption and withdraw its effect",
     "  multichat rewards simulate <key> [--user NAME]   # fake a redemption through the whole pipeline (no Twitch)",
+    "",
+    "live: a hint for YouTube live detection, which otherwise finds a stream on its own",
+    "within a discovery tick. `on` makes the server look now and every 20s for 5 minutes;",
+    "`off` makes it re-verify the attached chat now. It never marks a channel live or",
+    "detaches a chat by itself. Loopback-only, like fake. With no verb it prints the status.",
+    "  multichat live on            # the stream just started (e.g. from an OBS / Companion hook)",
+    "  multichat live off           # the stream just stopped",
+    "  multichat live on --source obs   # name the sender in the server's log",
+    "",
+    "status: prints what the running server reports on GET /api/status — where the YouTube",
+    "key came from (and its fingerprint, never the key), today's quota, why detection is",
+    "parked if it is, each channel's last transition, Twitch chat and EventSub. Loopback-only.",
+    "  multichat status             # readable",
+    "  multichat status --json      # the raw JSON",
   ].join("\n");
 }
 
@@ -3168,12 +3537,26 @@ function cliUsage(): string {
  * Exits the process on a connection failure or a non-multichat responder; on a
  * reached multichat it returns the response + trimmed text for the caller to judge.
  */
-async function postControl(
+function postControl(
   host: string,
   port: number,
   path: string,
   body: string,
   contentType: string,
+): Promise<{ res: Response; text: string }> {
+  return controlRequest(host, port, path, {
+    method: "POST",
+    headers: { "content-type": contentType },
+    body,
+  });
+}
+
+/** postControl for any method — the status endpoint is a GET. */
+async function controlRequest(
+  host: string,
+  port: number,
+  path: string,
+  init: RequestInit,
 ): Promise<{ res: Response; text: string }> {
   // The control endpoints are loopback-only; when the server binds 0.0.0.0 reach it
   // over loopback so the request actually originates from 127.0.0.1.
@@ -3181,11 +3564,7 @@ async function postControl(
 
   let res: Response;
   try {
-    res = await fetch(`http://${target}:${port}${path}`, {
-      method: "POST",
-      headers: { "content-type": contentType },
-      body,
-    });
+    res = await fetch(`http://${target}:${port}${path}`, init);
   } catch (e) {
     console.error(`Could not reach multichat at ${target}:${port}: ${e}`);
     console.error("Is the server running and is the port correct?");
@@ -3882,6 +4261,127 @@ async function runRewards(args: string[]): Promise<void> {
   Deno.exit(0);
 }
 
+/** Parse the `-p/--port` and `-h/--host` options the control CLIs share out of
+ *  `args`, returning what is left. Exits on `--help` or a bad port. */
+function controlTarget(
+  args: string[],
+): { host: string; port: number; rest: string[] } {
+  let host = Deno.env.get("HOST") ?? "127.0.0.1";
+  let port = Number(Deno.env.get("PORT") ?? "8080");
+  const rest: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--help") {
+      console.log(cliUsage());
+      Deno.exit(0);
+    } else if (a === "-p" || a === "--port") {
+      port = Number(args[++i]);
+    } else if (a === "-h" || a === "--host") {
+      host = args[++i] ?? host;
+    } else {
+      rest.push(a);
+    }
+  }
+  if (!Number.isFinite(port) || port <= 0) {
+    console.error("Invalid --port.");
+    Deno.exit(2);
+  }
+  return { host, port, rest };
+}
+
+/**
+ * CLI client: print what a running server reports on its loopback
+ * GET /api/status — readable by default, the raw JSON with --json (for a
+ * status bar or a script). See docs/api.md.
+ */
+async function runStatus(args: string[]): Promise<void> {
+  const { host, port, rest } = controlTarget(args);
+  let json = false;
+  for (const a of rest) {
+    if (a === "--json") json = true;
+    else if (a !== "status") {
+      console.error(`Unknown argument: ${a}`);
+      console.error("Usage: multichat status [--json] [--port P] [--host H]");
+      Deno.exit(2);
+    }
+  }
+  const { res, text } = await controlRequest(host, port, "/api/status", {
+    method: "GET",
+  });
+  if (!res.ok) {
+    console.error(`Failed (HTTP ${res.status}): ${text}`);
+    Deno.exit(1);
+  }
+  if (json) {
+    console.log(text);
+    Deno.exit(0);
+  }
+  try {
+    for (const line of formatStatus(JSON.parse(text) as ServerStatus)) {
+      console.log(line);
+    }
+  } catch {
+    console.log(text);
+  }
+  Deno.exit(0);
+}
+
+/**
+ * CLI client: send a go-live hint to a running server's loopback
+ * POST /api/live — `on` when the stream just started, `off` when it stopped —
+ * for wiring into whatever starts the stream (an OBS script, a Companion
+ * button, a systemd unit). With no verb it prints the status instead. See
+ * docs/configuration.md#go-live-hints.
+ */
+async function runLive(args: string[]): Promise<void> {
+  const { host, port, rest } = controlTarget(args);
+  const VERBS: Record<string, "live" | "offline" | "status"> = {
+    on: "live",
+    live: "live",
+    off: "offline",
+    offline: "offline",
+    status: "status",
+  };
+  let verb: "live" | "offline" | "status" = "status";
+  let source = "cli";
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === "--source") {
+      source = rest[++i] ?? source;
+    } else if (Object.hasOwn(VERBS, a)) {
+      verb = VERBS[a];
+    } else {
+      console.error(`Unknown argument: ${a}`);
+      console.error(
+        "Usage: multichat live [on|off|status] [--source NAME] [--port P] [--host H]",
+      );
+      Deno.exit(2);
+    }
+  }
+  if (verb === "status") {
+    return await runStatus(["-p", String(port), "-h", host]);
+  }
+
+  const { res, text } = await postControl(
+    host,
+    port,
+    "/api/live",
+    JSON.stringify({ state: verb, source }),
+    "application/json",
+  );
+  if (!res.ok) {
+    console.error(`Failed (HTTP ${res.status}): ${text}`);
+    Deno.exit(1);
+  }
+  try {
+    const r = JSON.parse(text) as LiveSignalResult;
+    console.log(`${r.effect}: ${r.message}`);
+  } catch {
+    console.log(text);
+  }
+  Deno.exit(0);
+}
+
 /** Read the Twitch app clientId/clientSecret from env, then settings.json. */
 async function loadEventSubCreds(
   settingsPath: string,
@@ -4108,6 +4608,10 @@ if (first === "set-youtube-key") {
   await runGiveaway(rest);
 } else if (first === "rewards") {
   await runRewards(rest);
+} else if (first === "live") {
+  await runLive(rest);
+} else if (first === "status") {
+  await runStatus(rest);
 } else if (first === "--help" || first === "-h") {
   console.log(cliUsage());
 } else {

@@ -15,7 +15,9 @@ import {
   buildUpdateRedemptionStatusRequest,
   buildUsersRequest,
   CHAT_WRITE_SCOPE,
+  chooseRefreshToken,
   EVENTSUB_SCOPES,
+  isInvalidRefreshToken,
   LOGIN_SCOPES,
   parseAppTokenResponse,
   parseChatBadgesResponse,
@@ -28,8 +30,10 @@ import {
   parseUsersResponse,
   REDEMPTIONS_MANAGE_SCOPE,
   resolveAppCredentials,
+  shouldRetryWithSeed,
   SUBSCRIPTIONS,
   subscriptionsFor,
+  twitchSeedEnvVar,
 } from "../src/twitchauth.ts";
 import { assert, assertEquals, assertThrows } from "./_assert.ts";
 
@@ -710,4 +714,59 @@ Deno.test("resolveAppCredentials: settings clientId, env secret, both required",
     undefined,
   );
   assertEquals(resolveAppCredentials(undefined, env({})), undefined);
+});
+
+Deno.test("stream.online / stream.offline: v1, no scope, every channel", () => {
+  for (const type of ["stream.online", "stream.offline"]) {
+    const spec = SUBSCRIPTIONS.find((s) => s.type === type)!;
+    assertEquals(spec.version, "1");
+    // No scope: a token without any (an old login) may subscribe, so adding
+    // these never costs a re-login.
+    assertEquals(spec.scope, null);
+    assertEquals(spec.feature, undefined);
+    assertEquals(spec.condition("42"), { broadcaster_user_id: "42" });
+    assert(subscriptionsFor([]).some((s) => s.type === type));
+  }
+});
+
+Deno.test("twitchSeedEnvVar: the id verbatim, odd characters collapsed", () => {
+  assertEquals(
+    twitchSeedEnvVar("1477084215"),
+    "MULTICHAT_TWITCH_SEED_1477084215",
+  );
+  assertEquals(twitchSeedEnvVar("a-b..c"), "MULTICHAT_TWITCH_SEED_a_b_c");
+});
+
+Deno.test("chooseRefreshToken: persisted wins; empty or unreadable falls back to the seed", () => {
+  assertEquals(chooseRefreshToken("rot", "seed"), {
+    token: "rot",
+    source: "persisted",
+  });
+  // A zero-length file (power cut mid-write) or an unreadable one (null) used
+  // to switch EventSub off for good.
+  assertEquals(chooseRefreshToken(" \n", "seed"), {
+    token: "seed",
+    source: "seed",
+  });
+  assertEquals(chooseRefreshToken(null, " seed "), {
+    token: "seed",
+    source: "seed",
+  });
+  assertEquals(chooseRefreshToken(null, ""), { token: "", source: null });
+});
+
+Deno.test("shouldRetryWithSeed: once, only for an invalid token, only to a different seed", () => {
+  assert(isInvalidRefreshToken("Invalid refresh token"));
+  assert(!isInvalidRefreshToken("Too many requests"));
+  const base = {
+    message: "Invalid refresh token",
+    current: "rot",
+    seed: "seed",
+    tried: false,
+  };
+  assert(shouldRetryWithSeed(base));
+  assert(!shouldRetryWithSeed({ ...base, tried: true }));
+  assert(!shouldRetryWithSeed({ ...base, current: "seed" }));
+  assert(!shouldRetryWithSeed({ ...base, seed: "" }));
+  assert(!shouldRetryWithSeed({ ...base, message: "HTTP 500" }));
 });

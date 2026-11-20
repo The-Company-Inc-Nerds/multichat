@@ -50,6 +50,14 @@ echo -n "$YT_KEY" | multichat set-youtube-key
 See
 [Configuration](docs/configuration.md#setting-the-youtube-api-key-at-runtime).
 
+YouTube streams are found automatically. To make that immediate, tell the server
+when the stream starts — `multichat live on` (or `POST /api/live` from an OBS /
+Companion hook; with Twitch EventSub set up, Twitch's own "stream online" event
+does it for you). And `multichat status` shows what the running server is doing:
+which key it runs on, today's quota, why detection is parked if it is, and
+whether EventSub has a token. See
+[Go-live hints](docs/configuration.md#go-live-hints).
+
 ### Twitch alerts (follows / bits / subs / raids)
 
 Chat works with no credentials. To also get **shoutout alerts** on `/alerts` and
@@ -74,7 +82,8 @@ the NixOS/systemd module), so it **survives restarts, reboots, `nixos-rebuild`,
 and package updates** — the state directory lives outside the Nix store and is
 never touched by a rebuild. (Running bare via `deno task start` with no
 `STATE_DIRECTORY` keeps the token in memory only, so re-login is needed after a
-restart.)
+restart.) State files are written atomically, so a power cut can't leave a
+half-written token or giveaway pool behind.
 
 See
 [Configuration → Twitch EventSub alerts](docs/configuration.md#twitch-eventsub-alerts)
@@ -83,12 +92,12 @@ and, for production secrets, the
 
 ## Documentation
 
-| Doc                                              | Contents                                                                                     |
-| ------------------------------------------------ | -------------------------------------------------------------------------------------------- |
-| [Installation & Setup](docs/install.md)          | Dev environment, running, building a binary, installing                                      |
-| [Configuration](docs/configuration.md)           | `settings.json` reference, channels, env vars, YouTube API key, Twitch EventSub alerts       |
-| [Chat Features](docs/features.md)                | Per-platform rendering: badges, emotes, events, alerts overlay, deletions, the channel panel |
-| [HTTP & SSE API](docs/api.md)                    | The `/`, `/overlay`, `/alerts`, `/events` endpoints and the event/message shapes             |
-| [NixOS Module](docs/nixos.md)                    | Module options and secrets management                                                        |
-| [Architecture](docs/development/architecture.md) | Module layout, data flow, design notes                                                       |
-| [Testing](docs/development/testing.md)           | Running checks and tests, commit workflow                                                    |
+| Doc                                              | Contents                                                                                                 |
+| ------------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
+| [Installation & Setup](docs/install.md)          | Dev environment, running, building a binary, installing                                                  |
+| [Configuration](docs/configuration.md)           | `settings.json` reference, channels, env vars, YouTube API key, go-live hints, Twitch EventSub alerts    |
+| [Chat Features](docs/features.md)                | Per-platform rendering: badges, emotes, events, alerts overlay, deletions, the channel panel             |
+| [HTTP & SSE API](docs/api.md)                    | The `/`, `/overlay`, `/alerts`, `/events` endpoints, the control endpoints, and the event/message shapes |
+| [NixOS Module](docs/nixos.md)                    | Module options and secrets management                                                                    |
+| [Architecture](docs/development/architecture.md) | Module layout, data flow, design notes                                                                   |
+| [Testing](docs/development/testing.md)           | Running checks and tests, commit workflow                                                                |

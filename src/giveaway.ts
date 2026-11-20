@@ -582,6 +582,25 @@ export function demoFollowerIds(count: number): string[] {
   );
 }
 
+/**
+ * The JSON shape each persisted giveaway file must have to be trusted. A file
+ * that fails its check is torn or foreign — the engine moves it aside instead
+ * of loading it as "empty" and letting the next write replace it. Deliberately
+ * no stricter than what the normalizers below have always accepted, so every
+ * file an earlier version wrote still loads: a pool needs its entrants array
+ * (numbers are migrated), turns are an array, packs and the campaign are
+ * objects, and the plan is an object with an order — or `null`, which is what
+ * "no plan" is saved as.
+ */
+export const GIVEAWAY_FILE_SHAPE = {
+  pool: (v: unknown): boolean => isObj(v) && Array.isArray(v.entrants),
+  campaign: (v: unknown): boolean => isObj(v) && !Array.isArray(v),
+  packs: (v: unknown): boolean => isObj(v) && !Array.isArray(v),
+  turns: (v: unknown): boolean => Array.isArray(v),
+  plan: (v: unknown): boolean =>
+    v === null || (isObj(v) && Array.isArray(v.order)),
+} as const;
+
 /** Validate a persisted pool (best-effort) read back from the state dir. Returns
  *  null for anything unparseable, so a corrupt file starts an empty pool rather
  *  than crashing. Migrates pre-campaign files: entrants without a `number` are
