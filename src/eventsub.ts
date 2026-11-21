@@ -233,10 +233,30 @@ export function mapRedemption(
   };
 }
 
+/** The channel went on or off air on Twitch (stream.online / stream.offline),
+ *  surfaced to an observer — the YouTube poller's go-live hint. Nothing is
+ *  rendered for it. */
+export interface StreamEvent {
+  channel: string;
+  live: boolean;
+  /** stream.online's `type` ("live", "playlist", "watch_party", "premiere",
+   *  "rerun"); "" when Twitch sent none, and for stream.offline. */
+  kind: string;
+}
+
+/** Optional observer for stream.online / stream.offline notifications. */
+export type StreamHandler = (s: StreamEvent) => void;
+
+/** Whether a StreamEvent is a real broadcast starting — a rerun or a playlist
+ *  going "online" says nothing about a simulcast elsewhere. */
+export function isLiveBroadcast(s: StreamEvent): boolean {
+  return s.live && (s.kind === "" || s.kind === "live");
+}
+
 /** Route one notification to the emitter. Returns true if the type was handled
  *  (even when the mapper deliberately emits nothing). Mirrors twitch.ts's
- *  handleCommand "return true if handled" contract. Redemptions render nothing
- *  here; they only reach `onRedemption`. */
+ *  handleCommand "return true if handled" contract. Redemptions and stream
+ *  on/off render nothing here; they only reach their observers. */
 export function handleNotification(
   type: string,
   event: Event,
@@ -245,6 +265,7 @@ export function handleNotification(
   emitter: Emitter,
   onFollow?: FollowHandler,
   onRedemption?: RedemptionHandler,
+  onStream?: StreamHandler,
 ): boolean {
   let msg: ChatMessage | null;
   switch (type) {
@@ -290,6 +311,14 @@ export function handleNotification(
       msg = null;
       break;
     }
+    case "stream.online":
+      onStream?.({ channel, live: true, kind: str(event.type).toLowerCase() });
+      msg = null;
+      break;
+    case "stream.offline":
+      onStream?.({ channel, live: false, kind: "" });
+      msg = null;
+      break;
     default:
       return false;
   }
@@ -338,6 +367,51 @@ export function getNotification(
   return { type, event, id };
 }
 
+// ---- session state (what GET /api/status reports per channel) ---------------
+
+/** A step in one channel's connection, reported to `onSession`. */
+export type EventSubSessionEvent =
+  | { kind: "connecting" }
+  /** The welcome arrived: the socket is up (subscriptions follow). */
+  | { kind: "connected" }
+  /** A subscribe round finished; `failed` names the types that didn't take. */
+  | { kind: "subscribed"; active: number; wanted: number; failed: string[] }
+  /** The session ended with `error`; a reconnect is scheduled. */
+  | { kind: "retrying"; error: string };
+
+/** The part of a channel's status its session events drive. */
+export interface EventSubSessionState {
+  session: "idle" | "connecting" | "connected" | "retrying";
+  sessionError: string | null;
+  subscriptions: { active: number; wanted: number; failed: string[] } | null;
+}
+
+/** Fold a session event into the state. A reconnect keeps the last error on
+ *  show until the welcome arrives, and keeps the subscription tally: Twitch
+ *  carries subscriptions over a handoff, and a fresh session re-reports. */
+export function applySessionEvent(
+  s: EventSubSessionState,
+  ev: EventSubSessionEvent,
+): EventSubSessionState {
+  switch (ev.kind) {
+    case "connecting":
+      return { ...s, session: "connecting" };
+    case "connected":
+      return { ...s, session: "connected", sessionError: null };
+    case "subscribed":
+      return {
+        ...s,
+        subscriptions: {
+          active: ev.active,
+          wanted: ev.wanted,
+          failed: ev.failed,
+        },
+      };
+    case "retrying":
+      return { ...s, session: "retrying", sessionError: ev.error };
+  }
+}
+
 // ---- socket wiring (not unit-tested; logic lives in the pure helpers) -------
 
 /** Everything one channel's WebSocket needs. `getToken(force)` is provided by the
@@ -361,6 +435,10 @@ export interface EventSubChannelContext {
    *  straight away on a reconnect handoff. EventSub never replays what was
    *  missed while disconnected, so the channel-points engine reconciles here. */
   onSessionReady?: () => void;
+  /** Optional stream on/off observer (see StreamHandler) — the go-live hint. */
+  onStream?: StreamHandler;
+  /** Optional observer of the connection's own state (see applySessionEvent). */
+  onSession?: (ev: EventSubSessionEvent) => void;
 }
 
 const DEFAULT_KEEPALIVE_MS = 10_000;
@@ -446,6 +524,12 @@ async function createSubscriptions(
   console.log(
     `[EventSub] ${ctx.channelLabel}: ${ok}/${results.length} subscriptions active`,
   );
+  ctx.onSession?.({
+    kind: "subscribed",
+    active: ok,
+    wanted: results.length,
+    failed: results.filter((r) => !r.result.ok).map((r) => r.spec.type),
+  });
 }
 
 /** Run one WebSocket session to completion. Resolves with a reconnect URL when
@@ -518,13 +602,22 @@ function connectOnce(
           if (kaSec) keepaliveMs = kaSec * 1000;
           const sessionId = getSessionId(frame);
           if (!sessionId) return fail(new Error("welcome without session id"));
+          ctx.onSession?.({ kind: "connected" });
           // On a reconnect handoff the old subscriptions carry over — don't recreate.
           if (resubscribe) {
             createSubscriptions(ctx, sessionId)
               .then(() => ctx.onSessionReady?.())
-              .catch((e) =>
-                console.error(`[EventSub] ${ctx.channelLabel}: subscribe: ${e}`)
-              );
+              .catch((e) => {
+                console.error(
+                  `[EventSub] ${ctx.channelLabel}: subscribe: ${e}`,
+                );
+                ctx.onSession?.({
+                  kind: "subscribed",
+                  active: 0,
+                  wanted: subscriptionsFor(ctx.features ?? []).length,
+                  failed: [String(e)],
+                });
+              });
           } else {
             ctx.onSessionReady?.();
           }
@@ -541,6 +634,7 @@ function connectOnce(
               ctx.emitter,
               ctx.onFollow,
               ctx.onRedemption,
+              ctx.onStream,
             );
           }
           break;
@@ -580,6 +674,7 @@ export function startTwitchEventSub(
       const start = Date.now();
       try {
         console.log(`[EventSub] Connecting: ${ctx.channelLabel}`);
+        ctx.onSession?.({ kind: "connecting" });
         const out = await connectOnce(ctx, url, resubscribe, signal);
         if (signal?.aborted) break;
         if (out.reconnectUrl) {
@@ -599,6 +694,7 @@ export function startTwitchEventSub(
         console.error(
           `[EventSub] ${ctx.channelLabel}: ${err} — retry in ${delay / 1000}s`,
         );
+        ctx.onSession?.({ kind: "retrying", error: String(err) });
         await sleep(delay, signal);
       }
     }

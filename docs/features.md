@@ -21,8 +21,11 @@ resolving → live → offline as the poller finds an active live chat and sees 
 end; a YouTube `error` means the API refused the key, the day's quota is spent,
 or Google or the network failed three checks or chat polls in a row — a single
 blip is retried quietly (see
-[Quota and long streams](configuration.md#quota-and-long-streams) — the log
-line says which). The panel collapses behind a ☰ toggle on narrow screens.
+[Quota and long streams](configuration.md#quota-and-long-streams) — the log line
+says which, and so does
+[`multichat status`](configuration.md#what-is-it-doing-multichat-status), which
+also covers what the panel can't show: Twitch EventSub's token and
+subscriptions). The panel collapses behind a ☰ toggle on narrow screens.
 
 ## Platform identity
 
@@ -37,13 +40,13 @@ readable.
 | Twitch   | every badge Twitch sends: broadcaster, moderator, VIP, sub, bits, … |
 | YouTube  | owner, moderator, member, verified                                  |
 
-Twitch badges render as Twitch's own badge images, before the author name and
-in the head of highlighted event rows that carry them (cheers, subs, raids and
+Twitch badges render as Twitch's own badge images, before the author name and in
+the head of highlighted event rows that carry them (cheers, subs, raids and
 announcements arriving over IRC; EventSub events have no badges). Hovering a
 badge shows Twitch's title for it, and a subscriber badge also shows the exact
-months from Twitch's `badge-info`: a 14-month sub reads "Subscriber (14
-months)" out of the box, or the channel's own title, such as "1-Year Subscriber
-(14 months)", once app credentials load its badge art. Images come from
+months from Twitch's `badge-info`: a 14-month sub reads "Subscriber (14 months)"
+out of the box, or the channel's own title, such as "1-Year Subscriber (14
+months)", once app credentials load its badge art. Images come from
 `static-cdn.jtvnw.net` at 1x/2x/4x: dense screens pick the larger art, and the
 bigger `/alerts` cards start on the 2x art, so badges stay sharp in OBS.
 
@@ -51,9 +54,9 @@ bigger `/alerts` cards start on the 2x art, so badges stay sharp in OBS.
   standard bits and subscriber badges, …) work out of the box, from a built-in
   copy of Twitch's global badge list.
 - **The channel's own subscriber and bits badges** need Twitch app credentials,
-  since Twitch only hands them out to an authenticated app. As on Twitch, a
-  Tier 2/3 sub in a channel with no art for that tier gets its Tier 1 badge.
-  See [Badge images](configuration.md#badge-images).
+  since Twitch only hands them out to an authenticated app. As on Twitch, a Tier
+  2/3 sub in a channel with no art for that tier gets its Tier 1 badge. See
+  [Badge images](configuration.md#badge-images).
 
 A badge with no image (one Twitch's badge lists don't cover) or whose image
 fails to load (a blocked CDN, a retired image) falls back to a small colored
@@ -134,13 +137,14 @@ an office memo — `THE COMPANY, INC` over `"[Name] just followed!"` — then, r
 before it vanishes, **redacts one of those three words** with a black bar (a
 "confidential document" gag). Three kinds get their own stamped documents
 instead of the memo: a **sub** is **hiring paperwork** — Tier 1/2/3 map to the
-job titles `INTERN`/`ASSOCIATE`/`EXECUTIVE` (a resub is a `CONTRACT RENEWAL`,
-a gift a `REFERRAL PROGRAM` crediting the gifter with N referrals); a **raid**
-is an **FBI search warrant** (`"[Name] stormed the premises with 250
-agents!"`) under a strobing red/blue police-light glow; a **cheer** is a
-**petty-cash receipt** stamped `OFF THE BOOKS`. Each card's red verdict stamp
-slams onto the paper shortly after it lands. The style is typically scoped to
-Twitch `follow`, `sub`, `raid` and `cheer` events. See
+job titles `INTERN`/`ASSOCIATE`/`EXECUTIVE` (a resub is a `CONTRACT RENEWAL`, a
+gift a `REFERRAL PROGRAM` crediting the gifter with N referrals); a **raid** is
+an **FBI search warrant** (`"[Name] stormed the premises with 250
+agents!"`)
+under a strobing red/blue police-light glow; a **cheer** is a **petty-cash
+receipt** stamped `OFF THE BOOKS`. Each card's red verdict stamp slams onto the
+paper shortly after it lands. The style is typically scoped to Twitch `follow`,
+`sub`, `raid` and `cheer` events. See
 [Configuration → Alert themes](configuration.md#alert-themes).
 
 ## Deletions

@@ -5,20 +5,21 @@ broadcaster, which pushes events to connected browsers over Server-Sent Events.
 
 ## Module layout
 
-| File                   | Responsibility                                                                                                                                                                                                              |
-| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `main.ts`              | Entry point — loads settings, creates the server, starts the platform clients, owns the runtime-key manager (shared YouTube runtime + quota ledger), the Twitch badge manager, the EventSub manager and the CLI subcommands |
-| `src/types.ts`         | Shared interfaces: `Settings`, `ChatMessage`, `ServerEvent`, `Emitter`, `ChannelStatus`, `TwitchEventSubConfig`, EventSub frames                                                                                            |
-| `src/twitch.ts`        | Twitch IRC over WebSocket (`wss://irc-ws.chat.twitch.tv`), with reconnect; suppresses events for EventSub-covered channels; decorates badges with art via a `BadgeSource`                                                   |
-| `src/eventsub.ts`      | Twitch EventSub over WebSocket (`wss://eventsub.wss.twitch.tv`) — follow/cheer/sub/raid; pure mappers + socket client                                                                                                       |
-| `src/twitchauth.ts`    | Pure Twitch OAuth + Helix/EventSub request builders / response parsers (incl. the app-token grant and chat-badge lists) + the `SUBSCRIPTIONS` table                                                                         |
-| `src/badges.ts`        | Pure badge-art resolution (`resolveBadgeArt`, `badgeLabel`, `decorateBadge`) + `src/twitchbadges.ts`, a generated snapshot of Twitch's global badges                                                                        |
-| `src/youtube.ts`       | YouTube Data API v3 polling — quota-aware live detection (uploads playlist + rationed search), chat polling paced by a per-day quota ledger                                                                                 |
-| `src/server.ts`        | `Deno.serve` HTTP server + the embedded viewer HTML/CSS/JS (`/`, `/overlay`, `/alerts`)                                                                                                                                     |
-| `src/control.ts`       | Pure control-plane helpers (loopback check, key-body parse, startup-key resolution, state paths)                                                                                                                            |
-| `src/fake.ts`          | Fake-event demo sequence + wire (de)serialization/validation behind `POST /api/fake`                                                                                                                                        |
-| `src/alerts.ts`        | Pure `/alerts` theme-registry validation (`normalizeAlertsConfig`), injected into the page as `window.MULTICHAT_ALERTS`                                                                                                     |
-| `src/channelpoints.ts` | Pure channel-points logic: config + `DEFAULT_CATALOG`, the reward sync diff, the redemption-ledger reducers, the cobblemon-overlay effect-API wire; the engine that drives them lives in `main.ts`                          |
+| File                   | Responsibility                                                                                                                                                                                                                                                                            |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `main.ts`              | Entry point — loads settings, creates the server, starts the platform clients, owns the runtime-key manager (shared YouTube runtime + quota ledger, key source + fallback, go-live hints), the Twitch badge manager, the EventSub manager, the state-file writers and the CLI subcommands |
+| `src/types.ts`         | Shared interfaces: `Settings`, `ChatMessage`, `ServerEvent`, `Emitter`, `ChannelStatus`, `TwitchEventSubConfig`, EventSub frames                                                                                                                                                          |
+| `src/twitch.ts`        | Twitch IRC over WebSocket (`wss://irc-ws.chat.twitch.tv`), with reconnect; suppresses events for EventSub-covered channels; decorates badges with art via a `BadgeSource`                                                                                                                 |
+| `src/eventsub.ts`      | Twitch EventSub over WebSocket (`wss://eventsub.wss.twitch.tv`) — follow/cheer/sub/raid; pure mappers + socket client                                                                                                                                                                     |
+| `src/twitchauth.ts`    | Pure Twitch OAuth + Helix/EventSub request builders / response parsers (incl. the app-token grant and chat-badge lists) + the `SUBSCRIPTIONS` table                                                                                                                                       |
+| `src/badges.ts`        | Pure badge-art resolution (`resolveBadgeArt`, `badgeLabel`, `decorateBadge`) + `src/twitchbadges.ts`, a generated snapshot of Twitch's global badges                                                                                                                                      |
+| `src/youtube.ts`       | YouTube Data API v3 polling — quota-aware live detection (uploads playlist + rationed search), chat polling paced by a per-day quota ledger                                                                                                                                               |
+| `src/server.ts`        | `Deno.serve` HTTP server + the embedded viewer HTML/CSS/JS (`/`, `/overlay`, `/alerts`)                                                                                                                                                                                                   |
+| `src/control.ts`       | Pure control-plane helpers (loopback check, key-body + live-hint body parse, startup-key resolution, state paths, the single-flight state writer)                                                                                                                                         |
+| `src/status.ts`        | Pure `GET /api/status` shapes, their assembly, and the text `multichat status` prints; also the package `VERSION` (read by `build.nix`)                                                                                                                                                   |
+| `src/fake.ts`          | Fake-event demo sequence + wire (de)serialization/validation behind `POST /api/fake`                                                                                                                                                                                                      |
+| `src/alerts.ts`        | Pure `/alerts` theme-registry validation (`normalizeAlertsConfig`), injected into the page as `window.MULTICHAT_ALERTS`                                                                                                                                                                   |
+| `src/channelpoints.ts` | Pure channel-points logic: config + `DEFAULT_CATALOG`, the reward sync diff, the redemption-ledger reducers, the cobblemon-overlay effect-API wire; the engine that drives them lives in `main.ts`                                                                                        |
 
 ## Data flow
 
@@ -75,14 +76,23 @@ For channels in `twitch.eventsub`, `eventsub.ts` opens one **receive-only**
 WebSocket per broadcaster (a session may only carry one user's token). On the
 `session_welcome` it creates the follow/cheer/sub/gift/resub/raid subscriptions
 via the Helix API (within the 10-second window), then maps each `notification`
-to a `ChatMessage` through the same `Emitter`. It mirrors the IRC client's idle
-watchdog (driven by the session's `keepalive_timeout_seconds`) and backoff, and
-migrates on `session_reconnect`. The pure mappers and `classifyFrame` live
-outside the socket for testing. `main.ts`'s EventSub manager owns each channel's
-token: user access tokens are refreshed reactively (single-flight) using the
-rotating refresh token, which is persisted (rotated-token-first) to the state
-directory. `twitchauth.ts` holds the pure request builders / response parsers.
-EventSub does not touch the sidebar status (IRC owns the Twitch dot).
+to a `ChatMessage` through the same `Emitter`. It also subscribes to
+`stream.online` / `stream.offline` (no scope needed), which render nothing: they
+reach an `onStream` observer that `main.ts` turns into the YouTube poller's
+[go-live hint](#go-live-hints). It mirrors the IRC client's idle watchdog
+(driven by the session's `keepalive_timeout_seconds`) and backoff, and migrates
+on `session_reconnect`. The pure mappers and `classifyFrame` live outside the
+socket for testing. `main.ts`'s EventSub manager owns each channel's token: user
+access tokens are refreshed reactively (single-flight) using the rotating
+refresh token, which is persisted (rotated-token-first, atomically) to the state
+directory. The configured seed stays the fallback: a persisted file that is
+empty or unreadable starts from the seed (`chooseRefreshToken`), and an
+`Invalid refresh token` answer is retried once with a different seed
+(`shouldRetryWithSeed`). `twitchauth.ts` holds the pure request builders /
+response parsers. EventSub does not touch the sidebar status (IRC owns the
+Twitch dot); its token, session and subscription state are reported by
+`GET /api/status` instead (`applySessionEvent` folds the socket's `onSession`
+events into it).
 
 ## YouTube client
 
@@ -104,6 +114,55 @@ up — any attach, a page-token reset, or an unplanned gap of more than 5 minute
 mid-chat shows `error` and keeps the chat's page token, so a new key resumes it
 at once. See [Reliability & limits](#reliability--limits) for the quota
 handling.
+
+### Go-live hints
+
+`liveHint(rt, "live" | "offline")` is how something that already knows the
+stream started or stopped — `POST /api/live`, `multichat live on|off`, Twitch's
+`stream.online` — nudges the poller. It is synchronous and only ever changes
+_when_ the loops look:
+
+- `live` starts a **boost**: it stamps `boostAt` in the quota ledger (counted
+  against `BOOST_DAILY_CAP`, so the cap and a running boost survive a restart)
+  and wakes every offline discovery sleep. While `boostActive`, the plain
+  offline wait is `BOOST_TICK_MS` instead of the 3 minute tick, and
+  `searchGateOpen` lets one search through early (`earlySearchDue`:
+  `BOOST_SEARCH_DELAY_MS` into the boost, skipping only the spacing — never the
+  block, the exhausted pool or the 40-a-day cap). The ledger records that search
+  as `earlySearchAt`, not `lastSearchAt`: it counts toward the cap, but the
+  spacing keeps running from the last regular search, so an early search that
+  was too early does not restart it. The gate is shared, so with several
+  channels the early search goes to whichever ticks first.
+- A hint flagged `resync` — `parseLiveSignalBody` sets it for a webhook event
+  that is read by its `data.streaming` rather than being `stream.started` /
+  `stream.stopped` — reports the state instead of a change. `rt.hint.state`
+  remembers what the last hint said; a `live` re-sync that repeats it starts no
+  boost, so a sender's once-a-minute "still streaming" cannot chain boosts until
+  the day's allowance is gone.
+- `offline` marks the attached chats in `rt.verifyNow` and wakes the chat
+  sleeps; each chat runs its ordinary `videos.list` verification at once and
+  then sleeps the rest of its interval, so the chat itself is never polled
+  early. A hint that lands while a poll or a verification is in flight is picked
+  up before the chat goes to sleep.
+
+The wake is `hintableSleep`: each sleeper registers one callback in
+`rt.discoveryWakers` / `rt.chatWakers` and removes it (and its abort listener)
+on waking. Only the plain offline wait and the chat interval are hintable — the
+quota park, the denied-key retry and the transient back-offs keep their own
+pace, which is what makes "a hint never bypasses a park" structural rather than
+a check. The pollers also keep a per-channel `ChannelReport` (state, the reason
+of the last transition, the attached video, the park) that
+`youtubeRuntimeStatus` exposes to `GET /api/status`.
+
+A failure Google attributes to the key itself is flagged `keyRefused`
+(`classifyYtError`) and reported through the runtime's `onKeyRefused`; the key
+manager in `main.ts` uses it to fall back from a refused runtime key to the
+declared one (`resolveStartupKeySource` keeps both). The quota ledger counts per
+key: `adoptKey` shelves the numbers of the key being left (`shelved`, one deep,
+persisted with the rest) and takes them up again when that key returns the same
+Pacific day — otherwise a stale runtime key, tried first and refused at every
+start, would reset the working key's day (search count, parks, boosts) with each
+restart.
 
 ## Design notes
 
@@ -154,6 +213,18 @@ Tuned for unattended multi-hour streams:
   redacted from logs, including network-error text that quotes the request URL.
   See
   [Configuration → Quota and long streams](../configuration.md#quota-and-long-streams).
+- **State that survives a power cut.** Every state file goes through
+  `persistStateAtomic` (temp file + fsync + rename, then an fsync of the
+  directory so the rename itself is on disk), and the files that change often —
+  the giveaway's pool, campaign, packs, turns and plan, the channel-points
+  ledger, reward map and pause — through `createStateWriter`, a single-flight
+  writer that folds overlapping changes into one follow-up write and is flushed
+  on SIGTERM/SIGINT. On load, a file that is not the expected JSON shape
+  (`decodeStateFile` + a shape check such as `GIVEAWAY_FILE_SHAPE`), or that
+  exists but cannot be read, is moved aside to `<name>.corrupt-<timestamp>` and
+  reported, never read as "empty" and overwritten; a writer that was never
+  called writes nothing on flush, so the empty state doesn't replace the file
+  either.
 - **SSE client cap.** `/events` is capped at 50 concurrent connections (returns
   `503` beyond that) so an exposed port can't be flooded with open streams.
 - **Bounded browser memory.** The viewer keeps at most 500 messages, removing

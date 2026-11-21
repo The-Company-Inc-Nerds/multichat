@@ -45,11 +45,26 @@ let
     "MULTICHAT_INTEGRATION_TOKEN_*"
     # Bearer for the cobblemon-overlay effect routes (channelPoints.overlayToken).
     "MULTICHAT_EFFECTS_TOKEN"
+    # A channel's seed refresh token, one variable per broadcaster id (another
+    # prefix wildcard). See twitchSeedEnvVar in src/twitchauth.ts.
+    "MULTICHAT_TWITCH_SEED_*"
   ];
+
+  # One version for the package and for GET /api/status: the app's own
+  # constant. A miss fails the evaluation rather than letting the two drift.
+  # Matched on its own line: builtins.match over the whole file would recurse
+  # once per character.
+  version =
+    let
+      line = pkgs.lib.findFirst (pkgs.lib.hasPrefix "export const VERSION = ")
+        (throw "build.nix: src/status.ts no longer declares VERSION")
+        (pkgs.lib.splitString "\n" (builtins.readFile ./src/status.ts));
+    in
+    builtins.head (builtins.match ''export const VERSION = "([^"]+)";'' line);
 in
 pkgs.stdenv.mkDerivation {
   pname = "multichat";
-  version = "0.1.0";
+  inherit version;
   src = pkgs.lib.cleanSource ./.;
   nativeBuildInputs = [ pkgs.makeWrapper ];
   dontBuild = true;

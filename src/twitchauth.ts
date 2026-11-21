@@ -84,6 +84,21 @@ export const SUBSCRIPTIONS: readonly SubscriptionSpec[] = [
     scope: null,
     condition: (id) => ({ to_broadcaster_user_id: id }),
   },
+  // The channel going on / off air. Nothing is rendered for these: they are a
+  // go-live hint for the YouTube poller (a simulcast starts both at once), and
+  // need no scope — any token of the broadcaster's may subscribe.
+  {
+    type: "stream.online",
+    version: "1",
+    scope: null,
+    condition: (id) => ({ broadcaster_user_id: id }),
+  },
+  {
+    type: "stream.offline",
+    version: "1",
+    scope: null,
+    condition: (id) => ({ broadcaster_user_id: id }),
+  },
   // Channel-point redemptions, broadcaster-wide (no reward_id): the app filters
   // to the rewards it created itself, so one subscription survives catalogue
   // edits. `.update` reports a status change made elsewhere (the streamer
@@ -244,6 +259,60 @@ export function parseTokenResponse(json: unknown): TokenResult {
     ? o.error
     : "missing access_token/refresh_token";
   return { ok: false, message: msg };
+}
+
+// ---- Refresh-token seed fallback --------------------------------------------
+//
+// The persisted (rotated) refresh token normally wins over the seed the
+// operator configured. But the persisted file can be lost to a power cut, and
+// a token can be revoked — the seed is then the only other credential there
+// is, so it is tried before giving up.
+
+/**
+ * Env-var name carrying a channel's seed refresh token:
+ * `MULTICHAT_TWITCH_SEED_<broadcasterId>`, every run of non-alphanumerics in
+ * the id collapsed to one `_` (Twitch ids are digits, so normally verbatim).
+ * The NixOS module exports the `refreshTokenFile` credential under this name —
+ * settings.json carries "" for such a channel — and computes it by the same
+ * rule, so the two must stay in sync.
+ */
+export function twitchSeedEnvVar(broadcasterId: string): string {
+  return `MULTICHAT_TWITCH_SEED_${
+    broadcasterId.replace(/[^A-Za-z0-9]+/g, "_")
+  }`;
+}
+
+/** The refresh token a channel starts from: the persisted one when there is
+ *  one, else the seed. `persisted` is null for a missing, empty or unreadable
+ *  file — none of which may leave the channel without a token while a seed
+ *  exists. `source` is null when there is no token at all. */
+export function chooseRefreshToken(
+  persisted: string | null,
+  seed: string,
+): { token: string; source: "persisted" | "seed" | null } {
+  const p = (persisted ?? "").trim();
+  if (p) return { token: p, source: "persisted" };
+  const s = seed.trim();
+  return s ? { token: s, source: "seed" } : { token: "", source: null };
+}
+
+/** True for Twitch's answer to a refresh token it no longer accepts (revoked,
+ *  superseded, or never valid): `400 {"message": "Invalid refresh token"}`. */
+export function isInvalidRefreshToken(message: string): boolean {
+  return /invalid refresh token/i.test(message);
+}
+
+/** Whether a rejected refresh should be retried with the seed: only for an
+ *  invalid-token answer, only when the seed is a different token, and only
+ *  once (`tried`) — a seed that is refused too is not presented again. */
+export function shouldRetryWithSeed(o: {
+  message: string;
+  current: string;
+  seed: string;
+  tried: boolean;
+}): boolean {
+  return !o.tried && !!o.seed && o.seed !== o.current &&
+    isInvalidRefreshToken(o.message);
 }
 
 // ---- App access token (client credentials) --------------------------------

@@ -1,17 +1,26 @@
 import {
+  BOOST_DAILY_CAP,
+  BOOST_DURATION_MS,
+  BOOST_SEARCH_DELAY_MS,
+  BOOST_TICK_MS,
+  boostActive,
   buildBadges,
+  type ChannelReport,
   type ChatItem,
   classifyYtError,
   createQuotaLedger,
   createYouTubeRuntime,
   DISCOVERY_TICK_MS,
+  earlySearchDue,
   emitItem,
   formatDuration,
   freshItems,
   freshQuota,
   governedIntervalMs,
+  HINT_VERIFY_SPACING_MS,
   keyFingerprint,
   LIVE_CALL_COST,
+  liveHint,
   MAX_GOVERNED_POLL_MS,
   msUntilPacificMidnight,
   normalizeQuotaSnapshot,
@@ -34,6 +43,8 @@ import {
   type VideoItem,
   youtubeLabel,
   type YouTubeRuntime,
+  youtubeRuntimeStatus,
+  type YtFailure,
   ytFetch,
 } from "../src/youtube.ts";
 import { youtubeQuotaStatePath } from "../src/control.ts";
@@ -452,6 +463,45 @@ Deno.test("classifyYtError: key / project problems are denied", () => {
   );
 });
 
+Deno.test("classifyYtError: only a refusal of the key itself is keyRefused", () => {
+  // Google names the key in details[] only (errors[] just says badRequest).
+  assertEquals(classifyYtError(400, KEY_INVALID_400).keyRefused, true);
+  for (
+    const reason of ["keyExpired", "accessNotConfigured", "ipRefererBlocked"]
+  ) {
+    const c = classifyYtError(403, ytErr(403, reason, "usageLimits"));
+    assertEquals(c.kind, "denied", reason);
+    assertEquals(c.keyRefused, true, reason);
+  }
+  // Denied, but about the request: another key would fare no better.
+  const forbidden = classifyYtError(403, ytErr(403, "forbidden"));
+  assertEquals(forbidden.kind, "denied");
+  assertEquals(forbidden.keyRefused, undefined);
+  assertEquals(
+    classifyYtError(404, ytErr(404, "videoNotFound")).keyRefused,
+    undefined,
+  );
+  // Quota and blips are never the key's fault.
+  assertEquals(classifyYtError(403, QUOTA_403).keyRefused, undefined);
+  assertEquals(classifyYtError(503, "upstream").keyRefused, undefined);
+});
+
+Deno.test("ytFetch: a refused key is flagged on the failure, a network error is not", async () => {
+  const refused = await ytFetch("http://test/videos?key=SECRETKEY", undefined, {
+    fetch: () =>
+      Promise.resolve(new Response(KEY_INVALID_400, { status: 400 })),
+    log: () => {},
+  });
+  assert(!refused.ok);
+  assertEquals(refused.keyRefused, true);
+  const down = await ytFetch("http://test/videos?key=SECRETKEY", undefined, {
+    fetch: () => Promise.reject(new TypeError("API_KEY_INVALID in a URL")),
+    log: () => {},
+  });
+  assert(!down.ok);
+  assertEquals(down.keyRefused, undefined);
+});
+
 Deno.test("classifyYtError: bad page tokens are their own kind", () => {
   assertEquals(
     classifyYtError(400, ytErr(400, "pageTokenInvalid"), true).kind,
@@ -757,6 +807,54 @@ Deno.test("searchGateOpen: blocked, capped, spaced", () => {
   assert(searchGateOpen({ ...q, searches: 1, lastSearchAt: now - HOUR }, now));
 });
 
+Deno.test("boostActive: five minutes from the hint, never while exhausted", () => {
+  const at = Date.parse("2026-10-08T20:00:00Z");
+  const q = { ...freshQuota("2026-10-08"), boosts: 1, boostAt: at };
+  assert(boostActive(q, at));
+  assert(boostActive(q, at + BOOST_DURATION_MS - 1));
+  assert(!boostActive(q, at + BOOST_DURATION_MS));
+  assert(!boostActive(q, at - 1)); // a clock that stepped back
+  assert(!boostActive({ ...q, boostAt: null }, at));
+  assert(!boostActive({ ...q, exhausted: true }, at));
+});
+
+Deno.test("searchGateOpen: a boost's early search skips the spacing, nothing else", () => {
+  const now = Date.parse("2026-10-08T20:00:00Z");
+  // A boost that started a minute ago; the last search was 5 minutes ago,
+  // far inside the usual ≥20 min spacing.
+  const q = {
+    ...freshQuota("2026-10-08"),
+    searches: 1,
+    lastSearchAt: now - 5 * MIN,
+    boosts: 1,
+    boostAt: now - BOOST_SEARCH_DELAY_MS,
+  };
+  assert(!searchGateOpen({ ...q, boostAt: null }, now), "spaced without it");
+  assert(earlySearchDue(q, now));
+  assert(searchGateOpen(q, now));
+  // Not before the playlist path has had its minute…
+  assert(!earlySearchDue(q, now - 1));
+  assert(!searchGateOpen(q, now - 1));
+  // …and only once: a search since it became due used it up — the early
+  // one itself, or a regular slot that fell there.
+  const spent = { ...q, searches: 2, earlySearchAt: now };
+  assert(!earlySearchDue(spent, now + MIN));
+  assert(!searchGateOpen(spent, now + MIN));
+  const slot = { ...q, searches: 2, lastSearchAt: now };
+  assert(!earlySearchDue(slot, now + MIN));
+  assert(!searchGateOpen(slot, now + MIN));
+  // An earlier boost's early search says nothing about this one's.
+  assert(earlySearchDue({ ...q, earlySearchAt: q.boostAt - MIN }, now));
+  // Never past the block, the exhausted pool or the daily cap.
+  assert(!searchGateOpen({ ...q, searchBlocked: true }, now));
+  assert(!searchGateOpen({ ...q, exhausted: true }, now));
+  assert(!searchGateOpen({ ...q, searches: SEARCH_DAILY_CAP }, now));
+  // Unused, it lapses with the boost.
+  const after = q.boostAt + BOOST_DURATION_MS;
+  assert(!earlySearchDue(q, after));
+  assert(!searchGateOpen(q, after));
+});
+
 Deno.test("normalizeQuotaSnapshot keeps today, resets a stale or bad file", () => {
   const today = "2026-10-08";
   const kept = normalizeQuotaSnapshot({
@@ -831,6 +929,156 @@ Deno.test("createQuotaLedger: restore, key changes, live time", () => {
   fresh.charge(7);
   assert(!fresh.adoptKey("k"));
   assertEquals(fresh.snapshot().units, 7);
+});
+
+Deno.test("the quota ledger counts go-live boosts, restores them, and forgets them at midnight PT", () => {
+  let t = Date.parse("2026-10-08T20:00:00Z");
+  let changes = 0;
+  const l = createQuotaLedger({ now: () => t, onChange: () => changes++ });
+  assertEquals(l.snapshot().boosts, 0);
+  assertEquals(l.snapshot().boostAt, null);
+  l.noteBoost();
+  t += 10 * MIN;
+  l.noteBoost();
+  assertEquals(changes, 2); // each one is persisted
+  assertEquals(l.snapshot().boosts, 2);
+  assertEquals(l.snapshot().boostAt, t);
+  // A restart resumes the count (the cap must survive one)…
+  const restored = createQuotaLedger({ now: () => t, snapshot: l.snapshot() });
+  assertEquals(restored.snapshot().boosts, 2);
+  assertEquals(restored.snapshot().boostAt, t);
+  // …a ledger written before boosts existed reads as none…
+  const old = normalizeQuotaSnapshot(
+    { day: "2026-10-08", units: 5, searches: 1 },
+    "2026-10-08",
+  );
+  assertEquals([old.boosts, old.boostAt], [0, null]);
+  assertEquals(
+    normalizeQuotaSnapshot(
+      { day: "2026-10-08", boosts: -3, boostAt: "soon" },
+      "2026-10-08",
+    ).boosts,
+    0,
+  );
+  // …and a new Pacific day starts from zero.
+  t += 24 * HOUR;
+  assertEquals(restored.snapshot().boosts, 0);
+  assertEquals(restored.snapshot().boostAt, null);
+});
+
+Deno.test("the quota ledger: a boost's early search spends one of the day's searches but keeps the regular slot", () => {
+  let t = Date.parse("2026-10-09T02:00:00Z"); // 19:00 PDT: 20 min spacing
+  const l = createQuotaLedger({ now: () => t });
+  l.noteSearch(); // a regular slot
+  const regular = t;
+  assertEquals(l.snapshot().lastSearchAt, regular);
+  assertEquals(l.snapshot().earlySearchAt, null);
+
+  t += 4 * MIN;
+  l.noteBoost();
+  t += BOOST_SEARCH_DELAY_MS;
+  assert(l.searchAllowed(), "the early search is due");
+  l.noteSearch();
+  const early = t;
+  const q = l.snapshot();
+  assertEquals(q.searches, 2); // it counts toward the 40 a day…
+  assertEquals(q.earlySearchAt, early);
+  // …but the spacing still runs from the regular search: an early search
+  // that found nothing must not push the next slot back.
+  assertEquals(q.lastSearchAt, regular);
+  assert(!l.searchAllowed(), "one early search per boost");
+  t = regular + SEARCH_MIN_SPACING_MS - 1;
+  assert(!l.searchAllowed());
+  t = regular + SEARCH_MIN_SPACING_MS;
+  assert(l.searchAllowed(), "the regular slot is where it was");
+
+  // A restart mid-boost can't grant the early search twice.
+  t = early + MIN;
+  const restarted = createQuotaLedger({ now: () => t, snapshot: l.snapshot() });
+  assertEquals(restarted.snapshot().earlySearchAt, early);
+  assert(!restarted.searchAllowed());
+  // A file written before the field existed, or a damaged one, reads as none.
+  for (const earlySearchAt of [undefined, "soon", NaN]) {
+    assertEquals(
+      normalizeQuotaSnapshot({ day: "2026-10-08", earlySearchAt }, "2026-10-08")
+        .earlySearchAt,
+      null,
+    );
+  }
+});
+
+Deno.test("the quota ledger: a key that comes back the same day takes up its numbers again", () => {
+  let t = Date.parse("2026-10-08T20:00:00Z");
+  // The working key's day so far, as the last run left it on disk.
+  const l = createQuotaLedger({
+    now: () => t,
+    snapshot: {
+      day: "2026-10-08",
+      units: 9000,
+      searches: SEARCH_DAILY_CAP,
+      searchBlocked: true,
+      liveMs: 3 * HOUR,
+      lastSearchAt: t - HOUR,
+      keyFp: "declared",
+      boosts: BOOST_DAILY_CAP,
+      boostAt: t - HOUR,
+    },
+  });
+  const day = (x: typeof l) => {
+    const q = x.snapshot();
+    return [q.keyFp, q.units, q.searches, q.searchBlocked, q.liveMs, q.boosts];
+  };
+  const declared = ["declared", 9000, SEARCH_DAILY_CAP, true, 3 * HOUR, 12];
+
+  // A stale runtime key is tried first: unknown, so it counts from zero…
+  assert(l.adoptKey("stale"));
+  assertEquals(day(l), ["stale", 0, 0, false, 0, 0]);
+  l.charge(1); // …its one refused call…
+  // …and the fallback to the declared key finds that key's day as it was.
+  assert(!l.adoptKey("declared"), "not counted from zero again");
+  assertEquals(day(l), declared);
+  assert(!l.searchAllowed(), "the search block was not forgotten");
+
+  // The same at the next start, from what was persisted — whichever key the
+  // file was last written under (a power cut can land before the fallback).
+  for (const written of ["declared", "stale"]) {
+    const next = createQuotaLedger({ now: () => t });
+    next.adoptKey("declared");
+    next.charge(9000);
+    next.adoptKey("stale");
+    next.charge(1);
+    if (written === "declared") next.adoptKey("declared");
+    const restored = createQuotaLedger({
+      now: () => t,
+      snapshot: JSON.parse(JSON.stringify(next.snapshot())),
+    });
+    assert(!restored.adoptKey("stale"), `stale, file under ${written}`);
+    assertEquals(restored.snapshot().units, 1);
+    assert(!restored.adoptKey("declared"), `declared, file under ${written}`);
+    assertEquals(restored.snapshot().units, 9000);
+  }
+
+  // Only the key used just before is remembered; any other starts from zero.
+  assert(l.adoptKey("third"));
+  assert(l.adoptKey("stale"));
+  assert(!l.adoptKey("third"));
+  // Shelved numbers are worthless on a new Pacific day, and so is a shelf
+  // from another day or without a key in a file read back.
+  t += 24 * HOUR;
+  assertEquals(l.snapshot().shelved, null);
+  assert(l.adoptKey("stale"));
+  for (
+    const shelved of [{ day: "2026-10-07", keyFp: "k", units: 5 }, {
+      day: "2026-10-08",
+      units: 5,
+    }, "garbage"]
+  ) {
+    assertEquals(
+      normalizeQuotaSnapshot({ day: "2026-10-08", shelved }, "2026-10-08")
+        .shelved,
+      null,
+    );
+  }
 });
 
 // ---- live detection / dedupe -----------------------------------------------------
@@ -979,12 +1227,21 @@ interface Harness {
   rt: YouTubeRuntime;
   e: ReturnType<typeof fakeEmitter>;
   calls: Call[];
-  sleeps: { t: number; ms: number }[];
+  /** Every sleep asked for; `woke` is set (to how long it really lasted)
+   *  when a timed event cut it short. */
+  sleeps: { t: number; ms: number; woke?: number }[];
   logs: string[];
   controller: AbortController;
   run(ch: YouTubeChannelConfig): Promise<void>;
   callsTo(path: string): Call[];
   states(): string[];
+}
+
+/** Something that happens at a fixed time while the poller sleeps — a hint
+ *  arriving. Runs once, at `at`, inside whichever sleep spans it. */
+interface TimedEvent {
+  at: number;
+  run: (h: Harness) => void;
 }
 
 type Route = (call: Call, h: Harness) => Response | Promise<Response>;
@@ -995,13 +1252,17 @@ const json = (body: unknown, status = 200) =>
 /**
  * Drive pollYouTubeChannel with a fake clock, an instant sleep (that advances
  * the clock) and a fetch routed by URL path. `stop` is consulted after every
- * sleep; the loop is aborted when it says so (or after `maxSleeps`).
+ * sleep; the loop is aborted when it says so (or after `maxSleeps`). `events`
+ * fire at their own times inside the sleep that spans them; one that wakes
+ * the sleeper (its signal aborts) ends that sleep there, like a real hint.
  */
 function harness(opts: {
   start: string;
   route: Route;
   stop?: (h: Harness, ms: number) => boolean;
   maxSleeps?: number;
+  events?: TimedEvent[];
+  onKeyRefused?: (key: string, failure: YtFailure) => void;
 }): Harness {
   const h = {
     clock: { t: Date.parse(opts.start) },
@@ -1012,6 +1273,7 @@ function harness(opts: {
     controller: new AbortController(),
   } as Harness;
   const maxSleeps = opts.maxSleeps ?? 2000;
+  const events = [...(opts.events ?? [])].sort((a, b) => a.at - b.at);
   h.rt = createYouTubeRuntime({
     now: () => h.clock.t,
     random: () => 0.5,
@@ -1029,13 +1291,27 @@ function harness(opts: {
     },
     sleep: (ms, signal) => {
       if (signal?.aborted) return Promise.resolve();
-      h.sleeps.push({ t: h.clock.t, ms });
-      h.clock.t += ms;
+      const entry: Harness["sleeps"][number] = { t: h.clock.t, ms };
+      const end = h.clock.t + ms;
+      h.sleeps.push(entry);
+      for (;;) {
+        const i = events.findIndex((ev) => ev.at < end);
+        if (i < 0) break;
+        const [ev] = events.splice(i, 1);
+        h.clock.t = Math.max(h.clock.t, ev.at);
+        ev.run(h);
+        if (signal?.aborted) {
+          entry.woke = h.clock.t - entry.t;
+          break;
+        }
+      }
+      if (entry.woke === undefined) h.clock.t = end;
       if (h.sleeps.length >= maxSleeps || opts.stop?.(h, ms)) {
         h.controller.abort();
       }
       return Promise.resolve();
     },
+    onKeyRefused: opts.onKeyRefused,
   });
   h.run = (ch) =>
     pollYouTubeChannel(ch, "SECRETKEY", h.e, h.rt, h.controller.signal);
@@ -2031,4 +2307,749 @@ Deno.test("scenario: the key never reaches a log or status line, whatever the er
     u.logs.join("\n"),
   );
   assertNoKeyLeak(u);
+});
+
+// ---- go-live hints ---------------------------------------------------------------
+
+/** A channel that is watched and not live: nothing in the playlist is, and
+ *  search finds nothing. */
+const offlineRoute: Route = (c) => {
+  switch (c.path) {
+    case "channels":
+      return json(UPLOADS);
+    case "playlistItems":
+      return json({ items: [{ contentDetails: { videoId: "v1" } }] });
+    case "videos":
+      return videosFrom({ v1: plainVideo("v1") })(c);
+    case "search":
+      return json({ items: [] });
+  }
+  return json({}, 500);
+};
+
+const offlineReport = (since: number): ChannelReport => ({
+  state: "offline",
+  reason: "not live",
+  since,
+  parked: null,
+  videoId: null,
+  checkedAt: since,
+  nextCheckAt: since + DISCOVERY_TICK_MS,
+});
+
+/** A runtime on a settable clock with one watched, offline channel — enough
+ *  to drive liveHint without running a poller. */
+function hintRuntime(clock: { t: number }, snapshot?: unknown) {
+  const rt = createYouTubeRuntime({
+    now: () => clock.t,
+    snapshot,
+    log: () => {},
+  });
+  rt.reports.set("chan", offlineReport(clock.t));
+  return rt;
+}
+
+Deno.test("scenario: a go-live hint wakes discovery, ticks every 20s for 5 min, then goes back to 3 min", async () => {
+  const t0 = Date.parse("2026-10-08T18:00:00Z");
+  const hintAt = t0 + 10 * MIN;
+  let hint: ReturnType<typeof liveHint> | undefined;
+  const boosts: unknown[] = [];
+  const h = harness({
+    start: "2026-10-08T18:00:00Z",
+    route: offlineRoute,
+    stop: (h) => h.clock.t >= t0 + 25 * MIN,
+    events: [
+      { at: hintAt, run: (h) => hint = liveHint(h.rt, "live", "test") },
+      {
+        at: hintAt + 30_000,
+        run: (h) => boosts.push(youtubeRuntimeStatus(h.rt).boost),
+      },
+      {
+        at: hintAt + 2 * MIN,
+        run: (h) => boosts.push(youtubeRuntimeStatus(h.rt).boost),
+      },
+      {
+        at: hintAt + 6 * MIN,
+        run: (h) => boosts.push(youtubeRuntimeStatus(h.rt).boost),
+      },
+    ],
+  });
+  await h.run({ channelId: "UCchan" });
+
+  assertEquals(hint?.effect, "boost");
+  assert(hint?.message.includes("boost 1/12 today"), hint?.message);
+  // It only changed when the poller looked: the channel was never called live.
+  assertEquals(h.states(), ["connecting", "offline"]);
+
+  // Three ordinary ticks, the fourth cut short by the hint…
+  const ticks = h.callsTo("playlistItems").map((c) => c.t - t0);
+  assertEquals(ticks.slice(0, 5), [
+    0,
+    3 * MIN,
+    6 * MIN,
+    9 * MIN,
+    10 * MIN,
+  ]);
+  assertEquals(h.sleeps[3].woke, MIN);
+  // …then every 20s for the five minutes, and 3 min ticks again after.
+  const boosted = h.sleeps.slice(4, 4 + BOOST_DURATION_MS / BOOST_TICK_MS);
+  assertEquals(boosted.length, 15);
+  assert(boosted.every((s) => s.ms === BOOST_TICK_MS), "20s ticks");
+  assertEquals(boosted[0].t, hintAt);
+  const after = h.sleeps.slice(4 + boosted.length);
+  assert(after.length >= 2, `${after.length} sleeps after the boost`);
+  assert(after.every((s) => s.ms === DISCOVERY_TICK_MS), "back to 3 min");
+  assertEquals(after[0].t, hintAt + BOOST_DURATION_MS);
+
+  // One early search a minute in — inside the ≥20 min spacing the first
+  // search of the day would otherwise impose — and no second early one; the
+  // regular slot then comes when it would have without the boost.
+  assertEquals(h.callsTo("search").map((c) => c.t - t0), [
+    0,
+    10 * MIN + BOOST_SEARCH_DELAY_MS,
+    21 * MIN,
+  ]);
+
+  // ≈2 units a tick, as ever; the boost is counted in the ledger.
+  const q = h.rt.ledger.snapshot();
+  assertEquals(q.units, 1 + 2 * h.callsTo("playlistItems").length);
+  assertEquals([q.boosts, q.boostAt], [1, hintAt]);
+  assertEquals(boosts, [
+    {
+      active: true,
+      until: hintAt + BOOST_DURATION_MS,
+      usedToday: 1,
+      dailyCap: BOOST_DAILY_CAP,
+      earlySearch: "waiting",
+    },
+    {
+      active: true,
+      until: hintAt + BOOST_DURATION_MS,
+      usedToday: 1,
+      dailyCap: BOOST_DAILY_CAP,
+      earlySearch: "done",
+    },
+    {
+      active: false,
+      until: null,
+      usedToday: 1,
+      dailyCap: BOOST_DAILY_CAP,
+      earlySearch: null,
+    },
+  ]);
+  assert(
+    h.logs.some((l) => l.includes("go-live hint (test) — checking now")),
+    h.logs.join("\n"),
+  );
+  assertNoKeyLeak(h);
+});
+
+Deno.test("scenario: a hinted stream that is only findable by search attaches a minute in", async () => {
+  const t0 = Date.parse("2026-10-08T18:00:00Z");
+  const hintAt = t0 + 4 * MIN;
+  const h = harness({
+    start: "2026-10-08T18:00:00Z",
+    route: (c, h) => {
+      switch (c.path) {
+        case "videos":
+          return videosFrom({
+            v1: plainVideo("v1"),
+            vLive: liveVideo("vLive", "c9", hintAt),
+          })(c);
+        case "search": // the stream starts with the hint, off the playlist
+          return json({
+            items: h.clock.t >= hintAt ? [{ id: { videoId: "vLive" } }] : [],
+          });
+        case "liveChat/messages":
+          h.controller.abort();
+          return json({ items: [] });
+      }
+      return offlineRoute(c, h);
+    },
+    events: [{ at: hintAt, run: (h) => liveHint(h.rt, "live") }],
+  });
+  await h.run({ channelId: "UCchan" });
+
+  // Without the hint the next search slot is ≥20 min after the first one.
+  const attach = h.callsTo("liveChat/messages")[0];
+  assertEquals(attach.t - hintAt, BOOST_SEARCH_DELAY_MS);
+  assertEquals(h.states(), ["connecting", "offline", "live"]);
+  assert(h.logs.some((l) => l.includes("found via search")), h.logs.join("\n"));
+});
+
+Deno.test("scenario: a stream the early search was too early for is found at the regular search slot, as with no hint", async () => {
+  const t0 = Date.parse("2026-10-08T18:00:00Z");
+  const hintAt = t0 + 4 * MIN;
+  // The encoder starts at `hintAt`; search.list only lists the broadcast 90s
+  // later — after the boost's early search has come and gone.
+  const detect = async (hinted: boolean) => {
+    const h = harness({
+      start: "2026-10-08T18:00:00Z",
+      route: (c, h) => {
+        switch (c.path) {
+          case "videos":
+            return videosFrom({
+              v1: plainVideo("v1"),
+              vLive: liveVideo("vLive", "c9", hintAt),
+            })(c);
+          case "search":
+            return json({
+              items: h.clock.t >= hintAt + 90_000
+                ? [{ id: { videoId: "vLive" } }]
+                : [],
+            });
+          case "liveChat/messages":
+            h.controller.abort();
+            return json({ items: [] });
+        }
+        return offlineRoute(c, h);
+      },
+      events: hinted
+        ? [{ at: hintAt, run: (h) => liveHint(h.rt, "live") }]
+        : [],
+    });
+    await h.run({ channelId: "UCchan" });
+    return {
+      attached: h.callsTo("liveChat/messages")[0].t - t0,
+      searches: h.callsTo("search").map((c) => c.t - t0),
+    };
+  };
+  const plain = await detect(false);
+  const hinted = await detect(true);
+
+  assertEquals(plain.searches, [0, 21 * MIN]);
+  // The early search came up empty, and cost nothing but itself: the next
+  // regular slot — and with it the attach — is where it is without a hint.
+  assertEquals(hinted.searches, [
+    0,
+    hintAt - t0 + BOOST_SEARCH_DELAY_MS,
+    21 * MIN,
+  ]);
+  assertEquals(hinted.attached, plain.attached);
+});
+
+Deno.test("liveHint: hints inside a boost coalesce; the daily cap and a running boost survive a restart", () => {
+  const clock = { t: Date.parse("2026-10-08T18:00:00Z") };
+  const rt = hintRuntime(clock);
+  let woken = 0;
+  rt.discoveryWakers.add(() => woken++);
+
+  assertEquals(liveHint(rt, "live").effect, "boost");
+  assertEquals(woken, 1);
+  clock.t += MIN;
+  const again = liveHint(rt, "live");
+  assertEquals(again.effect, "coalesced");
+  assert(again.message.includes("for another 240s"), again.message);
+  assertEquals(rt.ledger.snapshot().boosts, 1);
+  assertEquals(woken, 1); // already ticking fast: nothing to wake
+
+  // A restart mid-boost resumes it from the persisted ledger…
+  const restarted = hintRuntime(clock, rt.ledger.snapshot());
+  assert(youtubeRuntimeStatus(restarted).boost.active);
+  assertEquals(liveHint(restarted, "live").effect, "coalesced");
+  assertEquals(restarted.ledger.snapshot().boosts, 1);
+
+  // …and so does the count: 12 a day, whoever sends them.
+  for (let n = 2; n <= BOOST_DAILY_CAP; n++) {
+    clock.t += BOOST_DURATION_MS;
+    assertEquals(liveHint(rt, "live").effect, "boost", `boost ${n}`);
+  }
+  clock.t += BOOST_DURATION_MS;
+  const capped = liveHint(rt, "live");
+  assertEquals(capped.effect, "capped");
+  assertEquals(rt.ledger.snapshot().boosts, BOOST_DAILY_CAP);
+  assertEquals(woken, BOOST_DAILY_CAP);
+  const next = hintRuntime(clock, rt.ledger.snapshot());
+  assertEquals(liveHint(next, "live").effect, "capped");
+  assertEquals(youtubeRuntimeStatus(next).boost.usedToday, BOOST_DAILY_CAP);
+
+  // A new Pacific day brings a new allowance.
+  clock.t += 24 * HOUR;
+  assertEquals(liveHint(next, "live").effect, "boost");
+  assertEquals(next.ledger.snapshot().boosts, 1);
+});
+
+Deno.test("liveHint: a re-sync that repeats the last hint starts no boost; a change does", () => {
+  const clock = { t: Date.parse("2026-10-08T18:00:00Z") };
+  const rt = hintRuntime(clock);
+  let woken = 0;
+  rt.discoveryWakers.add(() => woken++);
+  const resync = (state: "live" | "offline") =>
+    liveHint(rt, state, "mailroom stream.state", { resync: true });
+
+  // The first report after a start is news: nothing said so before.
+  assertEquals(resync("live").effect, "boost");
+  // A sender repeating "still streaming" once a minute, to a server that
+  // cannot find the stream, used to chain boosts until the day's 12 were gone.
+  const effects: string[] = [];
+  for (let m = 1; m <= 3 * 60; m++) {
+    clock.t += MIN;
+    effects.push(resync("live").effect);
+  }
+  assertEquals([...new Set(effects)], ["coalesced"]);
+  assertEquals(rt.ledger.snapshot().boosts, 1);
+  assertEquals(woken, 1);
+  const repeat = resync("live");
+  assert(repeat.message.includes("repeats the last hint"), repeat.message);
+
+  // A change of state is news again, however it is reported…
+  assertEquals(resync("offline").effect, "idle"); // no chat attached
+  assertEquals(resync("live").effect, "boost");
+  // …and a sender's own "started" (no resync flag) never needed one.
+  clock.t += BOOST_DURATION_MS;
+  assertEquals(liveHint(rt, "live", "mailroom stream.started").effect, "boost");
+  clock.t += BOOST_DURATION_MS;
+  assertEquals(liveHint(rt, "live", "twitch chan").effect, "boost");
+  clock.t += BOOST_DURATION_MS;
+  assertEquals(resync("live").effect, "coalesced");
+  assertEquals(rt.ledger.snapshot().boosts, 4);
+
+  // A restart forgets what was last said: the next report counts once.
+  const restarted = hintRuntime(clock, rt.ledger.snapshot());
+  const again = () => liveHint(restarted, "live", "", { resync: true }).effect;
+  assertEquals([again(), again()], ["boost", "coalesced"]);
+  clock.t += BOOST_DURATION_MS;
+  assertEquals(again(), "coalesced");
+});
+
+Deno.test("liveHint: nothing to speed up while parked, attached or unwatched — and the ledger is left alone", () => {
+  const clock = { t: Date.parse("2026-10-08T18:00:00Z") };
+  const woke = (rt: YouTubeRuntime) => {
+    const n = { count: 0 };
+    rt.discoveryWakers.add(() => n.count++);
+    return n;
+  };
+
+  // The pool is spent: no boost can outrun the quota park.
+  const spent = hintRuntime(clock);
+  spent.ledger.charge(9_000);
+  spent.ledger.markExhausted();
+  const before = spent.ledger.snapshot();
+  const w1 = woke(spent);
+  const parked = liveHint(spent, "live");
+  assertEquals(parked.effect, "parked");
+  assert(parked.message.includes("until 00:00 PT"), parked.message);
+  assertEquals(spent.ledger.snapshot(), before); // not reset, not counted
+  assertEquals(w1.count, 0);
+
+  // The key is refused: discovery stays on its 10 min retry.
+  const denied = hintRuntime(clock);
+  denied.reports.get("chan")!.parked = "denied";
+  const w2 = woke(denied);
+  assertEquals(liveHint(denied, "live").effect, "parked");
+  assertEquals(denied.ledger.snapshot().boosts, 0);
+  assertEquals(w2.count, 0);
+
+  // Already on the live chat / nothing watched at all.
+  const attached = hintRuntime(clock);
+  attached.active.add("chan");
+  assertEquals(liveHint(attached, "live").effect, "attached");
+  assertEquals(attached.ledger.snapshot().boosts, 0);
+  const empty = createYouTubeRuntime({ now: () => clock.t, log: () => {} });
+  assertEquals(liveHint(empty, "live").effect, "idle");
+  assertEquals(liveHint(empty, "offline").effect, "idle");
+
+  // One channel attached, another still waiting: the boost is for that one.
+  attached.reports.set("other", offlineReport(clock.t));
+  assertEquals(liveHint(attached, "live").effect, "boost");
+});
+
+Deno.test("scenario: a hint does not shorten the key retry or the quota park", async () => {
+  const t0 = Date.parse("2026-10-08T18:00:00Z");
+  const effects: string[] = [];
+  const hintAt = (at: number) => ({
+    at,
+    run: (h: Harness) => effects.push(liveHint(h.rt, "live").effect),
+  });
+
+  const denied = harness({
+    start: "2026-10-08T18:00:00Z",
+    route: () => new Response(KEY_INVALID_400, { status: 400 }),
+    maxSleeps: 2,
+    events: [hintAt(t0 + MIN)],
+  });
+  await denied.run({ channelId: "UCchan" });
+  assertEquals(denied.sleeps.map((s) => [s.ms, s.woke]), [
+    [10 * MIN, undefined],
+    [10 * MIN, undefined],
+  ]);
+  assertEquals(denied.calls.map((c) => c.t - t0), [0, 10 * MIN]);
+
+  const spent = harness({
+    start: "2026-10-08T18:00:00Z",
+    route: () => new Response(QUOTA_403, { status: 403 }),
+    maxSleeps: 1,
+    events: [hintAt(t0 + HOUR)],
+  });
+  await spent.run({ channelId: "UCchan" });
+  assertEquals(spent.sleeps.length, 1);
+  assertEquals(spent.sleeps[0].woke, undefined);
+  assert(spent.sleeps[0].ms > 12 * HOUR, "slept until midnight PT");
+  assertEquals(spent.calls.length, 1);
+
+  // A back-off after a blip is not a park, so the boost does start — but the
+  // back-off keeps its own pace: only the plain offline wait is cut short.
+  const blip = harness({
+    start: "2026-10-08T18:00:00Z",
+    route: () => json({}, 500),
+    maxSleeps: 2,
+    events: [hintAt(t0 + 2000)],
+  });
+  await blip.run({ channelId: "UCchan" });
+  assertEquals(blip.sleeps.map((s) => [s.ms, s.woke]), [
+    [5000, undefined],
+    [10_000, undefined],
+  ]);
+
+  assertEquals(effects, ["parked", "parked", "boost"]);
+});
+
+Deno.test("scenario: an offline hint verifies the attached chat at once; a still-live stream keeps polling on its own pace", async () => {
+  const t0 = Date.parse("2026-10-08T18:00:00Z");
+  const effects: string[] = [];
+  const hintAt = (at: number) => ({
+    at,
+    run: (h: Harness) => effects.push(liveHint(h.rt, "offline", "test").effect),
+  });
+  const h = harness({
+    start: "2026-10-08T18:00:00Z",
+    route: liveRoute((n) =>
+      json({ items: [], nextPageToken: `t${n}`, pollingIntervalMillis: 5000 })
+    ),
+    stop: (h) => h.clock.t >= t0 + 2 * MIN,
+    // A sender stuck repeating itself asks once a minute at most.
+    events: [hintAt(t0 + 30_000), hintAt(t0 + 40_000), hintAt(t0 + 95_000)],
+  });
+  await h.run({ channelId: "UCchan" });
+
+  assertEquals(effects, ["verify", "coalesced", "verify"]);
+  // videos.list: the discovery, then one check per accepted hint — at the
+  // hint's time, not at the 10 min periodic check.
+  assertEquals(h.callsTo("videos").map((c) => c.t - t0), [0, 30_000, 95_000]);
+  assertEquals(h.callsTo("videos")[1].params.get("id"), "v1");
+  // YouTube still says live, so nothing was detached…
+  assertEquals(h.states(), ["connecting", "live"]);
+  // …and the chat itself was not polled early: its cadence is unbroken.
+  const chats = h.callsTo("liveChat/messages").map((c) => c.t);
+  const gap = chats[1] - chats[0];
+  assert(gap >= 5000, `gap ${gap}`);
+  for (let i = 2; i < chats.length; i++) {
+    assert(
+      Math.abs(chats[i] - chats[i - 1] - gap) < 1,
+      `poll ${i} came ${chats[i] - chats[i - 1]}ms after the last`,
+    );
+  }
+  assert(chats.length >= 10, `${chats.length} polls`);
+  assertEquals(h.sleeps.filter((s) => s.woke !== undefined).length, 2);
+  assertEquals(h.rt.verifyNow.size, 0);
+  assert(
+    h.logs.some((l) => l.includes("offline hint (test) — verifying UCchan")),
+    h.logs.join("\n"),
+  );
+});
+
+Deno.test("scenario: an offline hint ends the chat only when videos.list agrees", async () => {
+  const t0 = Date.parse("2026-10-08T18:00:00Z");
+  let ended = false;
+  const h = harness({
+    start: "2026-10-08T18:00:00Z",
+    route: (c, h) =>
+      c.path === "videos"
+        ? videosFrom({
+          v1: ended ? endedVideo("v1") : liveVideo("v1", "c1"),
+        })(c)
+        : liveRoute((n) => json({ items: [], nextPageToken: `t${n}` }))(c, h),
+    stop: (_h, ms) => ms === RESTART_RECHECK_MS,
+    events: [{
+      at: t0 + 30_000,
+      run: (h) => {
+        ended = true; // the encoder stopped, and YouTube has caught up
+        liveHint(h.rt, "offline");
+      },
+    }],
+  });
+  await h.run({ channelId: "UCchan" });
+
+  assertEquals(h.states(), ["connecting", "live", "offline"]);
+  const offline = h.e.captured.statuses.length;
+  assert(offline === 3);
+  assert(
+    h.logs.some((l) => l.includes("live chat ended (the stream ended)")),
+    h.logs.join("\n"),
+  );
+  // Detached at the hint (the periodic check was 10 minutes away).
+  assertEquals(h.sleeps[h.sleeps.length - 1].t, t0 + 30_000);
+  assertEquals(h.rt.active.size, 0);
+});
+
+Deno.test("scenario: an offline hint that lands mid-request is honoured before the next sleep, and never outlives its chat", async () => {
+  const t0 = Date.parse("2026-10-08T18:00:00Z");
+  // While the third chat poll is in flight: verified right after it, not one
+  // interval later (the sleeper it would have woken is not asleep yet).
+  const midPoll = harness({
+    start: "2026-10-08T18:00:00Z",
+    route: liveRoute((n, _c, h) => {
+      if (n === 3) liveHint(h.rt, "offline");
+      return json({ items: [], nextPageToken: `t${n}` });
+    }),
+    stop: (h) => h.callsTo("liveChat/messages").length >= 5,
+  });
+  await midPoll.run({ channelId: "UCchan" });
+  const polls = midPoll.callsTo("liveChat/messages").map((c) => c.t);
+  assertEquals(midPoll.callsTo("videos").map((c) => c.t), [t0, polls[2]]);
+  assertEquals(midPoll.rt.verifyNow.size, 0);
+
+  // While a verification is itself in flight (the periodic one, ten minutes
+  // in): that answer may be older than the hint, so it is asked again at
+  // once — not after the next chat poll, which the quota floor can put ten
+  // minutes away.
+  let verifies = 0;
+  const midVerify = harness({
+    start: "2026-10-08T18:00:00Z",
+    route: (c, h) => {
+      if (c.path === "videos" && ++verifies === 2) liveHint(h.rt, "offline");
+      return liveRoute((n) => json({ items: [], nextPageToken: `t${n}` }))(
+        c,
+        h,
+      );
+    },
+    stop: () => verifies >= 3,
+  });
+  await midVerify.run({ channelId: "UCchan" });
+  const checks = midVerify.callsTo("videos").map((c) => c.t - t0);
+  assertEquals(checks.length, 3);
+  assert(checks[1] >= 10 * MIN, `periodic check at ${checks[1]}`);
+  assertEquals(checks[2], checks[1]);
+  assertEquals(midVerify.states(), ["connecting", "live"]);
+
+  // The chat ends with a hint still pending: the request must not survive it
+  // to verify whatever is attached under that name next.
+  const ending = harness({
+    start: "2026-10-08T18:00:00Z",
+    route: liveRoute((n, _c, h) => {
+      if (n < 2) return json({ items: [], nextPageToken: "t1" });
+      liveHint(h.rt, "offline");
+      return new Response(CHAT_ENDED_403, { status: 403 });
+    }),
+    stop: (_h, ms) => ms === RESTART_RECHECK_MS,
+  });
+  await ending.run({ channelId: "UCchan" });
+  assertEquals(ending.states(), ["connecting", "live", "offline"]);
+  assertEquals(ending.rt.verifyNow.size, 0);
+});
+
+Deno.test("a go-live hint cuts a real discovery sleep short and leaves no listener behind", async () => {
+  // The generation's signal can live for months: count what stays attached.
+  const ac = new AbortController();
+  const attached = new Set<unknown>();
+  const add = ac.signal.addEventListener.bind(ac.signal);
+  const remove = ac.signal.removeEventListener.bind(ac.signal);
+  ac.signal.addEventListener = ((
+    type: string,
+    l: EventListener,
+    o?: AddEventListenerOptions,
+  ) => {
+    attached.add(l);
+    add(type, l, o);
+  }) as typeof ac.signal.addEventListener;
+  ac.signal.removeEventListener = ((type: string, l: EventListener) => {
+    attached.delete(l);
+    remove(type, l);
+  }) as typeof ac.signal.removeEventListener;
+
+  let checks = 0;
+  const rt = createYouTubeRuntime({
+    log: () => {},
+    fetch: (url) => {
+      const path = new URL(url).pathname.replace("/youtube/v3/", "");
+      if (path === "playlistItems") checks++;
+      return Promise.resolve(
+        json(path === "channels" ? UPLOADS : { items: [] }),
+      );
+    },
+  });
+  const until = async (what: string, cond: () => boolean) => {
+    for (let i = 0; i < 400 && !cond(); i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    assert(cond(), `timed out waiting for ${what}`);
+  };
+  const run = pollYouTubeChannel(
+    { channelId: "UCchan" },
+    "SECRETKEY",
+    fakeEmitter(),
+    rt,
+    ac.signal,
+  );
+  await until("the 3 min sleep", () => rt.discoveryWakers.size === 1);
+  assertEquals(checks, 1);
+
+  const started = Date.now();
+  assertEquals(liveHint(rt, "live").effect, "boost");
+  await until(
+    "the next check",
+    () => checks === 2 && rt.discoveryWakers.size === 1,
+  );
+  assert(Date.now() - started < 2000, "woke at once, not after 3 min");
+  // The sleep that was cut short took its waker and its listener with it;
+  // only the one now in progress (the 20s boost tick) holds any.
+  assertEquals(attached.size, 1);
+
+  ac.abort();
+  await run;
+  assertEquals(rt.discoveryWakers.size, 0);
+  assertEquals(attached.size, 0);
+});
+
+Deno.test("scenario: a key the API refuses is reported to its owner; other refusals are not", async () => {
+  const refused: [string, YtFailure][] = [];
+  const h = harness({
+    start: "2026-10-08T18:00:00Z",
+    route: () => new Response(KEY_INVALID_400, { status: 400 }),
+    maxSleeps: 1,
+    onKeyRefused: (key, failure) => refused.push([key, failure]),
+  });
+  await h.run({ handle: "@chan" });
+  assertEquals(refused.length, 1);
+  assertEquals(refused[0][0], "SECRETKEY");
+  assertEquals(refused[0][1].kind, "denied");
+  assertEquals(refused[0][1].keyRefused, true);
+  assert(!refused[0][1].message.includes("SECRETKEY"));
+
+  // Mid-chat too: the chat's key being revoked is the same report.
+  let polls = 0;
+  const chat = harness({
+    start: "2026-10-08T18:00:00Z",
+    route: liveRoute(() =>
+      ++polls > 1
+        ? new Response(KEY_INVALID_400, { status: 400 })
+        : json({ items: [], nextPageToken: "t1" })
+    ),
+    stop: (_h, ms) => ms === 10 * MIN,
+    onKeyRefused: (key, failure) => refused.push([key, failure]),
+  });
+  await chat.run({ channelId: "UCchan" });
+  assertEquals(refused.length, 2);
+  assertEquals(chat.states(), ["connecting", "live", "error"]);
+
+  // A 403 `forbidden` is about the request: no other key would fare better.
+  const other = harness({
+    start: "2026-10-08T18:00:00Z",
+    route: () => new Response(ytErr(403, "forbidden"), { status: 403 }),
+    maxSleeps: 1,
+    onKeyRefused: (key, failure) => refused.push([key, failure]),
+  });
+  await other.run({ handle: "@chan" });
+  assertEquals(other.states(), ["connecting", "error"]);
+  assertEquals(refused.length, 2);
+});
+
+Deno.test("youtubeRuntimeStatus: the attached video, the ledger and the reset — and never the key", async () => {
+  const t0 = Date.parse("2026-10-08T18:00:00Z");
+  let mid: ReturnType<typeof youtubeRuntimeStatus> | undefined;
+  const h = harness({
+    start: "2026-10-08T18:00:00Z",
+    route: liveRoute((n) => json({ items: [], nextPageToken: `t${n}` })),
+    stop: (h) => h.clock.t >= t0 + MIN,
+    events: [{ at: t0 + 30_000, run: (h) => mid = youtubeRuntimeStatus(h.rt) }],
+  });
+  await h.run({ channelId: "UCchan" });
+
+  assert(mid);
+  assertEquals(mid.parked, null);
+  assertEquals(mid.channels.length, 1);
+  const ch = mid.channels[0];
+  assertEquals(
+    [ch.name, ch.state, ch.videoId, ch.parked, ch.since, ch.checkedAt],
+    ["UCchan", "live", "v1", null, t0, t0],
+  );
+  assertEquals(
+    ch.reason,
+    "polling live chat (video v1, found via uploads playlist)",
+  );
+  assertEquals(mid.quota.day, "2026-10-08");
+  assert(mid.quota.units >= 3 + LIVE_CALL_COST, `${mid.quota.units} units`);
+  assertEquals(mid.quota.dailyQuota, 10_000);
+  assertEquals(mid.quota.budgetHours, 4);
+  assertEquals(
+    mid.quota.resetsAt,
+    Date.parse("2026-10-09T07:00:00Z"), // 00:00 PDT
+  );
+  assertEquals(mid.boost.active, false);
+  // The ledger's own bookkeeping is not part of the report.
+  assert(!("shelved" in mid.quota) && !("earlySearchAt" in mid.quota));
+  assert(!JSON.stringify(mid).includes("SECRETKEY"));
+
+  // Detached again once the generation is gone.
+  const end = youtubeRuntimeStatus(h.rt);
+  assertEquals(end.channels[0].videoId, null);
+});
+
+Deno.test("youtubeRuntimeStatus: says why detection is held back", async () => {
+  const t0 = Date.parse("2026-10-08T18:00:00Z");
+  const snap = async (route: Route, at: number, maxSleeps = 1) => {
+    let s: ReturnType<typeof youtubeRuntimeStatus> | undefined;
+    const h = harness({
+      start: "2026-10-08T18:00:00Z",
+      route,
+      maxSleeps,
+      events: [{ at, run: (h) => s = youtubeRuntimeStatus(h.rt) }],
+    });
+    await h.run({ channelId: "UCchan" });
+    assert(s);
+    assert(!JSON.stringify(s).includes("SECRETKEY"));
+    return s;
+  };
+
+  // The pool is spent: everything waits for midnight Pacific.
+  const spent = await snap(
+    () => new Response(QUOTA_403, { status: 403 }),
+    t0 + HOUR,
+  );
+  assertEquals(spent.parked?.reason, "exhausted");
+  assertEquals(spent.parked?.until, Date.parse("2026-10-09T07:00:00Z"));
+  assertEquals(spent.quota.exhausted, true);
+  assertEquals(
+    [spent.channels[0].state, spent.channels[0].parked],
+    ["error", "exhausted"],
+  );
+  assert(spent.channels[0].nextCheckAt! > spent.parked!.until!);
+
+  // The key is refused: the 10 min retry, with Google's own words.
+  const denied = await snap(
+    () => new Response(KEY_INVALID_400, { status: 400 }),
+    t0 + MIN,
+  );
+  assertEquals(denied.parked?.reason, "denied");
+  assertEquals(denied.parked?.until, t0 + 10 * MIN);
+  assert(denied.parked!.detail.includes("API key not valid"));
+  assertEquals(
+    [denied.channels[0].state, denied.channels[0].parked],
+    ["error", "denied"],
+  );
+
+  // Only the search fallback is blocked: the channel itself is fine.
+  const blocked = await snap(
+    (c, h) =>
+      c.path === "search"
+        ? new Response(SEARCH_429, { status: 429 })
+        : offlineRoute(c, h),
+    t0 + MIN,
+  );
+  assertEquals(blocked.parked?.reason, "search-blocked");
+  assertEquals(
+    [blocked.channels[0].state, blocked.channels[0].parked],
+    ["offline", null],
+  );
+  assertEquals(blocked.channels[0].reason, "not live");
+  assertEquals(blocked.channels[0].nextCheckAt, t0 + DISCOVERY_TICK_MS);
+
+  // Nothing wrong, and an early search that is due but not yet spent.
+  const clock = { t: t0 };
+  const rt = hintRuntime(clock);
+  assertEquals(youtubeRuntimeStatus(rt).parked, null);
+  liveHint(rt, "live");
+  clock.t += BOOST_SEARCH_DELAY_MS;
+  assertEquals(youtubeRuntimeStatus(rt).boost.earlySearch, "due");
+  assert(HINT_VERIFY_SPACING_MS >= MIN); // 1 unit a minute at the very most
 });

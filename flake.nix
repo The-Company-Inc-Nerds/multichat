@@ -28,7 +28,9 @@
         # the unit tests: deno's --allow-net allow-list (an unlisted subscriber or
         # overlay host is denied), its --allow-env allow-list (the token env vars
         # must be readable), and the LoadCredential path that keeps the tokens
-        # out of the Nix store.
+        # out of the Nix store. It also exercises the routes the unit tests
+        # never start a server for (the loopback-only go-live hint and status
+        # report) and the state directory under the unit's real sandbox.
         integrations = pkgs.testers.runNixOSTest {
           name = "multichat-integrations";
           nodes.machine = { pkgs, ... }: {
@@ -229,6 +231,56 @@
                 f"curl -X POST http://{lan}:8080/api/fake -d 'follow'"
             ) == "403", "/api/fake must not follow controlAccess"
 
+            # So do the go-live hint (it spends YouTube quota) and the status
+            # report (it describes the deployment); neither is for web pages.
+            live_body = "-d '{\"state\": \"live\", \"source\": \"test\"}'"
+            assert code(
+                f"curl -X POST http://{lan}:8080/api/live {live_body} "
+                "-H 'Authorization: Bearer control-secret'"
+            ) == "403", "/api/live must stay loopback-only"
+            assert code(
+                f"curl http://{lan}:8080/api/status "
+                "-H 'Authorization: Bearer control-secret'"
+            ) == "403", "/api/status must stay loopback-only"
+            assert code(
+                f"curl -X POST http://127.0.0.1:8080/api/live {live_body} "
+                "-H 'Origin: http://evil.test'"
+            ) == "403", "/api/live must refuse a web page"
+            assert code(
+                "curl http://127.0.0.1:8080/api/status "
+                "-H 'Origin: http://evil.test'"
+            ) == "403", "/api/status must refuse a web page"
+
+            # From loopback both answer, and the packaged CLI reaches them with
+            # the wrapper's permission flags as they are. A webhook's
+            # {event, ts, data} envelope is understood as it is; one about
+            # something else is a 200, never an error to retry.
+            status = json.loads(machine.succeed("curl -sf http://127.0.0.1:8080/api/status"))
+            assert status["twitch"]["irc"][0]["name"] == "demo", status
+            assert status["youtube"]["configured"] == 0, status
+            hint = json.loads(machine.succeed(
+                "curl -sf -X POST http://127.0.0.1:8080/api/live "
+                "-d '{\"event\": \"stream.started\", \"ts\": 0, \"data\": {\"streaming\": true}}'"
+            ))
+            assert hint["ok"] and hint["state"] == "live", hint
+            assert hint["effect"] == "unconfigured", hint  # no YouTube channels here
+            other = json.loads(machine.succeed(
+                "curl -sf -X POST http://127.0.0.1:8080/api/live "
+                "-d '{\"event\": \"scene.changed\", \"ts\": 0, \"data\": {\"scene\": \"a\"}}'"
+            ))
+            assert other["effect"] == "ignored", other
+            assert code(
+                "curl -X POST http://127.0.0.1:8080/api/live -d 'not json'"
+            ) == "400", "a malformed hint is a bad request"
+            assert "unconfigured" in machine.succeed("multichat live on -p 8080")
+            assert "Twitch chat" in machine.succeed("multichat status -p 8080")
+            # Pointed at the wrong port — the effects stand-in answers any POST
+            # with 200 — the CLI must not take that for multichat's answer: a
+            # hook would report success for a hint that never arrived.
+            assert "does not look like multichat" in machine.fail(
+                "multichat live on -p 8082 2>&1"
+            )
+
             # The gates the module emits conditionally: present and switched on,
             # with the operator's own values rather than the app's defaults.
             settings = json.loads(
@@ -317,8 +369,163 @@
                 "curl -sf -X POST http://127.0.0.1:8080/api/rewards "
                 "-d '{\"action\": \"status\"}' | grep -q '\"resolved\": *1'"
             )
+
+            # State under the unit's sandbox (DynamicUser, ProtectSystem=strict):
+            # what the giveaway holds survives a restart, and a pool file torn
+            # behind the service's back is moved aside and reported — not read
+            # as "empty" and overwritten by the next write.
+            state_dir = "/var/lib/private/multichat"
+            before = json.loads(giveaway("status"))["state"]["entrants"]
+            assert before, "the demo entrants minus the winner"
+            machine.succeed("systemctl restart multichat.service")
+            machine.wait_for_open_port(8080)
+            after = json.loads(giveaway("status"))["state"]["entrants"]
+            assert after == before, (before, after)
+
+            # The same goes for a file that is intact but not the service's to
+            # read (a restore that got the mode wrong): left in place, the first
+            # change would rename an empty ledger over it.
+            machine.succeed("systemctl stop multichat.service")
+            machine.succeed(
+                f"printf '%s' '{{\"open\": true, \"entr' > {state_dir}/giveaway-pool"
+            )
+            turns = machine.succeed(f"cat {state_dir}/giveaway-turns")
+            assert drawn["winner"]["login"] in turns, turns
+            machine.succeed(f"chmod 000 {state_dir}/giveaway-turns")
+            machine.succeed("systemctl start multichat.service")
+            machine.wait_for_open_port(8080)
+            assert json.loads(giveaway("status"))["state"]["entrants"] == []
+            machine.succeed(f"ls {state_dir}/giveaway-pool.corrupt-*")
+            assert machine.succeed(f"cat {state_dir}/giveaway-turns.corrupt-*") == turns
+            journal = machine.succeed("journalctl -u multichat.service --no-pager")
+            assert "EMPTY entrant pool" in journal
+            assert "turn ledger" in journal and "could not be read" in journal
+            # Every write went through a temp file; none is left behind.
+            leftovers = machine.succeed(f"ls {state_dir}")
+            assert ".tmp" not in leftovers, leftovers
           '';
         };
+
+        # When a channel's seed refresh token replaces the persisted one is
+        # decided by the unit's start script (module.nix), in shell, where the
+        # unit tests can't reach it. This runs the script the module really
+        # renders — with a stand-in for the binary it execs — through every
+        # case: first start, a rotated token, a state file emptied by a power
+        # cut, a replaced seed, the first start of this logic over an existing
+        # token, the same token saved again with other whitespace, and a blank
+        # seed. No VM, so it also runs without KVM.
+        twitch-seed =
+          let
+            # Records what the app would be handed as its seed fallback.
+            stub = pkgs.writeShellScriptBin "multichat" ''
+              printenv MULTICHAT_TWITCH_SEED_42 > "$STATE_DIRECTORY/exported" || true
+            '';
+            machine = nixpkgs.lib.nixosSystem {
+              inherit system;
+              modules = [
+                (import ./module.nix)
+                {
+                  services.multichat = {
+                    enable = true;
+                    package = stub;
+                    twitch.eventsub = {
+                      clientId = "client-id";
+                      clientSecretFile = "/unused/client-secret";
+                      channels = [{
+                        login = "demo";
+                        broadcasterId = "42";
+                        refreshTokenFile = "/unused/refresh-token";
+                      }];
+                    };
+                  };
+                }
+              ];
+            };
+            start = machine.config.systemd.services.multichat.serviceConfig.ExecStart;
+          in
+          pkgs.runCommand "multichat-twitch-seed" { } ''
+            export CREDENTIALS_DIRECTORY=$PWD/credentials STATE_DIRECTORY=$PWD/state
+            mkdir -p "$CREDENTIALS_DIRECTORY" "$STATE_DIRECTORY"
+            echo client-secret > "$CREDENTIALS_DIRECTORY/twitch-client-secret"
+            seed=$CREDENTIALS_DIRECTORY/twitch-refresh-42
+            state=$STATE_DIRECTORY/twitch-refresh-42
+            holds() {
+              if [ "$(cat "$1")" != "$2" ]; then
+                echo "FAIL ($3): $1 holds '$(cat "$1")', expected '$2'" >&2
+                exit 1
+              fi
+            }
+
+            # First start: seeded (0600), its hash recorded, the seed exported.
+            echo SEED-1 > "$seed"
+            ${start}
+            holds "$state" SEED-1 "first start"
+            [ "$(stat -c %a "$state")" = 600 ]
+            [ -s "$state.seed" ]
+            holds "$STATE_DIRECTORY/exported" SEED-1 "seed handed to the app"
+
+            # The app rotated the token: an unchanged seed never overwrites it.
+            echo ROTATED-1 > "$state"
+            ${start}
+            holds "$state" ROTATED-1 "unchanged seed"
+
+            # A power cut left the state file empty: seeded again.
+            : > "$state"
+            ${start}
+            holds "$state" SEED-1 "empty state file"
+
+            # The seed was replaced (a re-login): it takes effect by itself —
+            # once, not at every start after.
+            echo ROTATED-2 > "$state"
+            echo SEED-2 > "$seed"
+            ${start}
+            holds "$state" SEED-2 "replaced seed"
+            echo ROTATED-3 > "$state"
+            ${start}
+            holds "$state" ROTATED-3 "replaced seed, second start"
+
+            # The first start of this logic over an existing token (no hash
+            # yet) only records the hash: it can't tell a replaced seed from a
+            # rotated token, and must not overwrite one that works.
+            rm "$state.seed"
+            echo SEED-3 > "$seed"
+            ${start}
+            holds "$state" ROTATED-3 "existing token, no hash yet"
+            [ -s "$state.seed" ]
+            echo SEED-4 > "$seed"
+            ${start}
+            holds "$state" SEED-4 "the next replacement"
+
+            # The same token saved again without its trailing newline, or
+            # with more of them, is not a replacement.
+            echo ROTATED-4 > "$state"
+            printf 'SEED-4' > "$seed"
+            ${start}
+            holds "$state" ROTATED-4 "same seed, no trailing newline"
+            printf 'SEED-4\r\n\n' > "$seed"
+            ${start}
+            holds "$state" ROTATED-4 "same seed, other whitespace"
+            holds "$STATE_DIRECTORY/exported" SEED-4 "seed handed over trimmed"
+
+            # A blank seed — a fetch that wrote an empty file, or a cleared
+            # secret written as a lone newline — is ignored: not installed
+            # over the working token, not exported, and not remembered as
+            # "the seed".
+            for blank in "" '\n' ' \n\n'; do
+              printf "$blank" > "$seed"
+              rm -f "$STATE_DIRECTORY/exported"
+              ${start}
+              holds "$state" ROTATED-4 "blank seed"
+              [ ! -s "$STATE_DIRECTORY/exported" ]
+            done
+            echo SEED-4 > "$seed"
+            ${start}
+            holds "$state" ROTATED-4 "the same seed back after a blank one"
+
+            # Nothing half-written is left beside the token.
+            [ "$(ls "$STATE_DIRECTORY" | sort | tr '\n' ' ')" = "exported twitch-refresh-42 twitch-refresh-42.seed " ]
+            touch $out
+          '';
       };
     };
 }

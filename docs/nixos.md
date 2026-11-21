@@ -7,10 +7,10 @@ The viewer has no authentication, so `host` defaults to `127.0.0.1`. Only set
 `0.0.0.0` + `openFirewall` on a trusted network, or front it with an
 authenticating reverse proxy. The server caps concurrent viewers at 50.
 
-Exposing the port lets other machines *watch* `/giveaway`; it does not let them
+Exposing the port lets other machines _watch_ `/giveaway`; it does not let them
 draw. The buttons POST to a control endpoint that is loopback-only until
-`controlAccess` says otherwise — see [Running the draw from another
-machine](#running-the-draw-from-another-machine).
+`controlAccess` says otherwise — see
+[Running the draw from another machine](#running-the-draw-from-another-machine).
 
 `host` must be `"127.0.0.1"` or `"0.0.0.0"` — the packaged `deno` wrapper
 restricts `--allow-net` to those bind addresses, so any other value is rejected
@@ -88,9 +88,9 @@ The module is also importable without the flake —
 
 ## Running the draw from another machine
 
-The `/giveaway` page is a display surface and a control panel at once. Anyone who
-can reach the port sees the reel; only callers cleared by `controlAccess` can
-open, close, draw or reset.
+The `/giveaway` page is a display surface and a control panel at once. Anyone
+who can reach the port sees the reel; only callers cleared by `controlAccess`
+can open, close, draw or reset.
 
 ```nix
 services.multichat = {
@@ -108,16 +108,18 @@ services.multichat = {
   makes it safe to leave on for a box only reachable from your own network. It
   is an address check, not authentication: **every device on that network can
   draw.** Add `controlTokenFile` where that is not acceptable.
-- `"any"` — no address check. Pair it with a token or a reverse proxy; the module
-  warns if you do not.
+- `"any"` — no address check. Pair it with a token or a reverse proxy; the
+  module warns if you do not.
 
-With a token set, a non-loopback caller presents it as `Authorization: Bearer …`,
-`?token=…`, or the cookie that `GET /giveaway?token=…` mints (30 days, HttpOnly)
-— open that URL once on the phone and the buttons work thereafter. Loopback is
-never asked for it, so `multichat giveaway draw` on the host is unaffected.
+With a token set, a non-loopback caller presents it as
+`Authorization: Bearer …`, `?token=…`, or the cookie that
+`GET /giveaway?token=…` mints (30 days, HttpOnly) — open that URL once on the
+phone and the buttons work thereafter. Loopback is never asked for it, so
+`multichat giveaway draw` on the host is unaffected.
 
 `controlAccess` covers `POST /api/giveaway` only. `/api/youtube-key`,
-`/api/fake` and `/api/rewards` stay loopback-only regardless.
+`/api/fake`, `/api/rewards`, `/api/live` and `/api/status` stay loopback-only
+regardless.
 
 ## Supplying the YouTube key at runtime
 
@@ -137,58 +139,93 @@ start — set it once. Twitch chat works immediately regardless; only YouTube
 waits for the key. The control endpoint is loopback-only (see
 [HTTP & SSE API](api.md)). Full reference: [Configuration](configuration.md).
 
+A key set this way **outranks `apiKeyFile` / `apiKey`** on every later start
+(the persisted runtime key wins). The service logs which key it started on, with
+its fingerprint, and if Google refuses the persisted one while a different key
+is declared in Nix it switches to the declared key — loudly — instead of sitting
+on `error`. To make the declared key authoritative again for good, delete
+`/var/lib/private/multichat/youtube-api-key`. `multichat status` shows the key's
+source at any time.
+
+## Telling the service the stream started
+
+YouTube live detection needs no help, but a hint from whatever starts the stream
+makes it immediate (see [Go-live hints](configuration.md#go-live-hints)). On the
+host, from anything that can run a command or make an HTTP request:
+
+```bash
+multichat live on  -p 8080     # stream started
+multichat live off -p 8080     # stream stopped
+curl -fsS -X POST http://127.0.0.1:8080/api/live \
+  -H 'content-type: application/json' -d '{"state":"live","source":"obs"}'
+```
+
+`POST /api/live` also takes a webhook's `{event, ts, data}` envelope
+(`stream.started` / `stream.stopped` / `stream.state` with `data.streaming`), so
+a service that emits such webhooks can list `http://127.0.0.1:<port>/api/live`
+as a target as it is. The endpoint is loopback-only and needs nothing new in the
+unit's sandbox or the wrapper's `--allow-net` list: it is the server's own
+listener, and the CLI reaches it over `127.0.0.1`, which is always allowed. With
+`twitch.eventsub` configured, Twitch's own `stream.online` / `stream.offline`
+events do the same job with no wiring.
+
+`multichat status -p 8080` (or `GET /api/status` on loopback) reports what the
+service is doing — key source, quota, why detection is parked, EventSub's token
+and subscriptions. It is the first thing to run when "YouTube didn't notice we
+went live".
+
 ## Module options
 
-| Option                             | Type                                                    | Default                | Description                                                                                    |
-| ---------------------------------- | ------------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------------------------------- |
-| `enable`                           | bool                                                    | `false`                | Enable the service                                                                             |
-| `package`                          | package                                                 | built from `build.nix` | Override the multichat package                                                                 |
-| `port`                             | port                                                    | `8080`                 | Web interface port                                                                             |
-| `host`                             | string                                                  | `"127.0.0.1"`          | Bind address — must be `"127.0.0.1"` or `"0.0.0.0"`                                            |
-| `openFirewall`                     | bool                                                    | `false`                | Open `port` in the firewall                                                                    |
-| `controlAccess`                    | `"loopback"` \| `"lan"` \| `"any"`                      | `"loopback"`           | Who may drive the giveaway draw (see below)                                                    |
-| `controlToken`                     | string                                                  | `""`                   | Control token inline (Nix store — prefer `controlTokenFile`)                                   |
-| `controlTokenFile`                 | path                                                    | `null`                 | File with the raw control token; staged via `LoadCredential`                                   |
-| `twitch.channels`                  | `[string]`                                              | `[]`                   | Twitch channel names (chat, anonymous; case doesn't matter)                                    |
-| `twitch.eventsub.clientId`         | string                                                  | `""`                   | Twitch app Client ID for alerts (not secret); with `clientSecretFile` also the channel's own sub/bits badge art |
-| `twitch.eventsub.clientSecret`     | string                                                  | `""`                   | Client Secret inline (Nix store — prefer `clientSecretFile`)                                   |
-| `twitch.eventsub.clientSecretFile` | path                                                    | `null`                 | File with the raw Client Secret; staged via `LoadCredential`                                   |
-| `twitch.eventsub.channels`         | `[{login,broadcasterId,refreshToken,refreshTokenFile}]` | `[]`                   | Channels to alert on (from `multichat login`)                                                  |
-| `youtube.apiKey`                   | string                                                  | `""`                   | API key inline (stored in the Nix store — prefer `apiKeyFile`)                                 |
-| `youtube.apiKeyFile`               | path                                                    | `null`                 | Path to a file containing just the raw key; takes precedence over `apiKey`                     |
-| `youtube.channels`                 | `[{handle,channelId,videoId}]`                          | `[]`                   | YouTube channels                                                                               |
-| `youtube.dailyQuota`               | positive int                                            | `10000`                | Daily Data API units of the key's Google project; raise only after Google grants more          |
-| `youtube.budgetHours`              | number                                                  | `4`                    | Hours of live chat per Pacific day the quota is spread over (sets the chat poll pace; set it to your real daily stream length — past it polling slows, up to 10 min, rather than stopping) |
-| `alerts.activeTheme`               | string                                                  | `""`                   | Name of the active `/alerts` theme (empty = default look)                                      |
-| `alerts.themes`                    | `[{name,style,events,options}]`                         | `[]`                   | Named alert themes; `style` = `default` or `company-memo`                                      |
-| `giveaway.enable`                  | bool                                                    | `false`                | Enable the Twitch `!enter` giveaway / prize draw (CS2-style case reel)                         |
-| `giveaway.channel`                 | string                                                  | `""`                   | Twitch channel (login) the giveaway runs on (in `twitch.channels`)                             |
-| `giveaway.prefix`                  | string                                                  | `"!"`                  | Command prefix                                                                                 |
-| `giveaway.command`                 | string                                                  | `"enter"`              | Command word (default gives `!enter`)                                                          |
-| `giveaway.requireFollow`           | bool                                                    | `true`                 | Gate entries on a live follow check (needs the channel in `twitch.eventsub`)                   |
-| `giveaway.replies`                 | bool                                                    | `true`                 | Reply in chat as the broadcaster (needs re-`login` — see below)                                |
-| `giveaway.firstN`                  | int                                                     | `0`                    | Campaign: entrants #1..N are all guaranteed winners (0 = off), e.g. `500`                      |
-| `giveaway.followerStep`            | int                                                     | `0`                    | Arm draw credits every N new followers via EventSub (0 = no tracking), e.g. `100`              |
-| `giveaway.milestoneDraws`          | int                                                     | `1`                    | Draw credits armed per milestone, e.g. `10`                                                    |
-| `giveaway.messages`                | `attrs of string`                                       | `{}`                   | Optional reply templates incl. `enteredPool`/`milestone`; placeholders `{user}`/`{number}`/…   |
-| `giveaway.timezone`                | string                                                  | `"America/Denver"`     | IANA zone the compiled report renders turn times in (DST-aware — not a fixed `MST`)            |
-| `giveaway.terms.enable`            | bool                                                    | `false`                | Gate entry on accepting the terms; needs `replies` (the prompt is a chat reply)                |
-| `giveaway.terms.command`           | string                                                  | `"accept"`             | Accept command word after `prefix`, giving `!accept`                                           |
-| `giveaway.terms.version`           | string                                                  | `"1"`                  | Bump to invalidate every acceptance on file                                                    |
-| `giveaway.terms.url`               | string                                                  | `""`                   | Where the full T&C is published — multichat does **not** host it                               |
-| `giveaway.disposition.enable`      | bool                                                    | `false`                | Let the winner pick their pull's fate in chat                                                  |
-| `giveaway.disposition.{mail,donate,destroy,pass}` | string                                   | the same word          | The chat words for each choice; `pass` also advances the draw                                  |
-| `integrations.callbackToken`       | string                                                  | `""`                   | Callback bearer inline (Nix store — prefer `callbackTokenFile`)                                |
-| `integrations.callbackTokenFile`   | path                                                    | `null`                 | File with the raw callback bearer; staged via `LoadCredential`                                 |
-| `integrations.subscribers`         | `[{name,adapter,baseUrl,events,enabled,token,tokenFile,packSize}]` | `[]`        | External tools to push giveaway events to (see below)                                          |
-| `channelPoints.enable`             | bool                                                    | `false`                | Channel-point chaos: managed Twitch rewards → cobblemon-overlay effects (see below)            |
-| `channelPoints.channel`            | string                                                  | `""`                   | Twitch login the rewards live on (must be in `twitch.eventsub.channels`)                       |
-| `channelPoints.overlayUrl`         | string                                                  | `"http://127.0.0.1:8082"` | The cobblemon-overlay's base URL; its host joins `--allow-net`                              |
-| `channelPoints.overlayTokenFile`   | path                                                    | `null`                 | File with the overlay's effects bearer; staged via `LoadCredential`                            |
-| `channelPoints.ttlSec`             | int (30–3600)                                           | `600`                  | How long a redemption may wait to run before it is refunded                                    |
-| `channelPoints.autoPause`          | bool                                                    | `true`                 | Pause the rewards on Twitch while the game isn't taking effects                                |
-| `channelPoints.announce`           | bool                                                    | `true`                 | A highlighted system chat row per redemption                                                   |
-| `channelPoints.rewards`            | `null` or `[{key,title,cost,prompt,effect,params,cooldownSec,maxPerStream,maxPerUserPerStream,color,enabled}]` | `null` | The catalogue; `null` = the built-in 14 rewards               |
+| Option                                            | Type                                                                                                           | Default                   | Description                                                                                                                                                                                |
+| ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `enable`                                          | bool                                                                                                           | `false`                   | Enable the service                                                                                                                                                                         |
+| `package`                                         | package                                                                                                        | built from `build.nix`    | Override the multichat package                                                                                                                                                             |
+| `port`                                            | port                                                                                                           | `8080`                    | Web interface port                                                                                                                                                                         |
+| `host`                                            | string                                                                                                         | `"127.0.0.1"`             | Bind address — must be `"127.0.0.1"` or `"0.0.0.0"`                                                                                                                                        |
+| `openFirewall`                                    | bool                                                                                                           | `false`                   | Open `port` in the firewall                                                                                                                                                                |
+| `controlAccess`                                   | `"loopback"` \| `"lan"` \| `"any"`                                                                             | `"loopback"`              | Who may drive the giveaway draw (see below)                                                                                                                                                |
+| `controlToken`                                    | string                                                                                                         | `""`                      | Control token inline (Nix store — prefer `controlTokenFile`)                                                                                                                               |
+| `controlTokenFile`                                | path                                                                                                           | `null`                    | File with the raw control token; staged via `LoadCredential`                                                                                                                               |
+| `twitch.channels`                                 | `[string]`                                                                                                     | `[]`                      | Twitch channel names (chat, anonymous; case doesn't matter)                                                                                                                                |
+| `twitch.eventsub.clientId`                        | string                                                                                                         | `""`                      | Twitch app Client ID for alerts (not secret); with `clientSecretFile` also the channel's own sub/bits badge art                                                                            |
+| `twitch.eventsub.clientSecret`                    | string                                                                                                         | `""`                      | Client Secret inline (Nix store — prefer `clientSecretFile`)                                                                                                                               |
+| `twitch.eventsub.clientSecretFile`                | path                                                                                                           | `null`                    | File with the raw Client Secret; staged via `LoadCredential`                                                                                                                               |
+| `twitch.eventsub.channels`                        | `[{login,broadcasterId,refreshToken,refreshTokenFile}]`                                                        | `[]`                      | Channels to alert on (from `multichat login`)                                                                                                                                              |
+| `youtube.apiKey`                                  | string                                                                                                         | `""`                      | API key inline (stored in the Nix store — prefer `apiKeyFile`)                                                                                                                             |
+| `youtube.apiKeyFile`                              | path                                                                                                           | `null`                    | Path to a file containing just the raw key; takes precedence over `apiKey`                                                                                                                 |
+| `youtube.channels`                                | `[{handle,channelId,videoId}]`                                                                                 | `[]`                      | YouTube channels                                                                                                                                                                           |
+| `youtube.dailyQuota`                              | positive int                                                                                                   | `10000`                   | Daily Data API units of the key's Google project; raise only after Google grants more                                                                                                      |
+| `youtube.budgetHours`                             | number                                                                                                         | `4`                       | Hours of live chat per Pacific day the quota is spread over (sets the chat poll pace; set it to your real daily stream length — past it polling slows, up to 10 min, rather than stopping) |
+| `alerts.activeTheme`                              | string                                                                                                         | `""`                      | Name of the active `/alerts` theme (empty = default look)                                                                                                                                  |
+| `alerts.themes`                                   | `[{name,style,events,options}]`                                                                                | `[]`                      | Named alert themes; `style` = `default` or `company-memo`                                                                                                                                  |
+| `giveaway.enable`                                 | bool                                                                                                           | `false`                   | Enable the Twitch `!enter` giveaway / prize draw (CS2-style case reel)                                                                                                                     |
+| `giveaway.channel`                                | string                                                                                                         | `""`                      | Twitch channel (login) the giveaway runs on (in `twitch.channels`)                                                                                                                         |
+| `giveaway.prefix`                                 | string                                                                                                         | `"!"`                     | Command prefix                                                                                                                                                                             |
+| `giveaway.command`                                | string                                                                                                         | `"enter"`                 | Command word (default gives `!enter`)                                                                                                                                                      |
+| `giveaway.requireFollow`                          | bool                                                                                                           | `true`                    | Gate entries on a live follow check (needs the channel in `twitch.eventsub`)                                                                                                               |
+| `giveaway.replies`                                | bool                                                                                                           | `true`                    | Reply in chat as the broadcaster (needs re-`login` — see below)                                                                                                                            |
+| `giveaway.firstN`                                 | int                                                                                                            | `0`                       | Campaign: entrants #1..N are all guaranteed winners (0 = off), e.g. `500`                                                                                                                  |
+| `giveaway.followerStep`                           | int                                                                                                            | `0`                       | Arm draw credits every N new followers via EventSub (0 = no tracking), e.g. `100`                                                                                                          |
+| `giveaway.milestoneDraws`                         | int                                                                                                            | `1`                       | Draw credits armed per milestone, e.g. `10`                                                                                                                                                |
+| `giveaway.messages`                               | `attrs of string`                                                                                              | `{}`                      | Optional reply templates incl. `enteredPool`/`milestone`; placeholders `{user}`/`{number}`/…                                                                                               |
+| `giveaway.timezone`                               | string                                                                                                         | `"America/Denver"`        | IANA zone the compiled report renders turn times in (DST-aware — not a fixed `MST`)                                                                                                        |
+| `giveaway.terms.enable`                           | bool                                                                                                           | `false`                   | Gate entry on accepting the terms; needs `replies` (the prompt is a chat reply)                                                                                                            |
+| `giveaway.terms.command`                          | string                                                                                                         | `"accept"`                | Accept command word after `prefix`, giving `!accept`                                                                                                                                       |
+| `giveaway.terms.version`                          | string                                                                                                         | `"1"`                     | Bump to invalidate every acceptance on file                                                                                                                                                |
+| `giveaway.terms.url`                              | string                                                                                                         | `""`                      | Where the full T&C is published — multichat does **not** host it                                                                                                                           |
+| `giveaway.disposition.enable`                     | bool                                                                                                           | `false`                   | Let the winner pick their pull's fate in chat                                                                                                                                              |
+| `giveaway.disposition.{mail,donate,destroy,pass}` | string                                                                                                         | the same word             | The chat words for each choice; `pass` also advances the draw                                                                                                                              |
+| `integrations.callbackToken`                      | string                                                                                                         | `""`                      | Callback bearer inline (Nix store — prefer `callbackTokenFile`)                                                                                                                            |
+| `integrations.callbackTokenFile`                  | path                                                                                                           | `null`                    | File with the raw callback bearer; staged via `LoadCredential`                                                                                                                             |
+| `integrations.subscribers`                        | `[{name,adapter,baseUrl,events,enabled,token,tokenFile,packSize}]`                                             | `[]`                      | External tools to push giveaway events to (see below)                                                                                                                                      |
+| `channelPoints.enable`                            | bool                                                                                                           | `false`                   | Channel-point chaos: managed Twitch rewards → cobblemon-overlay effects (see below)                                                                                                        |
+| `channelPoints.channel`                           | string                                                                                                         | `""`                      | Twitch login the rewards live on (must be in `twitch.eventsub.channels`)                                                                                                                   |
+| `channelPoints.overlayUrl`                        | string                                                                                                         | `"http://127.0.0.1:8082"` | The cobblemon-overlay's base URL; its host joins `--allow-net`                                                                                                                             |
+| `channelPoints.overlayTokenFile`                  | path                                                                                                           | `null`                    | File with the overlay's effects bearer; staged via `LoadCredential`                                                                                                                        |
+| `channelPoints.ttlSec`                            | int (30–3600)                                                                                                  | `600`                     | How long a redemption may wait to run before it is refunded                                                                                                                                |
+| `channelPoints.autoPause`                         | bool                                                                                                           | `true`                    | Pause the rewards on Twitch while the game isn't taking effects                                                                                                                            |
+| `channelPoints.announce`                          | bool                                                                                                           | `true`                    | A highlighted system chat row per redemption                                                                                                                                               |
+| `channelPoints.rewards`                           | `null` or `[{key,title,cost,prompt,effect,params,cooldownSec,maxPerStream,maxPerUserPerStream,color,enabled}]` | `null`                    | The catalogue; `null` = the built-in 14 rewards                                                                                                                                            |
 
 See [Giveaway mode](configuration.md#giveaway-mode) for the full behavior
 (including the campaign mode the 500/100/10 example configures). Three gotchas
@@ -233,11 +270,29 @@ exported as `TWITCH_CLIENT_SECRET` at start (never entering the Nix store); the
 
 Each `twitch.eventsub.channels` entry can carry its refresh token via
 `refreshTokenFile` (preferred) or an inline `refreshToken` (warned, Nix store).
-A `refreshTokenFile` is staged via `LoadCredential` and, on first start,
-installed into the `StateDirectory` as `twitch-refresh-<broadcasterId>` — and
-**only if it is not already there**, so the rotated token the app persists is
-never clobbered. This is why `broadcasterId` is required alongside
-`refreshTokenFile`. Obtain both with `multichat login` (see
+A `refreshTokenFile` is staged via `LoadCredential` and installed into the
+`StateDirectory` as `twitch-refresh-<broadcasterId>` by the unit's start script
+— this is why `broadcasterId` is required alongside `refreshTokenFile`. The
+script installs the seed in exactly three cases, so the rotated token the app
+persists is never clobbered by an unchanged seed:
+
+| State at start                                             | What the unit does                                    |
+| ---------------------------------------------------------- | ----------------------------------------------------- |
+| no token file yet (first start)                            | installs the seed                                     |
+| the token file is empty (a write cut short by a power cut) | installs the seed                                     |
+| the seed is a different token than the one last seen       | installs the new seed                                 |
+| a token is there and the seed is unchanged                 | nothing — the persisted token wins                    |
+| a token is there, but no seed hash was ever recorded       | records the hash, leaves the token alone              |
+| the seed file is empty, or holds only whitespace           | nothing (a blank secret is never installed or hashed) |
+
+"Last seen" is a SHA-256 of the seed token, kept beside the token as
+`twitch-refresh-<broadcasterId>.seed` (a hash, not a secret). It is taken of the
+token with its whitespace removed, so saving the same token again with or
+without a trailing newline is not a change. The seed is also handed to the app
+as `MULTICHAT_TWITCH_SEED_<broadcasterId>`, its fallback when the persisted
+token turns out unreadable or Twitch rejects it (see
+[Token persistence & rotation](configuration.md#3-token-persistence--rotation)).
+Obtain the token and id with `multichat login` (see
 [Configuration](configuration.md#twitch-eventsub-alerts)). Inline `clientSecret`
 / `refreshToken` each emit a build-time warning.
 
@@ -246,26 +301,28 @@ outside the Nix store, so the rotated refresh token survives
 `nixos-rebuild
 switch`, package updates, and reboots — you authorize each
 channel once and never re-login on an upgrade. The refresh token in Nix
-(`refreshTokenFile` / `refreshToken`) is only the first-run seed; after that the
-persisted, rotated token wins and the seed is ignored.
+(`refreshTokenFile` / `refreshToken`) is only the seed; after the first run the
+persisted, rotated token wins for as long as the seed stays the same and Twitch
+keeps accepting the token.
 
-**Re-login for a new scope.** The flip side: when a release needs a scope the
-current token lacks (`user:write:chat` for giveaway replies,
-`channel:manage:redemptions` for channel points), a fresh `multichat login` is
-ignored until the persisted token goes. In order: run `multichat login` as the
-broadcaster; put the new refresh token into the `refreshTokenFile` secret (the
-password-manager item — Proton Pass, agenix, sops — that feeds it); then
-`sudo rm /var/lib/private/multichat/twitch-refresh-<broadcasterId>` (the unit
-re-installs the seed only when that file is missing, so it must already be the
-new one) and `systemctl restart multichat`. Full walk-through:
+**Re-login for a new scope.** When a release needs a scope the current token
+lacks (`user:write:chat` for giveaway replies, `channel:manage:redemptions` for
+channel points): run `multichat login` as the broadcaster; put the new refresh
+token into the `refreshTokenFile` secret (the password-manager item — Proton
+Pass, agenix, sops — that feeds it); and `systemctl restart multichat`. The unit
+sees that the seed changed and installs it. The one exception is a host whose
+state directory has no `twitch-refresh-<broadcasterId>.seed` yet (it was last
+started by a version without it): there, also
+`sudo rm /var/lib/private/multichat/twitch-refresh-<broadcasterId>` before the
+restart, once. Full walk-through:
 [Adding a scope later](configuration.md#4-adding-a-scope-later-re-login).
 
 ## Integrations (chat-cards)
 
 `integrations.subscribers` pushes giveaway-lifecycle events to external tools,
 and `/api/turn-report` takes results back. The pair completes a loop with
-[chat-cards](https://github.com/The-Company-Inc-Nerds/chat-cards): a draw opens a
-physical card pack under the winner's name, and the cards pulled — with their
+[chat-cards](https://github.com/The-Company-Inc-Nerds/chat-cards): a draw opens
+a physical card pack under the winner's name, and the cards pulled — with their
 prices — come back onto that winner's turn.
 
 ```nix
@@ -373,12 +430,12 @@ services.multichat = {
 `alerts.themes` is a registry of named looks for the `/alerts` OBS overlay, and
 `alerts.activeTheme` selects the one in effect (empty = the default card). Each
 theme sets a built-in `style` (`default`, or `company-memo` — an office memo
-that redacts one of its three words before it disappears; subs render as
-hiring paperwork with tier job titles, raids as an FBI search warrant under
-police lights, and cheers as a petty-cash receipt, each with a stamped
-verdict), an optional `events` list limiting which shoutout kinds it restyles
-(empty = all; others fall back to the default card), and an `options` attrset
-of style knobs. Example — the flagship memo on its Twitch shoutouts:
+that redacts one of its three words before it disappears; subs render as hiring
+paperwork with tier job titles, raids as an FBI search warrant under police
+lights, and cheers as a petty-cash receipt, each with a stamped verdict), an
+optional `events` list limiting which shoutout kinds it restyles (empty = all;
+others fall back to the default card), and an `options` attrset of style knobs.
+Example — the flagship memo on its Twitch shoutouts:
 
 ```nix
 services.multichat.alerts = {
@@ -406,18 +463,19 @@ The module **fails the build** (assertion) when:
 
 It emits a build-time **warning** when the insecure inline `youtube.apiKey`,
 `twitch.eventsub.clientSecret`, `controlToken`, or a channel's inline
-`refreshToken` is used; when `controlAccess = "any"` is set with no control token
-(anyone who can reach the port could draw); when `controlAccess` is widened while
-`host` is still `"127.0.0.1"` (nothing off-box can reach the server at all);
-when both `twitch.channels` and `youtube.channels` are empty (the viewer would
-show no chat); when `youtube.channels` is set but no build-time key is given (a
-reminder that the key can be supplied at runtime — not an error); when
-`twitch.eventsub.channels` is set but `clientId` is empty (alerts would be
-skipped); when `alerts.activeTheme` names no theme in `alerts.themes` (the
-overlay falls back to the default look); when the `giveaway.channel` isn't in
-`twitch.channels` (its chat won't be joined); when `giveaway.requireFollow` is
-on but the channel isn't in `twitch.eventsub.channels` (follow checks can't
-run); when `giveaway.followerStep` is set but the channel isn't in
+`refreshToken` is used; when `controlAccess = "any"` is set with no control
+token (anyone who can reach the port could draw); when `controlAccess` is
+widened while `host` is still `"127.0.0.1"` (nothing off-box can reach the
+server at all); when both `twitch.channels` and `youtube.channels` are empty
+(the viewer would show no chat); when `youtube.channels` is set but no
+build-time key is given (a reminder that the key can be supplied at runtime —
+not an error); when `twitch.eventsub.channels` is set but `clientId` is empty
+(alerts would be skipped); when `alerts.activeTheme` names no theme in
+`alerts.themes` (the overlay falls back to the default look); when the
+`giveaway.channel` isn't in `twitch.channels` (its chat won't be joined); when
+`giveaway.requireFollow` is on but the channel isn't in
+`twitch.eventsub.channels` (follow checks can't run); when
+`giveaway.followerStep` is set but the channel isn't in
 `twitch.eventsub.channels` (follow events can't be received, so milestone
 progress won't advance); or when `giveaway.replies` is on (a reminder to re-run
 `multichat login` for the `user:write:chat` scope).
@@ -428,8 +486,9 @@ credential and its env var), and two subscriber names that collapse to the same
 env var — `"chat-cards"` and `"chat cards"` both become
 `MULTICHAT_INTEGRATION_TOKEN_CHAT_CARDS`, so one would silently take the other's
 token. Inline `integrations.callbackToken` / subscriber `token` warn like the
-other in-store secrets, and configuring subscribers with `giveaway.enable = false`
-warns too: the bus only carries giveaway events, so nothing would ever be sent.
+other in-store secrets, and configuring subscribers with
+`giveaway.enable = false` warns too: the bus only carries giveaway events, so
+nothing would ever be sent.
 
 Channel points add three assertions — `channelPoints.enable` without a
 `channelPoints.channel`, a reward title outside 1–45 characters or a prompt over
@@ -439,15 +498,16 @@ case-insensitively) — on top of the option types themselves (`cooldownSec`
 channel-points channel isn't in `twitch.eventsub.channels` (nothing can reach
 Twitch; only `rewards simulate` works), and always reminds you that the
 channel's token needs `channel:manage:redemptions` — naming the persisted token
-file to delete for the re-login. The subscribers-without-a-giveaway warning now
-also says that channel-point redemptions don't ride the integration bus.
+file and its `.seed` marker for the re-login. The subscribers-without-a-giveaway
+warning now also says that channel-point redemptions don't ride the integration
+bus.
 
 The terms gate warns in two more cases: with `replies` off (the "you must accept
-first" prompt is a chat reply, so entrants would be refused in silence), and with
-neither `terms.url` nor a custom `messages.termsRequired` (the built-in prompt
-renders an empty `()` where the link belongs). `terms` and `disposition` are
-emitted into `settings.json` only when enabled — the app reads a present block as
-"configured on purpose", so a disabled one is never written.
+first" prompt is a chat reply, so entrants would be refused in silence), and
+with neither `terms.url` nor a custom `messages.termsRequired` (the built-in
+prompt renders an empty `()` where the link belongs). `terms` and `disposition`
+are emitted into `settings.json` only when enabled — the app reads a present
+block as "configured on purpose", so a disabled one is never written.
 
 ## Security hardening
 
@@ -470,7 +530,24 @@ writable+executable memory, so enabling it would break the server.
 
 ## Restart behaviour
 
-The unit restarts on failure (`RestartSec = 5s`) with the start-limit window
-disabled (`StartLimitIntervalSec = 0`), so a burst of crashes during a long
+The unit restarts on failure with the start-limit window disabled
+(`StartLimitIntervalSec = 0`), so a burst of crashes during a long
 Twitch/YouTube outage never parks the service in `failed` — it keeps retrying
-every 5 seconds.
+for as long as it takes.
+
+The retries back off: the first comes after `RestartSec = 5s`, and over
+`RestartSteps = 4` further failures the delay grows to
+`RestartMaxDelaySec = 30s` (≈5s, 8s, 12s, 19s, then 30s). The usual reason for a
+start to fail over and over is a `LoadCredential` file that isn't there yet —
+systemd refuses to start the unit (`status=243/CREDENTIALS`) before the app even
+runs — and without the back-off that is a failure in the journal every 5 seconds
+for as long as the secret is missing. Once the file appears the next retry
+starts the service; nothing has to bounce it.
+
+One thing to know when choosing other values (both are `mkDefault`, so
+`systemd.services.multichat.serviceConfig.RestartMaxDelaySec = "10s";` just
+works): systemd does **not** reset its restart counter when the service then
+runs fine — only a manual stop/restart or a deploy does. So after a boot that
+had to wait for its secrets, a later crash is restarted after
+`RestartMaxDelaySec`, not `RestartSec`. That is why the ceiling is 30 seconds
+and not minutes.
